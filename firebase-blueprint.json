@@ -1,0 +1,41 @@
+{
+  "entities": {
+    "World": {
+      "title": "World",
+      "description": "Represents the shared city grid.",
+      "type": "object",
+      "properties": {
+        "grid": {
+          "type": "object",
+          "description": "Map of coordinate strings to tile arrays."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["grid"]
+    },
+    "Layout": {
+      "title": "Layout",
+      "description": "A saved city layout.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "data": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "data"]
+    }
+  },
+  "firestore": {
+    "/worlds/{worldId}": {
+      "schema": "World",
+      "description": "Shared city worlds."
+    },
+    "/layouts/{layoutId}": {
+      "schema": "Layout",
+      "description": "Shared saved layouts."
+    }
+  }
+}

@@ -1,0 +1,86 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: worlds
+// Document ID: worldId (e.g., "default")
+// Fields:
+//   - grid: map (required) - The city grid data
+//   - updatedAt: timestamp (optional) - Last update time
+//
+// Collection: users
+// Document ID: uid
+// Fields:
+//   - email: string (required)
+//   - role: string (required, 'admin' or 'user')
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+         (request.auth.token.email == "ssadams@metacognitive.technology" && request.auth.token.email_verified == true));
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidWorld(data) {
+      return data.grid is map &&
+             (data.updatedAt == null || data.updatedAt is timestamp);
+    }
+
+    function isValidUser(data) {
+      return data.email is string &&
+             data.role in ['admin', 'user'];
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /worlds/{worldId} {
+      // Allow anyone to read/write if they know the worldId (room code)
+      allow read, write: if true;
+    }
+
+    match /layouts/{layoutId} {
+      // Allow anyone to read/manage layouts
+      allow read, create, delete: if true;
+      allow update: if false; // Layouts are immutable once saved
+    }
+
+    match /users/{userId} {
+      allow read, write: if false; // No longer using user profiles
+    }
+
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}

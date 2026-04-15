@@ -1,0 +1,6 @@
+{
+  "name": "GridCity",
+  "description": "A collaborative city-building and traffic simulation game with real-time multiplayer using Firebase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
