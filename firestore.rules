@@ -75,6 +75,12 @@ service cloud.firestore {
       allow update: if false; // Layouts are immutable once saved
     }
 
+    match /simulations/{simulationId} {
+      // Allow anyone to read/manage simulations
+      allow read, create, delete: if true;
+      allow update: if false; // Simulations are immutable once saved
+    }
+
     match /users/{userId} {
       allow read, write: if false; // No longer using user profiles
     }

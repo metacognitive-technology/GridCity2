@@ -32,7 +32,11 @@ import {
   Trees,
   Upload,
   LogOut,
-  Database
+  Database,
+  Car,
+  CarFront,
+  PlayCircle,
+  FolderOpen
 } from 'lucide-react';
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent } from './components/Vehicle';
@@ -181,11 +185,22 @@ export default function App() {
   const [pendingLayout, setPendingLayout] = useState<GridData | null>(null);
   const [pastePreviewPos, setPastePreviewPos] = useState<Point | null>(null);
   const [vehicles, setVehicles] = useState<Record<string, Vehicle>>({});
+  const [selectedVehicles, setSelectedVehicles] = useState<Set<string>>(new Set());
+  const [isPlacingVehicles, setIsPlacingVehicles] = useState(false);
+  const [showCarManager, setShowCarManager] = useState(false);
+  const addCarsCountRef = useRef<HTMLInputElement>(null);
   const [userColor, setUserColor] = useState<string>('#ef4444');
+
+  const [simulations, setSimulations] = useState<any[]>([]);
+  const [libraryTab, setLibraryTab] = useState<'layouts' | 'simulations'>('layouts');
+  const [showSaveSimulationConfirm, setShowSaveSimulationConfirm] = useState(false);
+  const [newSimulationName, setNewSimulationName] = useState('');
+  const [showDeleteSimulationConfirm, setShowDeleteSimulationConfirm] = useState<{ id: string; name: string } | null>(null);
 
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [tempRoomCode, setTempRoomCode] = useState('');
   const isRemoteChange = useRef(false);
+  const lastForceReloadRef = useRef<number>(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -197,7 +212,7 @@ export default function App() {
   // Sync library from Firestore
   useEffect(() => {
     const layoutsRef = collection(db, 'layouts');
-    const unsubscribe = onSnapshot(layoutsRef, (snapshot) => {
+    const unsubscribeLayouts = onSnapshot(layoutsRef, (snapshot) => {
       const newLibrary = snapshot.docs.map(docSnap => ({
         id: docSnap.id,
         name: docSnap.data().name,
@@ -205,7 +220,21 @@ export default function App() {
       }));
       setLibrary(newLibrary);
     }, (err) => handleFirestoreError(err, OperationType.LIST, 'layouts'));
-    return () => unsubscribe();
+    // Sync simulations from Firestore
+    const simsRef = collection(db, 'simulations');
+    const unsubscribeSims = onSnapshot(simsRef, (snapshot) => {
+      const newSimulations = snapshot.docs.map(docSnap => ({
+        id: docSnap.id,
+        name: docSnap.data().name,
+        data: docSnap.data().data
+      }));
+      setSimulations(newSimulations);
+    }, (err) => handleFirestoreError(err, OperationType.LIST, 'simulations'));
+
+    return () => {
+      unsubscribeLayouts();
+      unsubscribeSims();
+    };
   }, []);
 
   // Auth listener
@@ -254,7 +283,34 @@ export default function App() {
           }
         }
         if (data.vehicles) {
-          setVehicles(data.vehicles);
+          const isForceReload = data.forceReloadVehicles && data.forceReloadVehicles !== lastForceReloadRef.current;
+          if (isForceReload) {
+            lastForceReloadRef.current = data.forceReloadVehicles;
+            setVehicles(data.vehicles);
+          } else {
+            setVehicles(prev => {
+              const nextVehicles = { ...prev };
+              let hasChanges = false;
+              
+              const firestoreIds = new Set(Object.keys(data.vehicles));
+              
+              for (const id of Object.keys(nextVehicles)) {
+                if (!firestoreIds.has(id)) {
+                  delete nextVehicles[id];
+                  hasChanges = true;
+                }
+              }
+
+              for (const [id, v] of Object.entries(data.vehicles)) {
+                if (!nextVehicles[id]) {
+                  nextVehicles[id] = v as Vehicle;
+                  hasChanges = true;
+                }
+              }
+
+              return hasChanges ? nextVehicles : prev;
+            });
+          }
         }
       } else {
         setDoc(worldRef, { grid: {}, vehicles: {}, updatedAt: serverTimestamp() })
@@ -361,6 +417,222 @@ export default function App() {
     setShowDeleteLayoutConfirm({ id, name });
   };
 
+  const saveToSimulations = async () => {
+    if (!newSimulationName.trim()) return;
+
+    try {
+      await addDoc(collection(db, 'simulations'), {
+        name: newSimulationName.trim(),
+        data: { grid, vehicles },
+        createdAt: serverTimestamp()
+      });
+      setNewSimulationName('');
+      setShowSaveSimulationConfirm(false);
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('resource-exhausted')) {
+        setQuotaExceeded(true);
+      } else {
+        handleFirestoreError(err, OperationType.CREATE, 'simulations');
+      }
+    }
+  };
+
+  const loadSimulation = (sim: any) => {
+    setGrid(sim.data.grid || {});
+    setVehicles(sim.data.vehicles || {});
+    setSelectedVehicles(new Set());
+    if (roomCode && !quotaExceeded) {
+      updateDoc(doc(db, 'worlds', roomCode), { 
+        grid: sim.data.grid || {}, 
+        vehicles: sim.data.vehicles || {}, 
+        forceReloadVehicles: Date.now(),
+        updatedAt: serverTimestamp() 
+      }).catch(err => {
+        if (err instanceof Error && err.message.includes('resource-exhausted')) {
+          setQuotaExceeded(true);
+        } else {
+          console.error("Error updating world:", err);
+        }
+      });
+    }
+  };
+
+  const confirmDeleteSimulation = async () => {
+    if (!showDeleteSimulationConfirm) return;
+    try {
+      await deleteDoc(doc(db, 'simulations', showDeleteSimulationConfirm.id));
+      setShowDeleteSimulationConfirm(null);
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('resource-exhausted')) {
+        setQuotaExceeded(true);
+      } else {
+        handleFirestoreError(err, OperationType.DELETE, `simulations/${showDeleteSimulationConfirm.id}`);
+      }
+    }
+  };
+
+  const distributeSelectedCars = () => {
+    const roadTiles = Object.entries(grid).filter(([key, tiles]) => 
+      (tiles as GridTile[]).some(t => t.type.startsWith('road') || t.type.startsWith('rail'))
+    );
+    if (roadTiles.length === 0) return;
+    
+    let updatedVehicles = { ...vehicles };
+    let anyUpdates = false;
+
+    selectedVehicles.forEach(id => {
+      const v = updatedVehicles[id];
+      if (v) {
+        const randomRoad = roadTiles[Math.floor(Math.random() * roadTiles.length)];
+        const [rx, ry] = randomRoad[0].split(',').map(Number);
+        const tileList = randomRoad[1] as GridTile[];
+        
+        let targetTileIndex = tileList.length - 1;
+        // Optionally find the specific road/rail 
+        let targetTile = tileList[targetTileIndex];
+        let zIndex = 0;
+        if (targetTile.type.includes('bridge') || targetTile.type.includes('trestle')) zIndex = 1;
+
+        const is4Lane = targetTile.type.includes('4lane');
+        updatedVehicles[id] = {
+           ...v,
+           x: rx,
+           y: ry,
+           heading: targetTile.rotation,
+           progress: Math.random(),
+           lane: is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1),
+           zIndex
+        };
+        anyUpdates = true;
+      }
+    });
+
+    if (anyUpdates) {
+      setVehicles(updatedVehicles);
+    }
+  };
+
+  const addRandomCars = () => {
+    const count = parseInt(addCarsCountRef.current?.value || '1', 10);
+    if (isNaN(count) || count <= 0) return;
+
+    const roadTiles = Object.entries(grid).filter(([key, tiles]) => 
+      (tiles as GridTile[]).some(t => t.type.startsWith('road') || t.type.startsWith('rail'))
+    );
+
+    const updatedVehicles = { ...vehicles };
+    const newIds = [];
+    
+    for(let i=0; i<count; i++) {
+        const id = Math.random().toString(36).substring(2, 11);
+        newIds.push(id);
+        const randomColor = '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0');
+        
+        let newX = 0, newY = 0, heading = 0, lane = 1, zIndex = 0;
+        if (roadTiles.length > 0) {
+          const randomRoad = roadTiles[Math.floor(Math.random() * roadTiles.length)];
+          const [rx, ry] = randomRoad[0].split(',').map(Number);
+          const tilesList = randomRoad[1] as GridTile[];
+          const topTile = tilesList[tilesList.length - 1];
+          const is4Lane = topTile.type.includes('4lane');
+          newX = rx;
+          newY = ry;
+          heading = topTile.rotation;
+          lane = is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1);
+          zIndex = topTile.type.includes('bridge') ? 1 : 0;
+        }
+
+        updatedVehicles[id] = {
+           id,
+           x: newX,
+           y: newY,
+           heading,
+           progress: Math.random(),
+           lane,
+           color: randomColor,
+           zIndex,
+           isMoving: true,
+           speed: 1,
+           turnAroundAtDeadEnd: true,
+           randomTurning: true,
+        };
+    }
+    setVehicles(updatedVehicles);
+    setSelectedVehicles(new Set([...selectedVehicles, ...newIds]));
+    if (roomCode && !quotaExceeded) {
+        const worldRef = doc(db, 'worlds', roomCode);
+        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
+          .catch(err => {
+            if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+          });
+    }
+  };
+
+  const removeSelectedCars = () => {
+    if (selectedVehicles.size === 0) return;
+    const updatedVehicles = { ...vehicles };
+    selectedVehicles.forEach(id => {
+      delete updatedVehicles[id];
+    });
+    setVehicles(updatedVehicles);
+    setSelectedVehicles(new Set());
+    if (roomCode && !quotaExceeded) {
+      const worldRef = doc(db, 'worlds', roomCode);
+      updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
+        .catch(err => {
+          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+        });
+    }
+  };
+
+  const toggleAllCars = () => {
+    if (selectedVehicles.size === Object.keys(vehicles).length) {
+      setSelectedVehicles(new Set());
+    } else {
+      setSelectedVehicles(new Set(Object.keys(vehicles)));
+    }
+  };
+
+  const toggleSelectedCarsAttribute = (attr: 'isMoving' | 'turnAroundAtDeadEnd' | 'randomTurning') => {
+    if (selectedVehicles.size === 0) return;
+    const updatedVehicles = { ...vehicles };
+    let anyUpdates = false;
+
+    // determine majority state to toggle to opposite
+    let activeCount = 0;
+    selectedVehicles.forEach(id => {
+      if (updatedVehicles[id]?.[attr]) activeCount++;
+    });
+    const newState = activeCount < selectedVehicles.size / 2;
+
+    selectedVehicles.forEach(id => {
+      if (updatedVehicles[id]) {
+        updatedVehicles[id] = { ...updatedVehicles[id], [attr]: newState };
+        anyUpdates = true;
+      }
+    });
+
+    if (anyUpdates) {
+      setVehicles(updatedVehicles);
+    }
+  };
+
+  const changeSelectedCarsSpeed = (newSpeed: number) => {
+    if (selectedVehicles.size === 0) return;
+    const updatedVehicles = { ...vehicles };
+    let anyUpdates = false;
+    selectedVehicles.forEach(id => {
+      if (updatedVehicles[id]) {
+        updatedVehicles[id] = { ...updatedVehicles[id], speed: newSpeed };
+        anyUpdates = true;
+      }
+    });
+
+    if (anyUpdates) {
+      setVehicles(updatedVehicles);
+    }
+  };
+
   const requestRef = useRef<number>(0);
   const lastTimeRef = useRef<number>(0);
 
@@ -372,7 +644,8 @@ export default function App() {
         let hasChanges = false;
         const nextVehicles = { ...prev };
 
-        for (const [uid, vehicle] of Object.entries(prev)) {
+        for (const [uid, v] of Object.entries(prev)) {
+          const vehicle = v as Vehicle;
           if (!vehicle.isMoving && !vehicle.stepForward && !vehicle.stepBackward) continue;
           hasChanges = true;
 
@@ -412,17 +685,22 @@ export default function App() {
               const otherPorts = ports.filter(p => p !== entryPort);
               
               if (otherPorts.length > 0) {
-                let exitPort = otherPorts[0];
-                if (otherPorts.length > 1) {
-                  const straightPort = (entryPort + 2) % 4;
-                  const leftPort = (entryPort + 3) % 4;
-                  const rightPort = (entryPort + 1) % 4;
+                if (vehicle.randomTurning) {
+                  let exitPort = otherPorts[Math.floor(Math.random() * otherPorts.length)];
+                  exitHeading = exitPort * 90;
+                } else {
+                  let exitPort = otherPorts[0];
+                  if (otherPorts.length > 1) {
+                    const straightPort = (entryPort + 2) % 4;
+                    const leftPort = (entryPort + 3) % 4;
+                    const rightPort = (entryPort + 1) % 4;
 
-                  if (turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
-                  else if (turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
-                  else if (otherPorts.includes(straightPort)) exitPort = straightPort;
+                    if (turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
+                    else if (turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
+                    else if (otherPorts.includes(straightPort)) exitPort = straightPort;
+                  }
+                  exitHeading = exitPort * 90;
                 }
-                exitHeading = exitPort * 90;
               }
             }
 
@@ -457,13 +735,31 @@ export default function App() {
                     lane: isNext4Lane ? vehicle.lane : 1 // Reset to lane 1 if not 4-lane
                   };
                 } else {
-                  newVehicleState = { ...vehicle, progress: 0.99, isMoving: false };
+                  // Turn around at dead end
+                  newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                    ...vehicle, 
+                    heading: (heading + 180) % 360, 
+                    progress: 0, 
+                    isMoving: true 
+                  } : { ...vehicle, progress: 0.99, isMoving: false };
                 }
               } else {
-                newVehicleState = { ...vehicle, progress: 0.99, isMoving: false };
+                // Turn around if no matching tile
+                newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                  ...vehicle, 
+                  heading: (heading + 180) % 360, 
+                  progress: 0, 
+                  isMoving: true 
+                } : { ...vehicle, progress: 0.99, isMoving: false };
               }
             } else {
-              newVehicleState = { ...vehicle, progress: 0.99, isMoving: false };
+              // Turn around if no next tile in grid
+              newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                ...vehicle, 
+                heading: (heading + 180) % 360, 
+                progress: 0, 
+                isMoving: true 
+              } : { ...vehicle, progress: 0.99, isMoving: false };
             }
           } else if (progress < 0) {
             // Simple clamping for backward movement to avoid complex backward routing
@@ -658,118 +954,117 @@ export default function App() {
       if (e.repeat) return;
 
       // Vehicle controls
-      if (user && vehicles[user.uid]) {
+      if (selectedVehicles.size > 0) {
         const key = e.key.toLowerCase();
-        const myVehicle = vehicles[user.uid];
-        let updated = false;
-        let newVehicle = { ...myVehicle };
+        let anyUpdated = false;
+        const updatedVehicles = { ...vehicles };
 
-        if (key === 'g') {
-          newVehicle.isMoving = !newVehicle.isMoving;
-          updated = true;
-        } else if (key === 's') {
-          if (newVehicle.isMoving !== false) {
-            newVehicle.isMoving = false;
+        selectedVehicles.forEach(id => {
+          const myVehicle = updatedVehicles[id];
+          if (!myVehicle) return;
+          let updated = false;
+          let newVehicle = { ...myVehicle };
+
+          if (key === 'g') {
+            newVehicle.isMoving = !newVehicle.isMoving;
             updated = true;
-          }
-        } else if (key === 'f') {
-          newVehicle.isMoving = false;
-          newVehicle.stepForward = true;
-          updated = true;
-        } else if (key === 'b') {
-          newVehicle.isMoving = false;
-          newVehicle.stepBackward = true;
-          updated = true;
-        } else if (e.key === 'ArrowUp') {
-          const newSpeed = Math.min((newVehicle.speed || 1) + 0.5, 5);
-          if (newVehicle.speed !== newSpeed) {
-            newVehicle.speed = newSpeed;
-            updated = true;
-          }
-        } else if (e.key === 'ArrowDown') {
-          const newSpeed = Math.max((newVehicle.speed || 1) - 0.5, 0.5);
-          if (newVehicle.speed !== newSpeed) {
-            newVehicle.speed = newSpeed;
-            updated = true;
-          }
-        } else if (key === 'l' || key === 'r') {
-          const currentTiles = grid[`${myVehicle.x},${myVehicle.y}`];
-          const currentTile = currentTiles?.find(t => {
-            const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
-            return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
-          });
-          
-          const isIntersection = currentTile && (currentTile.type.includes('cross') || currentTile.type.includes('t') || currentTile.type.includes('roundabout'));
-          const is4Lane = currentTile?.type.includes('4lane');
-          const isOneWay = currentTile?.type.includes('oneway');
-          
-          if (!isIntersection && is4Lane) {
-            if (key === 'l') {
-              if (newVehicle.lane === 1) {
-                if (newVehicle.turnIntent !== 'left') {
-                  newVehicle.turnIntent = 'left';
-                  updated = true;
-                }
-              } else {
-                newVehicle.lane = 1;
-                updated = true;
-              }
-            } else if (key === 'r') {
-              if (newVehicle.lane === 2.5) {
-                if (newVehicle.turnIntent !== 'right') {
-                  newVehicle.turnIntent = 'right';
-                  updated = true;
-                }
-              } else {
-                newVehicle.lane = 2.5;
-                updated = true;
-              }
-            }
-          } else if (!isIntersection && isOneWay) {
-            if (key === 'l') {
-              if (newVehicle.lane === -1) {
-                if (newVehicle.turnIntent !== 'left') {
-                  newVehicle.turnIntent = 'left';
-                  updated = true;
-                }
-              } else {
-                newVehicle.lane = -1;
-                updated = true;
-              }
-            } else if (key === 'r') {
-              if (newVehicle.lane === 1) {
-                if (newVehicle.turnIntent !== 'right') {
-                  newVehicle.turnIntent = 'right';
-                  updated = true;
-                }
-              } else {
-                newVehicle.lane = 1;
-                updated = true;
-              }
-            }
-          } else {
-            const intent = key === 'l' ? 'left' : 'right';
-            if (newVehicle.turnIntent !== intent) {
-              newVehicle.turnIntent = intent;
+          } else if (key === 's') {
+            if (newVehicle.isMoving !== false) {
+              newVehicle.isMoving = false;
               updated = true;
             }
-          }
-        }
-
-        if (updated) {
-          const updatedVehicles = { ...vehicles, [user.uid]: newVehicle };
-          setVehicles(updatedVehicles);
-          if (roomCode && !quotaExceeded) {
-            const worldRef = doc(db, 'worlds', roomCode);
-            updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
-              .catch(err => {
-                if (err instanceof Error && err.message.includes('resource-exhausted')) {
-                  setQuotaExceeded(true);
+          } else if (key === 'f') {
+            newVehicle.isMoving = false;
+            newVehicle.stepForward = true;
+            updated = true;
+          } else if (key === 'b') {
+            newVehicle.isMoving = false;
+            newVehicle.stepBackward = true;
+            updated = true;
+          } else if (e.key === 'ArrowUp') {
+            const newSpeed = Math.min((newVehicle.speed || 1) + 0.5, 5);
+            if (newVehicle.speed !== newSpeed) {
+              newVehicle.speed = newSpeed;
+              updated = true;
+            }
+          } else if (e.key === 'ArrowDown') {
+            const newSpeed = Math.max((newVehicle.speed || 1) - 0.5, 0.5);
+            if (newVehicle.speed !== newSpeed) {
+              newVehicle.speed = newSpeed;
+              updated = true;
+            }
+          } else if (key === 'l' || key === 'r') {
+            const currentTiles = grid[`${myVehicle.x},${myVehicle.y}`];
+            const currentTile = currentTiles?.find(t => {
+              const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
+              return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
+            });
+            
+            const isIntersection = currentTile && (currentTile.type.includes('cross') || currentTile.type.includes('t') || currentTile.type.includes('roundabout'));
+            const is4Lane = currentTile?.type.includes('4lane');
+            const isOneWay = currentTile?.type.includes('oneway');
+            
+            if (!isIntersection && is4Lane) {
+              if (key === 'l') {
+                if (newVehicle.lane === 1) {
+                  if (newVehicle.turnIntent !== 'left') {
+                    newVehicle.turnIntent = 'left';
+                    updated = true;
+                  }
                 } else {
-                  console.error("Error updating vehicles:", err);
+                  newVehicle.lane = 1;
+                  updated = true;
                 }
-              });
+              } else if (key === 'r') {
+                if (newVehicle.lane === 2.5) {
+                  if (newVehicle.turnIntent !== 'right') {
+                    newVehicle.turnIntent = 'right';
+                    updated = true;
+                  }
+                } else {
+                  newVehicle.lane = 2.5;
+                  updated = true;
+                }
+              }
+            } else if (!isIntersection && isOneWay) {
+              if (key === 'l') {
+                if (newVehicle.lane === -1) {
+                  if (newVehicle.turnIntent !== 'left') {
+                    newVehicle.turnIntent = 'left';
+                    updated = true;
+                  }
+                } else {
+                  newVehicle.lane = -1;
+                  updated = true;
+                }
+              } else if (key === 'r') {
+                if (newVehicle.lane === 1) {
+                  if (newVehicle.turnIntent !== 'right') {
+                    newVehicle.turnIntent = 'right';
+                    updated = true;
+                  }
+                } else {
+                  newVehicle.lane = 1;
+                  updated = true;
+                }
+              }
+            } else {
+              const intent = key === 'l' ? 'left' : 'right';
+              if (newVehicle.turnIntent !== intent) {
+                newVehicle.turnIntent = intent;
+                updated = true;
+              }
+            }
           }
+
+          if (updated) {
+            updatedVehicles[id] = newVehicle;
+            anyUpdated = true;
+          }
+        });
+
+        if (anyUpdated) {
+          setVehicles(updatedVehicles);
           return;
         }
       }
@@ -936,8 +1231,85 @@ export default function App() {
     }
 
     if (!selectedTile) {
-      // Spawn vehicle on click if no tool selected
-      if (grid[key] && user) {
+      // Handle placing selected vehicles if mode is active
+      if (isPlacingVehicles && selectedVehicles.size > 0 && grid[key]) {
+        const localX = worldX - gridX * GRID_SIZE;
+        const localY = worldY - gridY * GRID_SIZE;
+        const existingTiles = grid[key];
+        const targetTile = existingTiles[existingTiles.length - 1];
+        
+        let zIndex = 0;
+        if (targetTile.type.includes('bridge') || targetTile.type.includes('trestle')) {
+          zIndex = 1;
+        }
+
+        let lane = 1;
+        let heading = targetTile.rotation;
+        
+        const relX = localX / GRID_SIZE;
+        const relY = localY / GRID_SIZE;
+        
+        const is4Lane = targetTile.type.includes('4lane');
+        const isOneWay = targetTile.type.includes('oneway');
+        const isRail = targetTile.type.startsWith('rail');
+
+        if (isRail) {
+          lane = 0;
+          if (targetTile.rotation === 0 || targetTile.rotation === 180) {
+            heading = relY > 0.5 ? 0 : 180;
+          } else {
+            heading = relX < 0.5 ? 90 : 270;
+          }
+        } else if (isOneWay) {
+          heading = targetTile.rotation;
+          if (heading === 0 || heading === 180) {
+            lane = relX > 0.5 ? 1 : -1;
+            if (heading === 180) lane = -lane;
+          } else {
+            lane = relY > 0.5 ? -1 : 1;
+            if (heading === 270) lane = -lane;
+          }
+        } else {
+          if (targetTile.rotation === 0 || targetTile.rotation === 180 || targetTile.type.includes('cross')) {
+            if (relX > 0.5) {
+              heading = 0;
+              lane = is4Lane ? (relX > 0.75 ? 2.5 : 1) : 1;
+            } else {
+              heading = 180;
+              lane = is4Lane ? (relX < 0.25 ? 2.5 : 1) : 1;
+            }
+          } else {
+            if (relY > 0.5) {
+              heading = 90;
+              lane = is4Lane ? (relY > 0.75 ? 2.5 : 1) : 1;
+            } else {
+              heading = 270;
+              lane = is4Lane ? (relY < 0.25 ? 2.5 : 1) : 1;
+            }
+          }
+        }
+
+        const updatedVehicles = { ...vehicles };
+        selectedVehicles.forEach(id => {
+          if (updatedVehicles[id]) {
+            updatedVehicles[id] = {
+              ...updatedVehicles[id],
+              x: gridX,
+              y: gridY,
+              heading,
+              lane,
+              progress: 0.5,
+              zIndex
+            };
+          }
+        });
+
+        setVehicles(updatedVehicles);
+        return;
+      }
+
+      // Spawn new single vehicle on alt-click
+      if (e.altKey && grid[key]) {
         const localX = worldX - gridX * GRID_SIZE;
         const localY = worldY - gridY * GRID_SIZE;
         
@@ -1001,8 +1373,9 @@ export default function App() {
             }
           }
 
+          const newId = Math.random().toString(36).substring(2, 11);
           const newVehicle: Vehicle = {
-            id: user.uid,
+            id: newId,
             x: gridX,
             y: gridY,
             heading: heading,
@@ -1012,10 +1385,13 @@ export default function App() {
             zIndex: zIndex,
             isMoving: false,
             speed: 1,
-            turnIntent: null
+            turnIntent: null,
+            turnAroundAtDeadEnd: true,
+            randomTurning: true
           };
-          const updatedVehicles = { ...vehicles, [user.uid]: newVehicle };
+          const updatedVehicles = { ...vehicles, [newId]: newVehicle };
           setVehicles(updatedVehicles);
+          setSelectedVehicles(new Set([...selectedVehicles, newId]));
           if (roomCode && !quotaExceeded) {
             const worldRef = doc(db, 'worlds', roomCode);
             updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
@@ -1596,6 +1972,16 @@ export default function App() {
   const gridX = Math.floor(worldX / GRID_SIZE);
   const gridY = Math.floor(worldY / GRID_SIZE);
 
+  const selectedVehiclesList = Array.from(selectedVehicles);
+  const activeCountIsMoving = selectedVehiclesList.filter(id => vehicles[id]?.isMoving).length;
+  const isMovingActive = selectedVehicles.size > 0 && activeCountIsMoving >= selectedVehicles.size / 2;
+
+  const activeCountTurnAround = selectedVehiclesList.filter(id => vehicles[id]?.turnAroundAtDeadEnd).length;
+  const isTurnAroundActive = selectedVehicles.size > 0 && activeCountTurnAround >= selectedVehicles.size / 2;
+
+  const activeCountRandomTurn = selectedVehiclesList.filter(id => vehicles[id]?.randomTurning).length;
+  const isRandomTurnActive = selectedVehicles.size > 0 && activeCountRandomTurn >= selectedVehicles.size / 2;
+
   return (
     <div className="flex h-screen w-full bg-slate-50 overflow-hidden font-sans text-slate-900 select-none">
       <AnimatePresence>
@@ -1784,201 +2170,155 @@ export default function App() {
           </div>
 
           {/* Library Section */}
-          <div className="pt-4 border-t border-slate-100">
-            <div className="flex items-center gap-2 mb-3 px-1">
-              <Bookmark className="w-4 h-4 text-blue-500" />
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">Saved Layouts</span>
+          <div className="pt-4 border-t border-slate-100 flex flex-col pt-0">
+            <div className="flex border-b border-slate-100 mt-2 mb-2">
+              <button 
+                onClick={() => setLibraryTab('layouts')}
+                className={`flex-1 py-2 text-xs font-bold uppercase tracking-wider transition-colors border-b-2 ${libraryTab === 'layouts' ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
+              >
+                Layouts
+              </button>
+              <button 
+                onClick={() => setLibraryTab('simulations')}
+                className={`flex-1 py-2 text-xs font-bold uppercase tracking-wider transition-colors border-b-2 ${libraryTab === 'simulations' ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
+              >
+                Sims
+              </button>
             </div>
             
-            <div className="space-y-2">
-              <div className="flex gap-2">
-                <input 
-                  type="text" 
-                  placeholder="Layout name..."
-                  value={newLayoutName}
-                  onChange={(e) => setNewLayoutName(e.target.value)}
-                  className="flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                />
-                <button 
-                  onClick={(e) => {
-                    e.preventDefault();
-                    saveToLibrary(false);
-                  }}
-                  disabled={!newLayoutName.trim()}
-                  className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 disabled:opacity-30 transition-colors"
-                >
-                  <Plus className="w-4 h-4" />
-                </button>
-              </div>
+            {libraryTab === 'layouts' ? (
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <input 
+                    type="text" 
+                    placeholder="Layout name..."
+                    value={newLayoutName}
+                    onChange={(e) => setNewLayoutName(e.target.value)}
+                    className="flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                  />
+                  <button 
+                    onClick={(e) => {
+                      e.preventDefault();
+                      saveToLibrary(false);
+                    }}
+                    disabled={!newLayoutName.trim()}
+                    className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 disabled:opacity-30 transition-colors"
+                  >
+                    <Plus className="w-4 h-4" />
+                  </button>
+                </div>
 
-              <div className="max-h-48 overflow-y-auto space-y-1 pr-1">
-                {library.length === 0 ? (
-                  <p className="text-[10px] text-slate-400 italic text-center py-4">No saved layouts yet</p>
-                ) : (
-                  library.map((item, index) => (
-                    <div key={index} className="group flex items-center justify-between bg-white border border-slate-100 rounded-lg p-2 hover:border-blue-200 transition-colors">
-                      <button 
-                        onClick={() => loadFromLibrary(item.data)}
-                        className="flex-1 text-left text-xs font-medium text-slate-600 truncate"
-                      >
-                        {item.name}
-                      </button>
-                      <button 
-                        onClick={() => deleteFromLibrary(item.id, item.name)}
-                        className="opacity-0 group-hover:opacity-100 p-1 text-slate-300 hover:text-red-500 transition-all"
-                      >
-                        <X className="w-3 h-3" />
-                      </button>
-                    </div>
-                  ))
-                )}
+                <div className="max-h-48 overflow-y-auto space-y-1 pr-1">
+                  {library.length === 0 ? (
+                    <p className="text-[10px] text-slate-400 italic text-center py-4">No saved layouts yet</p>
+                  ) : (
+                    library.map((item, index) => (
+                      <div key={index} className="group flex items-center justify-between bg-white border border-slate-100 rounded-lg p-2 hover:border-blue-200 transition-colors">
+                        <button 
+                          onClick={() => loadFromLibrary(item.data)}
+                          className="flex-1 text-left text-xs font-medium text-slate-600 truncate"
+                        >
+                          {item.name}
+                        </button>
+                        <button 
+                          onClick={() => deleteFromLibrary(item.id, item.name)}
+                          className="opacity-0 group-hover:opacity-100 p-1 text-slate-300 hover:text-red-500 transition-all"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex gap-2">
+                  <input 
+                    type="text" 
+                    placeholder="Sim name..."
+                    value={newSimulationName}
+                    onChange={(e) => setNewSimulationName(e.target.value)}
+                    className="flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500/50"
+                  />
+                  <button 
+                    onClick={(e) => {
+                      e.preventDefault();
+                      saveToSimulations();
+                    }}
+                    disabled={!newSimulationName.trim()}
+                    className="bg-purple-600 text-white p-2 rounded-lg hover:bg-purple-700 disabled:opacity-30 transition-colors"
+                  >
+                    <Plus className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="max-h-48 overflow-y-auto space-y-1 pr-1">
+                  {simulations.length === 0 ? (
+                    <p className="text-[10px] text-slate-400 italic text-center py-4">No saved simulations yet</p>
+                  ) : (
+                    simulations.map((item, index) => (
+                      <div key={index} className="group flex items-center justify-between bg-white border border-slate-100 rounded-lg p-2 hover:border-purple-200 transition-colors">
+                        <button 
+                          onClick={() => loadSimulation(item)}
+                          className="flex-1 flex items-center gap-2 text-left text-xs font-medium text-slate-600 truncate"
+                        >
+                          <PlayCircle className="w-3 h-3 text-purple-400" />
+                          <span className="truncate">{item.name}</span>
+                        </button>
+                        <button 
+                          onClick={() => setShowDeleteSimulationConfirm({ id: item.id, name: item.name })}
+                          className="opacity-0 group-hover:opacity-100 p-1 text-slate-300 hover:text-red-500 transition-all"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
-        <div className="p-4 border-t border-slate-100 bg-slate-50/50">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-widest text-center w-full">History & Tools</span>
-          </div>
-          
-          <div className="grid grid-cols-2 gap-2 mb-3">
-            <button 
-              onClick={undo}
-              disabled={historyIndex === 0}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-30"
-            >
-              <Undo className="w-3 h-3" />
-              Undo
-            </button>
-            <button 
-              onClick={redo}
-              disabled={historyIndex === history.length - 1}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-30"
-            >
-              <Redo className="w-3 h-3" />
-              Redo
-            </button>
-          </div>
-
-          <div className="grid grid-cols-3 gap-2 mb-3">
-            <button 
-              onClick={copySelection}
-              disabled={!selectionStart || !selectionEnd}
-              className="flex flex-col items-center justify-center gap-1 py-2 bg-white border border-slate-200 rounded-lg text-[10px] font-medium text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-30"
-              title="Copy (Ctrl+C)"
-            >
-              <Copy className="w-3 h-3" />
-              Copy
-            </button>
-            <button 
-              onClick={cutSelection}
-              disabled={!selectionStart || !selectionEnd}
-              className="flex flex-col items-center justify-center gap-1 py-2 bg-white border border-slate-200 rounded-lg text-[10px] font-medium text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-30"
-              title="Cut (Ctrl+X)"
-            >
-              <Scissors className="w-3 h-3" />
-              Cut
-            </button>
-            <button 
-              onClick={() => {
-                if (clipboard) {
-                  setIsPasting(true);
-                  setSelectedTile(null);
-                }
-              }}
-              disabled={!clipboard}
-              className="flex flex-col items-center justify-center gap-1 py-2 bg-white border border-slate-200 rounded-lg text-[10px] font-medium text-slate-600 hover:bg-slate-100 transition-colors disabled:opacity-30"
-              title="Paste (Ctrl+V)"
-            >
-              <ClipboardPaste className="w-3 h-3" />
-              Paste
-            </button>
+        <div className="p-4 border-t border-slate-100 bg-slate-50/50 flex flex-col gap-3">
+          <div className="flex items-center justify-center gap-1 bg-white border border-slate-200 rounded-lg p-1">
+            <button onClick={undo} disabled={historyIndex === 0} className="p-2 hover:bg-slate-100 rounded-md text-slate-600 disabled:opacity-30 transition-colors" title="Undo"><Undo className="w-4 h-4" /></button>
+            <button onClick={redo} disabled={historyIndex === history.length - 1} className="p-2 hover:bg-slate-100 rounded-md text-slate-600 disabled:opacity-30 transition-colors" title="Redo"><Redo className="w-4 h-4" /></button>
+            <div className="w-px h-4 bg-slate-200 mx-1" />
+            <button onClick={copySelection} disabled={!selectionStart || !selectionEnd} className="p-2 hover:bg-slate-100 rounded-md text-slate-600 disabled:opacity-30 transition-colors" title="Copy (Ctrl+C)"><Copy className="w-4 h-4" /></button>
+            <button onClick={cutSelection} disabled={!selectionStart || !selectionEnd} className="p-2 hover:bg-slate-100 rounded-md text-slate-600 disabled:opacity-30 transition-colors" title="Cut (Ctrl+X)"><Scissors className="w-4 h-4" /></button>
+            <button onClick={() => { if(clipboard){setIsPasting(true);setSelectedTile(null);} }} disabled={!clipboard} className="p-2 hover:bg-slate-100 rounded-md text-slate-600 disabled:opacity-30 transition-colors" title="Paste (Ctrl+V)"><ClipboardPaste className="w-4 h-4" /></button>
           </div>
 
           <div className="grid grid-cols-2 gap-2">
-            <button 
-              onClick={() => setRotation(prev => (prev + 90) % 360)}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors"
-            >
+            <button onClick={() => setRotation(prev => (prev + 90) % 360)} className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors">
               <RotateCcw className="w-3 h-3" />
               Rotate (R)
             </button>
-            <button 
-              onClick={() => {
-                setSelectedTile(null);
-                setIsPasting(false);
-              }}
-              className={`flex items-center justify-center gap-2 py-2 px-3 border rounded-lg text-xs font-medium transition-colors ${!selectedTile && !isPasting ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'}`}
-            >
+            <button onClick={() => { setSelectedTile(null); setIsPasting(false); }} className={`flex items-center justify-center gap-2 py-2 px-3 border rounded-lg text-xs font-medium transition-colors ${!selectedTile && !isPasting ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'}`}>
               <MousePointer2 className="w-3 h-3" />
               Select
             </button>
-            <button 
-              onClick={() => setShowClearConfirm(true)}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-red-600 hover:bg-red-50 transition-colors"
-            >
-              <Trash2 className="w-3 h-3" />
-              Clear
-            </button>
-            <button 
-              onClick={exportGrid}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors"
-            >
-              <Download className="w-3 h-3" />
-              Export
-            </button>
-            <button 
-              onClick={() => fileInputRef.current?.click()}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors"
-            >
-              <Upload className="w-3 h-3" />
-              Import
-            </button>
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              onChange={importGrid} 
-              accept=".json" 
-              className="hidden" 
-            />
-            <button 
-              onClick={() => setDensityModal({ type: 'map' })}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-colors col-span-2"
-              title="Generate a full map with roads, rails, and landscaping"
-            >
-              <MapIcon className="w-3 h-3" />
-              Generate Full Map
-            </button>
-            <button 
-              onClick={() => setDensityModal({ type: 'road' })}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-blue-600 hover:bg-blue-50 transition-colors"
-              title="Generate random road network"
-            >
-              <Route className="w-3 h-3" />
-              Random Roads
-            </button>
-            <button 
-              onClick={() => setDensityModal({ type: 'rail' })}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:bg-slate-100 transition-colors"
-              title="Generate sparse random rail network"
-            >
-              <Train className="w-3 h-3" />
-              Random Rails
-            </button>
-            <button 
-              onClick={() => randomLandscaping()}
-              className="flex items-center justify-center gap-2 py-2 px-3 bg-white border border-slate-200 rounded-lg text-xs font-medium text-emerald-600 hover:bg-emerald-50 transition-colors"
-              title="Fill empty spaces with random landscaping"
-            >
-              <Trees className="w-3 h-3" />
-              Auto-Landscape
-            </button>
           </div>
-          <button 
-            onClick={() => setShowInfo(true)}
-            className="mt-3 w-full flex items-center justify-center gap-2 py-2 px-3 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-colors"
-          >
+
+          <div className="flex justify-center gap-1 bg-white border border-slate-200 rounded-lg p-1">
+            <button onClick={() => setShowClearConfirm(true)} className="flex-1 flex justify-center p-2 hover:bg-red-50 text-red-600 rounded-md transition-colors" title="Clear Grid"><Trash2 className="w-4 h-4" /></button>
+            <div className="w-px h-4 bg-slate-200 mx-1 self-center" />
+            <button onClick={exportGrid} className="flex-1 flex justify-center p-2 hover:bg-slate-100 text-slate-600 rounded-md transition-colors" title="Export JSON"><Download className="w-4 h-4" /></button>
+            <button onClick={() => fileInputRef.current?.click()} className="flex-1 flex justify-center p-2 hover:bg-slate-100 text-slate-600 rounded-md transition-colors" title="Import JSON"><Upload className="w-4 h-4" /></button>
+          </div>
+          <input type="file" ref={fileInputRef} onChange={importGrid} accept=".json" className="hidden" />
+
+          <div className="flex justify-center gap-1 bg-white border border-slate-200 rounded-lg p-1">
+            <button onClick={() => setDensityModal({ type: 'map' })} className="flex-1 flex justify-center p-2 hover:bg-blue-50 text-blue-600 rounded-md transition-colors" title="Generate Full Map"><MapIcon className="w-4 h-4" /></button>
+            <div className="w-px h-4 bg-slate-200 mx-1 self-center" />
+            <button onClick={() => setDensityModal({ type: 'road' })} className="flex-1 flex justify-center p-2 hover:bg-slate-100 text-slate-600 rounded-md transition-colors" title="Random Roads"><Route className="w-4 h-4" /></button>
+            <button onClick={() => setDensityModal({ type: 'rail' })} className="flex-1 flex justify-center p-2 hover:bg-slate-100 text-slate-600 rounded-md transition-colors" title="Random Rails"><Train className="w-4 h-4" /></button>
+            <button onClick={() => randomLandscaping()} className="flex-1 flex justify-center p-2 hover:bg-emerald-50 text-emerald-600 rounded-md transition-colors" title="Auto-Landscape"><Trees className="w-4 h-4" /></button>
+          </div>
+
+          <button onClick={() => setShowInfo(true)} className="w-full flex items-center justify-center gap-2 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-colors">
             <Info className="w-3 h-3" />
             Help Guide
           </button>
@@ -2069,13 +2409,26 @@ export default function App() {
               }
               
               return (
-                <VehicleComponent 
-                  key={v.id}
-                  {...v} 
-                  tileType={currentTile?.type}
-                  tileRotation={currentTile?.rotation}
-                  exitHeading={exitHeading}
-                />
+                <div key={v.id}>
+                  {selectedVehicles.has(v.id) && (
+                    <div 
+                      className="absolute border-2 border-yellow-400 rounded-full z-20 pointer-events-none"
+                      style={{
+                        left: v.x * GRID_SIZE - 2,
+                        top: v.y * GRID_SIZE - 2,
+                        width: GRID_SIZE + 4,
+                        height: GRID_SIZE + 4,
+                        opacity: 0.8
+                      }}
+                    />
+                  )}
+                  <VehicleComponent 
+                    {...v} 
+                    tileType={currentTile?.type}
+                    tileRotation={currentTile?.rotation}
+                    exitHeading={exitHeading}
+                  />
+                </div>
               );
             })}
           </AnimatePresence>
@@ -2217,6 +2570,14 @@ export default function App() {
             >
               <Hand className="w-5 h-5" />
             </button>
+            <div className="h-px bg-slate-100 mx-2" />
+            <button 
+              onClick={() => setShowCarManager(!showCarManager)}
+              className={`p-3 rounded-xl transition-colors ${showCarManager ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:bg-slate-50'}`}
+              title="Car Manager"
+            >
+              <CarFront className="w-5 h-5" />
+            </button>
           </div>
           
           <div className="bg-white rounded-full shadow-2xl border border-slate-200 p-3 flex items-center justify-center text-slate-400 text-xs font-bold">
@@ -2224,8 +2585,263 @@ export default function App() {
           </div>
         </div>
 
+        {/* Car Manager Side Panel */}
+        <AnimatePresence>
+          {showCarManager && (
+            <motion.div
+              initial={{ x: 400, opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: 400, opacity: 0 }}
+              className="absolute right-0 top-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col"
+            >
+              <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-indigo-50 text-indigo-500 rounded-xl">
+                    <Car className="w-5 h-5" />
+                  </div>
+                  <h2 className="font-bold text-slate-800">Car Manager</h2>
+                </div>
+                <button 
+                  onClick={() => setShowCarManager(false)}
+                  className="p-2 hover:bg-slate-50 text-slate-400 rounded-xl transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
+                <div className="bg-slate-50 rounded-2xl p-4 border border-slate-100">
+                  <div className="flex items-center gap-2 mb-3">
+                    <input 
+                      type="number" 
+                      ref={addCarsCountRef}
+                      defaultValue={1}
+                      min={1}
+                      max={50}
+                      className="w-20 p-2 text-sm border border-slate-200 rounded-xl outline-none focus:border-indigo-500"
+                    />
+                    <button 
+                      onClick={addRandomCars}
+                      className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl py-2 px-3 text-sm font-semibold transition-colors disabled:opacity-50"
+                      disabled={!roomCode}
+                    >
+                      Add Random Cars
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between px-2">
+                  <div className="flex flex-col gap-1">
+                    <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                      <input 
+                        type="checkbox" 
+                        checked={Object.keys(vehicles).length > 0 && selectedVehicles.size === Object.keys(vehicles).length}
+                        onChange={toggleAllCars}
+                        className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-600"
+                      />
+                      Select All ({selectedVehicles.size}/{Object.keys(vehicles).length})
+                    </label>
+                    <button
+                      onClick={() => {
+                        const newSelection = new Set<string>();
+                        Object.keys(vehicles).forEach(id => {
+                          if (!selectedVehicles.has(id)) newSelection.add(id);
+                        });
+                        setSelectedVehicles(newSelection);
+                      }}
+                      className="text-xs text-indigo-600 hover:text-indigo-700 text-left underline underline-offset-2 ml-5 transition-colors"
+                    >
+                      Invert Selection
+                    </button>
+                  </div>
+                  <button 
+                    onClick={removeSelectedCars}
+                    disabled={selectedVehicles.size === 0 || !roomCode}
+                    className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
+                    title="Remove Selected"
+                  >
+                    <Trash2 className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="flex-1 bg-white border border-slate-100 rounded-2xl overflow-y-auto shadow-inner flex flex-col min-h-[200px]">
+                  {(Object.values(vehicles) as Vehicle[]).map((v) => (
+                    <label key={v.id} className="flex items-center gap-3 p-3 hover:bg-slate-50 border-b border-slate-50 cursor-pointer">
+                      <input 
+                        type="checkbox"
+                        checked={selectedVehicles.has(v.id)}
+                        onChange={(e) => {
+                          const newSet = new Set(selectedVehicles);
+                          if (e.target.checked) newSet.add(v.id);
+                          else newSet.delete(v.id);
+                          setSelectedVehicles(newSet);
+                        }}
+                        className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-600"
+                      />
+                      <div className="w-4 h-4 rounded-full shadow-inner" style={{ backgroundColor: v.color }} />
+                      <span className="text-xs font-mono text-slate-500">{v.id}</span>
+                    </label>
+                  ))}
+                  {Object.keys(vehicles).length === 0 && (
+                    <div className="flex-1 flex items-center justify-center text-sm text-slate-400">
+                      No cars active
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="p-4 border-t border-slate-200 bg-slate-50/50 flex flex-col gap-4">
+                <button 
+                  disabled={selectedVehicles.size === 0 || !roomCode}
+                  onClick={distributeSelectedCars}
+                  className="bg-white border border-slate-200 hover:border-slate-300 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 disabled:opacity-40 w-full shadow-sm"
+                >
+                  Distribute Randomly
+                </button>
+                
+                <div className="flex items-center gap-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                  <span className="text-sm font-medium text-slate-700 w-12">Speed</span>
+                  <input 
+                    type="range" 
+                    min="0.5" 
+                    max="5" 
+                    step="0.5"
+                    disabled={selectedVehicles.size === 0 || !roomCode}
+                    value={selectedVehicles.size > 0 ? (vehicles[Array.from(selectedVehicles)[0]]?.speed || 1) : 1}
+                    onChange={(e) => changeSelectedCarsSpeed(parseFloat(e.target.value))}
+                    className="flex-1"
+                  />
+                  <span className="text-xs font-bold text-slate-400 w-8 text-right">
+                    {selectedVehicles.size > 0 ? (vehicles[Array.from(selectedVehicles)[0]]?.speed || 1).toFixed(1) : '-'}x
+                  </span>
+                </div>
+
+                <div className="flex flex-col gap-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                  <label className={`flex items-center justify-between cursor-pointer ${selectedVehicles.size === 0 ? 'opacity-40' : ''}`}>
+                    <span className="text-sm font-medium text-slate-700">Go / Stop</span>
+                    <button 
+                      type="button"
+                      disabled={selectedVehicles.size === 0 || !roomCode}
+                      onClick={() => toggleSelectedCarsAttribute('isMoving')}
+                      className={`w-[44px] h-[24px] rounded-full p-1 transition-colors flex items-center ${isMovingActive ? 'bg-indigo-600' : 'bg-slate-300'}`}
+                    >
+                      <div className={`w-4 h-4 bg-white rounded-full transition-transform ${isMovingActive ? 'translate-x-[20px]' : 'translate-x-0'}`} />
+                    </button>
+                  </label>
+
+                  <label className={`flex items-center justify-between cursor-pointer ${selectedVehicles.size === 0 ? 'opacity-40' : ''}`}>
+                    <span className="text-sm font-medium text-slate-700">Turn around at end</span>
+                    <button 
+                      type="button"
+                      disabled={selectedVehicles.size === 0 || !roomCode}
+                      onClick={() => toggleSelectedCarsAttribute('turnAroundAtDeadEnd')}
+                      className={`w-[44px] h-[24px] rounded-full p-1 transition-colors flex items-center ${isTurnAroundActive ? 'bg-indigo-600' : 'bg-slate-300'}`}
+                    >
+                      <div className={`w-4 h-4 bg-white rounded-full transition-transform ${isTurnAroundActive ? 'translate-x-[20px]' : 'translate-x-0'}`} />
+                    </button>
+                  </label>
+
+                  <label className={`flex items-center justify-between cursor-pointer ${selectedVehicles.size === 0 ? 'opacity-40' : ''}`}>
+                    <span className="text-sm font-medium text-slate-700">Random Turns</span>
+                    <button 
+                      type="button"
+                      disabled={selectedVehicles.size === 0 || !roomCode}
+                      onClick={() => toggleSelectedCarsAttribute('randomTurning')}
+                      className={`w-[44px] h-[24px] rounded-full p-1 transition-colors flex items-center ${isRandomTurnActive ? 'bg-indigo-600' : 'bg-slate-300'}`}
+                    >
+                      <div className={`w-4 h-4 bg-white rounded-full transition-transform ${isRandomTurnActive ? 'translate-x-[20px]' : 'translate-x-0'}`} />
+                    </button>
+                  </label>
+                </div>
+
+                <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                  <label className={`flex items-center justify-between cursor-pointer`}>
+                    <span className="text-sm font-medium text-slate-700">Place Cars (Click Grid)</span>
+                    <button 
+                      type="button"
+                      disabled={!roomCode}
+                      onClick={() => setIsPlacingVehicles(!isPlacingVehicles)}
+                      className={`w-[44px] h-[24px] rounded-full p-1 transition-colors flex items-center ${isPlacingVehicles ? 'bg-orange-500' : 'bg-slate-300'}`}
+                    >
+                      <div className={`w-4 h-4 bg-white rounded-full transition-transform ${isPlacingVehicles ? 'translate-x-[20px]' : 'translate-x-0'}`} />
+                    </button>
+                  </label>
+                </div>
+              </div>
+
+            </motion.div>
+          )}
+        </AnimatePresence>
+
           {/* Modals */}
           <AnimatePresence>
+            {showDeleteSimulationConfirm && (
+              <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm z-[110] flex items-center justify-center p-4">
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="bg-white border border-slate-200 rounded-[2rem] p-8 shadow-2xl max-w-sm w-full text-center"
+                >
+                  <div className="bg-red-100 w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-6">
+                    <Trash2 className="w-8 h-8 text-red-600" />
+                  </div>
+                  <h3 className="text-xl font-bold text-slate-900 mb-2">Delete Simulation?</h3>
+                  <p className="text-slate-500 mb-8 leading-relaxed">
+                    Are you sure you want to delete <span className="font-bold text-slate-700">"{showDeleteSimulationConfirm.name}"</span>? This action cannot be undone.
+                  </p>
+                  <div className="flex gap-3">
+                    <button 
+                      onClick={() => setShowDeleteSimulationConfirm(null)}
+                      className="flex-1 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold hover:bg-slate-200 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      onClick={confirmDeleteSimulation}
+                      className="flex-1 py-3 bg-red-600 text-white rounded-xl font-bold hover:bg-red-700 transition-colors shadow-lg shadow-red-200"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+
+            {showSaveSimulationConfirm && (
+              <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm z-[110] flex items-center justify-center p-4">
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="bg-white border border-slate-200 rounded-[2rem] p-8 shadow-2xl max-w-sm w-full text-center"
+                >
+                  <div className="bg-purple-100 w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-6">
+                    <Save className="w-8 h-8 text-purple-600" />
+                  </div>
+                  <h3 className="text-xl font-bold text-slate-900 mb-2">Save Simulation?</h3>
+                  <p className="text-slate-500 mb-8">
+                    Your Simulation name is active. Would you like to save it?
+                  </p>
+                  <div className="flex gap-3">
+                    <button 
+                      onClick={() => setShowSaveSimulationConfirm(false)}
+                      className="flex-1 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold hover:bg-slate-200 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      onClick={() => {
+                        saveToSimulations();
+                        setShowSaveSimulationConfirm(false);
+                      }}
+                      className="flex-1 py-3 bg-purple-600 text-white rounded-xl font-bold hover:bg-purple-700 transition-colors"
+                    >
+                      Save
+                    </button>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+
             {showDeleteLayoutConfirm && (
               <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm z-[110] flex items-center justify-center p-4">
                 <motion.div 

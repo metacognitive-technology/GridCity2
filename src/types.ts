@@ -65,4 +65,6 @@ export interface Vehicle {
   turnIntent?: 'left' | 'right' | 'straight' | null;
   stepForward?: boolean;
   stepBackward?: boolean;
+  turnAroundAtDeadEnd?: boolean;
+  randomTurning?: boolean;
 }
