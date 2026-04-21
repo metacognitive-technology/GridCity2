@@ -484,17 +484,21 @@ export default function App() {
   };
 
   const distributeSelectedCars = () => {
-    const roadTiles = Object.entries(grid).filter(([key, tiles]) => 
-      (tiles as GridTile[]).some(t => t.type.startsWith('road') || t.type.startsWith('rail'))
-    );
-    if (roadTiles.length === 0) return;
-    
     let updatedVehicles = { ...vehicles };
     let anyUpdates = false;
 
     selectedVehicles.forEach(id => {
       const v = updatedVehicles[id];
       if (v) {
+        const vType = v.type || 'car';
+        const roadTiles = Object.entries(grid).filter(([key, tiles]) => 
+          (tiles as GridTile[]).some(t => {
+            if (t.type === 'rail-road-crossing') return true;
+            return vType === 'train' ? (t.type.startsWith('rail') || t.type.includes('trestle')) : t.type.startsWith('road');
+          })
+        );
+        if (roadTiles.length === 0) return;
+
         const randomRoad = roadTiles[Math.floor(Math.random() * roadTiles.length)];
         const [rx, ry] = randomRoad[0].split(',').map(Number);
         const tileList = randomRoad[1] as GridTile[];
@@ -512,7 +516,7 @@ export default function App() {
            y: ry,
            heading: targetTile.rotation,
            progress: Math.random(),
-           lane: is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1),
+           lane: vType === 'train' ? 0 : (is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1)),
            zIndex
         };
         anyUpdates = true;
@@ -524,12 +528,15 @@ export default function App() {
     }
   };
 
-  const addRandomCars = () => {
+  const addRandomCars = (type: 'car' | 'train' | 'semi' = 'car') => {
     const count = parseInt(addCarsCountRef.current?.value || '1', 10);
     if (isNaN(count) || count <= 0) return;
 
     const roadTiles = Object.entries(grid).filter(([key, tiles]) => 
-      (tiles as GridTile[]).some(t => t.type.startsWith('road') || t.type.startsWith('rail'))
+      (tiles as GridTile[]).some(t => {
+        if (t.type === 'rail-road-crossing') return true;
+        return type === 'train' ? (t.type.startsWith('rail') || t.type.includes('trestle')) : t.type.startsWith('road');
+      })
     );
 
     const updatedVehicles = { ...vehicles };
@@ -550,12 +557,13 @@ export default function App() {
           newX = rx;
           newY = ry;
           heading = topTile.rotation;
-          lane = is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1);
-          zIndex = topTile.type.includes('bridge') ? 1 : 0;
+          lane = type === 'train' ? 0 : (is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1));
+          zIndex = topTile.type.includes('bridge') || topTile.type.includes('trestle') ? 1 : 0;
         }
 
         updatedVehicles[id] = {
            id,
+           type,
            x: newX,
            y: newY,
            heading,
@@ -567,6 +575,7 @@ export default function App() {
            speed: 1,
            turnAroundAtDeadEnd: true,
            randomTurning: true,
+           trailers: type === 'semi' ? 1 : undefined,
         };
     }
     setVehicles(updatedVehicles);
@@ -575,7 +584,9 @@ export default function App() {
         const worldRef = doc(db, 'worlds', roomCode);
         updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
           .catch(err => {
-            if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+            if (err instanceof Error && err.message.includes('resource-exhausted')) {
+              setQuotaExceeded(true);
+            }
           });
     }
   };
@@ -621,6 +632,27 @@ export default function App() {
       if (updatedVehicles[id]) {
         updatedVehicles[id] = { ...updatedVehicles[id], [attr]: newState };
         anyUpdates = true;
+      }
+    });
+
+    if (anyUpdates) {
+      setVehicles(updatedVehicles);
+    }
+  };
+
+  const changeSelectedTrailers = (delta: number) => {
+    if (selectedVehicles.size === 0) return;
+    const updatedVehicles = { ...vehicles };
+    let anyUpdates = false;
+    selectedVehicles.forEach(id => {
+      const v = updatedVehicles[id];
+      if (v && v.type === 'semi') {
+        const current = v.trailers ?? 1;
+        const next = Math.max(0, Math.min(2, current + delta));
+        if (current !== next) {
+          updatedVehicles[id] = { ...v, trailers: next };
+          anyUpdates = true;
+        }
       }
     });
 
@@ -730,24 +762,39 @@ export default function App() {
               });
 
               if (nextTile) {
-                const nextPorts = (TILE_CONNECTIONS[nextTile.type] || []).map(p => (p + nextTile.rotation / 90) % 4);
-                const nextEntryPort = (exitHeading / 90 + 2) % 4;
+                const isTrain = (vehicle.type === 'train');
+                const isNextRail = nextTile.type.startsWith('rail') || nextTile.type.includes('trestle');
+                const isNextRoad = nextTile.type.startsWith('road');
+                const isCrossing = nextTile.type === 'rail-road-crossing';
+                
+                if ((isTrain && (isNextRail || isCrossing)) || (!isTrain && (isNextRoad || isCrossing))) {
+                  const nextPorts = (TILE_CONNECTIONS[nextTile.type] || []).map(p => (p + nextTile.rotation / 90) % 4);
+                  const nextEntryPort = (exitHeading / 90 + 2) % 4;
 
-                if (nextPorts.includes(nextEntryPort)) {
-                  const isNext4Lane = nextTile.type.includes('4lane');
-                  
-                  newVehicleState = {
-                    ...vehicle,
-                    x: nextX,
-                    y: nextY,
-                    heading: exitHeading,
-                    progress: progress - 1, // Keep remainder
-                    zIndex: zIndex,
-                    turnIntent: null, // Reset turn intent after entering new tile
-                    lane: isNext4Lane ? vehicle.lane : 1 // Reset to lane 1 if not 4-lane
-                  };
+                  if (nextPorts.includes(nextEntryPort)) {
+                    const isNext4Lane = nextTile.type.includes('4lane');
+                    
+                    newVehicleState = {
+                      ...vehicle,
+                      x: nextX,
+                      y: nextY,
+                      heading: exitHeading,
+                      progress: progress - 1, // Keep remainder
+                      zIndex: zIndex,
+                      turnIntent: null, // Reset turn intent after entering new tile
+                      lane: isNext4Lane ? vehicle.lane : 1 // Reset to lane 1 if not 4-lane
+                    };
+                  } else {
+                    // Turn around at dead end (not connected port)
+                    newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                      ...vehicle, 
+                      heading: (heading + 180) % 360, 
+                      progress: 0, 
+                      isMoving: true 
+                    } : { ...vehicle, progress: 0.99, isMoving: false };
+                  }
                 } else {
-                  // Turn around at dead end
+                  // Turn around if vehicle type doesn't match tile type
                   newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
                     ...vehicle, 
                     heading: (heading + 180) % 360, 
@@ -1017,7 +1064,7 @@ export default function App() {
             const isOneWay = currentTile?.type.includes('oneway');
             
             if (!isIntersection && is4Lane) {
-              if (key === 'l') {
+              if (key === 'r') {
                 if (newVehicle.lane === 1) {
                   if (newVehicle.turnIntent !== 'left') {
                     newVehicle.turnIntent = 'left';
@@ -1027,7 +1074,7 @@ export default function App() {
                   newVehicle.lane = 1;
                   updated = true;
                 }
-              } else if (key === 'r') {
+              } else if (key === 'l') {
                 if (newVehicle.lane === 2.5) {
                   if (newVehicle.turnIntent !== 'right') {
                     newVehicle.turnIntent = 'right';
@@ -1039,7 +1086,7 @@ export default function App() {
                 }
               }
             } else if (!isIntersection && isOneWay) {
-              if (key === 'l') {
+              if (key === 'r') {
                 if (newVehicle.lane === -1) {
                   if (newVehicle.turnIntent !== 'left') {
                     newVehicle.turnIntent = 'left';
@@ -1049,7 +1096,7 @@ export default function App() {
                   newVehicle.lane = -1;
                   updated = true;
                 }
-              } else if (key === 'r') {
+              } else if (key === 'l') {
                 if (newVehicle.lane === 1) {
                   if (newVehicle.turnIntent !== 'right') {
                     newVehicle.turnIntent = 'right';
@@ -1061,7 +1108,7 @@ export default function App() {
                 }
               }
             } else {
-              const intent = key === 'l' ? 'left' : 'right';
+              const intent = key === 'r' ? 'left' : 'right';
               if (newVehicle.turnIntent !== intent) {
                 newVehicle.turnIntent = intent;
                 updated = true;
@@ -1386,8 +1433,10 @@ export default function App() {
           }
 
           const newId = Math.random().toString(36).substring(2, 11);
+          const newType = isRail ? 'train' : 'car';
           const newVehicle: Vehicle = {
             id: newId,
+            type: newType,
             x: gridX,
             y: gridY,
             heading: heading,
@@ -1399,7 +1448,8 @@ export default function App() {
             speed: 1,
             turnIntent: null,
             turnAroundAtDeadEnd: true,
-            randomTurning: true
+            randomTurning: true,
+            trailers: newType === 'semi' ? 1 : undefined,
           };
           const updatedVehicles = { ...vehicles, [newId]: newVehicle };
           setVehicles(updatedVehicles);
@@ -2622,8 +2672,8 @@ export default function App() {
               </div>
 
               <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
-                <div className="bg-slate-50 rounded-2xl p-4 border border-slate-100">
-                  <div className="flex items-center gap-2 mb-3">
+                <div className="bg-slate-50 rounded-2xl p-4 border border-slate-100 flex flex-col gap-2">
+                  <div className="flex items-center gap-2 mb-1">
                     <input 
                       type="number" 
                       ref={addCarsCountRef}
@@ -2632,12 +2682,29 @@ export default function App() {
                       max={50}
                       className="w-20 p-2 text-sm border border-slate-200 rounded-xl outline-none focus:border-indigo-500"
                     />
+                    <span className="text-sm font-medium text-slate-600">Count</span>
+                  </div>
+                  <div className="flex items-center gap-2">
                     <button 
-                      onClick={addRandomCars}
-                      className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl py-2 px-3 text-sm font-semibold transition-colors disabled:opacity-50"
+                      onClick={() => addRandomCars('car')}
+                      className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl py-2 px-2 text-xs font-semibold transition-colors disabled:opacity-50"
                       disabled={!roomCode}
                     >
-                      Add Random Cars
+                      + Car
+                    </button>
+                    <button 
+                      onClick={() => addRandomCars('semi')}
+                      className="flex-1 bg-amber-600 hover:bg-amber-700 text-white rounded-xl py-2 px-2 text-xs font-semibold transition-colors disabled:opacity-50"
+                      disabled={!roomCode}
+                    >
+                      + Semi
+                    </button>
+                    <button 
+                      onClick={() => addRandomCars('train')}
+                      className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl py-2 px-2 text-xs font-semibold transition-colors disabled:opacity-50"
+                      disabled={!roomCode}
+                    >
+                      + Train
                     </button>
                   </div>
                 </div>
@@ -2710,6 +2777,24 @@ export default function App() {
                 >
                   Distribute Randomly
                 </button>
+                
+                {Array.from(selectedVehicles).some(id => vehicles[id]?.type === 'semi') && (
+                  <div className="flex items-center justify-between gap-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                    <span className="text-sm font-medium text-slate-700">Trailers</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => changeSelectedTrailers(-1)}
+                        disabled={!roomCode}
+                        className="w-8 h-8 flex justify-center items-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold transition-colors"
+                      >-</button>
+                      <button
+                        onClick={() => changeSelectedTrailers(1)}
+                        disabled={!roomCode}
+                        className="w-8 h-8 flex justify-center items-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold transition-colors"
+                      >+</button>
+                    </div>
+                  </div>
+                )}
                 
                 <div className="flex items-center gap-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
                   <span className="text-sm font-medium text-slate-700 w-12">Speed</span>

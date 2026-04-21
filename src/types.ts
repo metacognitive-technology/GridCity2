@@ -60,6 +60,8 @@ export interface Vehicle {
   progress: number; // 0 to 1 within the tile
   color: string;
   zIndex: number; // 0 for ground, 1 for bridge
+  type?: 'car' | 'train' | 'semi';
+  trailers?: number;
   isMoving?: boolean;
   speed?: number;
   turnIntent?: 'left' | 'right' | 'straight' | null;
