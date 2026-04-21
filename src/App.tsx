@@ -43,7 +43,7 @@ import { Vehicle as VehicleComponent } from './components/Vehicle';
 import { TileType, GridData, Point, GridTile, Vehicle } from './types';
 import { auth, db, handleFirestoreError, OperationType, loginAnonymously, logout as firebaseLogout } from './firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp, collection, addDoc, deleteDoc } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp, collection, addDoc, deleteDoc, disableNetwork } from 'firebase/firestore';
 
 const GRID_SIZE = 64;
 const INITIAL_ZOOM = 1;
@@ -152,7 +152,15 @@ const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' 
 ];
 
 export default function App() {
-  const [grid, setGrid] = useState<GridData>({});
+  const [grid, _setGrid] = useState<GridData>({});
+  const localGridRef = useRef<GridData>({});
+  const setGrid = useCallback((newGrid: GridData | ((prev: GridData) => GridData)) => {
+    _setGrid((prev) => {
+      const next = typeof newGrid === 'function' ? newGrid(prev) : newGrid;
+      localGridRef.current = next;
+      return next;
+    });
+  }, []);
   const [history, setHistory] = useState<GridData[]>([{}]);
   const [historyIndex, setHistoryIndex] = useState(0);
   
@@ -207,7 +215,11 @@ export default function App() {
 
   const [user, setUser] = useState<User | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [quotaExceeded, setQuotaExceeded] = useState(false);
+  const [quotaExceeded, _setQuotaExceeded] = useState(false);
+  const setQuotaExceeded = useCallback((val: boolean) => {
+    _setQuotaExceeded(val);
+    if (val) disableNetwork(db).catch(console.error);
+  }, []);
 
   // Sync library from Firestore
   useEffect(() => {
@@ -267,8 +279,8 @@ export default function App() {
       if (docSnap.exists()) {
         const data = docSnap.data();
         if (data.grid) {
-          // Compare with current grid to avoid unnecessary updates
-          if (JSON.stringify(data.grid) !== JSON.stringify(grid)) {
+          // Compare with current local grid state to avoid loops
+          if (JSON.stringify(data.grid) !== JSON.stringify(localGridRef.current)) {
             isRemoteChange.current = true;
             setGrid(data.grid);
             setHistory(prev => {

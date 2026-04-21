@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged, User } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot, getDocFromServer, collection, updateDoc, serverTimestamp, Timestamp, getDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, onSnapshot, getDocFromServer, collection, updateDoc, serverTimestamp, Timestamp, getDoc, disableNetwork } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 // Initialize Firebase
@@ -54,6 +54,9 @@ export interface FirestoreErrorInfo {
 }
 
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  if (error instanceof Error && error.message.includes('resource-exhausted')) {
+    disableNetwork(db).catch(console.error);
+  }
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
