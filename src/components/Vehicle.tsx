@@ -1,6 +1,8 @@
 import React from 'react';
 import { motion } from 'motion/react';
 
+import { RailcarType } from '../types';
+
 interface VehicleProps {
   id: string;
   x: number;
@@ -16,6 +18,7 @@ interface VehicleProps {
   exitHeading?: number;
   type?: 'car' | 'train' | 'semi';
   trailers?: number;
+  railcars?: RailcarType[];
 }
 
 const GRID_SIZE = 64;
@@ -79,32 +82,57 @@ export function getTrajectory(x: number, y: number, heading: number, targetHeadi
   return { posX, posY, rotation: currentRotation };
 }
 
-const Trailer: React.FC<{
-  x: number;
-  y: number;
-  heading: number;
-  targetHeading: number;
-  lane: number;
-  progress: number;
-  zIndex: number;
-  index: number;
-}> = ({ x, y, heading, targetHeading, lane, progress, zIndex, index }) => {
-  const pixelOffset = 27 + index * 42;
-  const progressOffset = pixelOffset / GRID_SIZE;
-  
-  let tProg = progress - progressOffset;
-  let target = targetHeading;
-
-  if (tProg < 0) {
-     target = heading;
+function sampleHistory(history: {x: number, y: number, r: number, d: number}[], targetDist: number) {
+  if (history.length === 1 || targetDist <= history[0].d) {
+     const oldest = history[0];
+     const overshoot = oldest.d - targetDist;
+     const rad = (oldest.r - 90) * (Math.PI / 180);
+     return {
+       x: oldest.x - Math.cos(rad) * overshoot,
+       y: oldest.y - Math.sin(rad) * overshoot,
+       r: oldest.r
+     };
+  } else if (targetDist >= history[history.length - 1].d) {
+     const newest = history[history.length - 1];
+     const overshoot = targetDist - newest.d;
+     const rad = (newest.r - 90) * (Math.PI / 180);
+     return {
+       x: newest.x + Math.cos(rad) * overshoot,
+       y: newest.y + Math.sin(rad) * overshoot,
+       r: newest.r
+     };
+  } else {
+     for (let j = history.length - 1; j >= 1; j--) {
+         const p1 = history[j-1];
+         const p2 = history[j];
+         if (targetDist >= p1.d && targetDist <= p2.d) {
+             const t = (targetDist - p1.d) / (p2.d - p1.d);
+             let rDiff = (p2.r - p1.r) % 360;
+             if (rDiff > 180) rDiff -= 360;
+             if (rDiff < -180) rDiff += 360;
+             return {
+               x: p1.x + (p2.x - p1.x) * t,
+               y: p1.y + (p2.y - p1.y) * t,
+               r: p1.r + rDiff * t
+             };
+         }
+     }
   }
+  return history[0];
+}
 
-  const { posX, posY, rotation } = getTrajectory(x, y, heading, target, lane, tProg);
-
+const Trailer: React.FC<{
+  posX: number;
+  posY: number;
+  rotation: number;
+  zIndex: number;
+}> = ({ posX, posY, rotation, zIndex }) => {
   const prevRotationRef = React.useRef(rotation);
+  
   let diff = (rotation - prevRotationRef.current) % 360;
   if (diff > 180) diff -= 360;
   if (diff < -180) diff += 360;
+  
   const displayRotation = prevRotationRef.current + diff;
   prevRotationRef.current = displayRotation;
 
@@ -138,7 +166,97 @@ const Trailer: React.FC<{
   );
 };
 
-export const Vehicle: React.FC<VehicleProps> = ({ x, y, heading, lane, progress, color, zIndex, exitHeading, type = 'car', trailers = 0 }) => {
+const Railcar: React.FC<{
+  posX: number;
+  posY: number;
+  rotation: number;
+  zIndex: number;
+  railcarType: RailcarType;
+}> = ({ posX, posY, rotation, zIndex, railcarType }) => {
+  const prevRotationRef = React.useRef(rotation);
+  
+  let diff = (rotation - prevRotationRef.current) % 360;
+  if (diff > 180) diff -= 360;
+  if (diff < -180) diff += 360;
+  
+  const displayRotation = prevRotationRef.current + diff;
+  prevRotationRef.current = displayRotation;
+
+  let bg = '#94a3b8';
+  let inner = null;
+  switch (railcarType) {
+    case 'passenger':
+      bg = '#2563eb';
+      inner = (
+        <div style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '4px 0', justifyContent: 'space-evenly', alignItems: 'center' }}>
+          {[...Array(5)].map((_, i) => <div key={i} style={{ width: 10, height: 4, backgroundColor: '#bfdbfe', borderRadius: 1 }} />)}
+        </div>
+      );
+      break;
+    case 'flatbed':
+      bg = '#78350f';
+      inner = <div style={{ position: 'absolute', top: 2, bottom: 2, left: 2, right: 2, backgroundColor: '#b45309' }} />;
+      break;
+    case 'boxcar':
+      bg = '#c2410c';
+      inner = <div style={{ position: 'absolute', top: '40%', bottom: '40%', left: 0, right: 0, backgroundColor: '#9a3412', borderTop: '1px solid #ea580c', borderBottom: '1px solid #ea580c' }} />;
+      break;
+    case 'container':
+      bg = '#047857';
+      inner = <div style={{ position: 'absolute', top: 2, bottom: 2, left: 2, right: 2, backgroundImage: 'repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,0.2) 3px, rgba(0,0,0,0.2) 6px)' }} />;
+      break;
+    case 'closed-hopper':
+      bg = '#64748b';
+      inner = (
+        <div style={{ display: 'flex', flexDirection: 'column', height: '100%', justifyContent: 'space-evenly', alignItems: 'center' }}>
+          {[...Array(3)].map((_, i) => <div key={i} style={{ width: 12, height: 12, backgroundColor: '#475569', borderRadius: '50%' }} />)}
+        </div>
+      );
+      break;
+    case 'open-hopper':
+      bg = '#334155';
+      inner = <div style={{ position: 'absolute', top: 2, bottom: 2, left: 2, right: 2, backgroundColor: '#0f172a', borderRadius: 2 }} />;
+      break;
+    case 'tank':
+      bg = '#cbd5e1';
+      inner = <div style={{ position: 'absolute', top: 2, bottom: 2, left: 1, right: 1, backgroundColor: '#e2e8f0', borderRadius: '8px' }} />;
+      break;
+  }
+
+  return (
+    <motion.div
+      style={{
+        position: 'absolute',
+        width: 18,
+        height: 48,
+        backgroundColor: bg,
+        borderRadius: 2,
+        border: `1px solid rgba(0,0,0,0.4)`,
+        zIndex: 100 + zIndex,
+        pointerEvents: 'none',
+        overflow: 'hidden'
+      }}
+      initial={{ opacity: 0, scale: 0.5 }}
+      animate={{
+        opacity: 1,
+        scale: 1,
+        left: posX,
+        top: posY,
+        rotate: displayRotation,
+        x: "-50%",
+        y: "-50%",
+        scaleX: zIndex > 0 ? 1.1 : 1,
+        scaleY: zIndex > 0 ? 1.1 : 1,
+      }}
+      exit={{ opacity: 0, scale: 0.5 }}
+      transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+    >
+      {inner}
+    </motion.div>
+  );
+};
+
+export const Vehicle: React.FC<VehicleProps> = ({ x, y, heading, lane, progress, color, zIndex, exitHeading, type = 'car', trailers = 0, railcars = [] }) => {
   const targetHeading = exitHeading !== undefined ? exitHeading : heading;
   
   const { posX, posY, rotation: currentRotation } = getTrajectory(x, y, heading, targetHeading, lane, progress);
@@ -154,16 +272,37 @@ export const Vehicle: React.FC<VehicleProps> = ({ x, y, heading, lane, progress,
   const displayRotation = prevRotationRef.current + diff;
   prevRotationRef.current = displayRotation;
 
+  // History tracking for trailers
+  const traveledRef = React.useRef(0);
+  const historyRef = React.useRef<{x: number, y: number, r: number, d: number}[]>([{ x: posX, y: posY, r: displayRotation, d: 0 }]);
+
+  const lastPushed = historyRef.current[historyRef.current.length - 1];
+  const dx = posX - lastPushed.x;
+  const dy = posY - lastPushed.y;
+  const dist = Math.sqrt(dx*dx + dy*dy);
+
+  if (dist > GRID_SIZE * 2) {
+    historyRef.current = [{ x: posX, y: posY, r: displayRotation, d: traveledRef.current }];
+  } else if (dist > 0.1) {
+    traveledRef.current += dist;
+    historyRef.current.push({ x: posX, y: posY, r: displayRotation, d: traveledRef.current });
+    
+    while (historyRef.current.length > 2 && historyRef.current[1].d < traveledRef.current - 800) {
+      historyRef.current.shift();
+    }
+  }
+
   let baseHeight = 20;
+  let baseWidth = 12;
   if (type === 'semi') baseHeight = 10;
-  else if (type === 'train') baseHeight = 40;
+  else if (type === 'train') { baseHeight = 40; baseWidth = 18; }
 
   return (
     <>
       <motion.div
         style={{
           position: 'absolute',
-          width: 12,
+          width: baseWidth,
           height: baseHeight,
           backgroundColor: color,
           borderRadius: 2,
@@ -205,19 +344,66 @@ export const Vehicle: React.FC<VehicleProps> = ({ x, y, heading, lane, progress,
         <div style={{ position: 'absolute', top: '0', right: '15%', width: '20%', height: type === 'semi' ? '20%' : '10%', backgroundColor: '#fef3c7', borderRadius: '50%' }} />
       </motion.div>
       
-      {type === 'semi' && Array.from({ length: trailers }).map((_, i) => (
-        <Trailer 
-          key={`trailer-${i}`}
-          x={x}
-          y={y}
-          heading={heading}
-          targetHeading={targetHeading}
-          lane={lane}
-          progress={progress}
-          zIndex={zIndex}
-          index={i}
-        />
-      ))}
+      {type === 'semi' && Array.from({ length: trailers }).map((_, i) => {
+        const offsetFront = 7 + i * 42;
+        const offsetRear = offsetFront + 40;
+
+        const frontPos = sampleHistory(historyRef.current, traveledRef.current - offsetFront);
+        const rearPos = sampleHistory(historyRef.current, traveledRef.current - offsetRear);
+
+        let tX = (frontPos.x + rearPos.x) / 2;
+        let tY = (frontPos.y + rearPos.y) / 2;
+        let tR = displayRotation;
+
+        const dx = frontPos.x - rearPos.x;
+        const dy = frontPos.y - rearPos.y;
+        if (Math.sqrt(dx*dx + dy*dy) > 0.1) {
+          tR = Math.atan2(dy, dx) * (180 / Math.PI) + 90;
+        } else {
+          tR = frontPos.r;
+        }
+
+        return (
+          <Trailer 
+            key={`trailer-${i}`}
+            posX={tX}
+            posY={tY}
+            rotation={tR}
+            zIndex={zIndex}
+          />
+        );
+      })}
+
+      {type === 'train' && railcars.map((railcar, i) => {
+        const offsetFront = 25 + i * 50;
+        const offsetRear = offsetFront + 48;
+
+        const frontPos = sampleHistory(historyRef.current, traveledRef.current - offsetFront);
+        const rearPos = sampleHistory(historyRef.current, traveledRef.current - offsetRear);
+
+        let tX = (frontPos.x + rearPos.x) / 2;
+        let tY = (frontPos.y + rearPos.y) / 2;
+        let tR = displayRotation;
+
+        const dx = frontPos.x - rearPos.x;
+        const dy = frontPos.y - rearPos.y;
+        if (Math.sqrt(dx*dx + dy*dy) > 0.1) {
+          tR = Math.atan2(dy, dx) * (180 / Math.PI) + 90;
+        } else {
+          tR = frontPos.r;
+        }
+
+        return (
+          <Railcar 
+            key={`railcar-${i}`}
+            posX={tX}
+            posY={tY}
+            rotation={tR}
+            zIndex={zIndex}
+            railcarType={railcar}
+          />
+        );
+      })}
     </>
   );
 };

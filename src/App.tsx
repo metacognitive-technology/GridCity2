@@ -40,10 +40,10 @@ import {
 } from 'lucide-react';
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent } from './components/Vehicle';
-import { TileType, GridData, Point, GridTile, Vehicle } from './types';
+import { TileType, GridData, Point, GridTile, Vehicle, RailcarType } from './types';
 import { auth, db, handleFirestoreError, OperationType, loginAnonymously, logout as firebaseLogout } from './firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp, collection, addDoc, deleteDoc, disableNetwork } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp, collection, addDoc, deleteDoc, disableNetwork, deleteField } from 'firebase/firestore';
 
 const GRID_SIZE = 64;
 const INITIAL_ZOOM = 1;
@@ -154,12 +154,18 @@ const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' 
 export default function App() {
   const [grid, _setGrid] = useState<GridData>({});
   const localGridRef = useRef<GridData>({});
+  const lastSyncedGrid = useRef<GridData>({});
   const setGrid = useCallback((newGrid: GridData | ((prev: GridData) => GridData)) => {
-    _setGrid((prev) => {
-      const next = typeof newGrid === 'function' ? newGrid(prev) : newGrid;
-      localGridRef.current = next;
-      return next;
-    });
+    if (typeof newGrid === 'function') {
+      _setGrid((prev) => {
+        const next = newGrid(prev);
+        localGridRef.current = next;
+        return next;
+      });
+    } else {
+      localGridRef.current = newGrid;
+      _setGrid(newGrid);
+    }
   }, []);
   const [history, setHistory] = useState<GridData[]>([{}]);
   const [historyIndex, setHistoryIndex] = useState(0);
@@ -207,7 +213,6 @@ export default function App() {
 
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [tempRoomCode, setTempRoomCode] = useState('');
-  const isRemoteChange = useRef(false);
   const lastForceReloadRef = useRef<number>(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -215,6 +220,7 @@ export default function App() {
 
   const [user, setUser] = useState<User | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [availableRooms, setAvailableRooms] = useState<{ id: string, updatedAt: any }[]>([]);
   const [quotaExceeded, _setQuotaExceeded] = useState(false);
   const setQuotaExceeded = useCallback((val: boolean) => {
     _setQuotaExceeded(val);
@@ -222,6 +228,25 @@ export default function App() {
   }, []);
 
   // Sync library from Firestore
+  useEffect(() => {
+    if (!roomCode) {
+      const worldsRef = collection(db, 'worlds');
+      const unsubscribeWorlds = onSnapshot(worldsRef, (snapshot) => {
+        const rooms = snapshot.docs.map(docSnap => ({
+          id: docSnap.id,
+          updatedAt: docSnap.data().updatedAt
+        })).sort((a, b) => {
+           const timeA = a.updatedAt?.toMillis() || 0;
+           const timeB = b.updatedAt?.toMillis() || 0;
+           return timeB - timeA;
+        });
+        setAvailableRooms(rooms);
+      }, (err) => handleFirestoreError(err, OperationType.LIST, 'worlds'));
+      
+      return () => unsubscribeWorlds();
+    }
+  }, [roomCode]);
+
   useEffect(() => {
     const layoutsRef = collection(db, 'layouts');
     const unsubscribeLayouts = onSnapshot(layoutsRef, (snapshot) => {
@@ -281,17 +306,44 @@ export default function App() {
         if (data.grid) {
           // Compare with current local grid state to avoid loops
           if (JSON.stringify(data.grid) !== JSON.stringify(localGridRef.current)) {
-            isRemoteChange.current = true;
-            setGrid(data.grid);
-            setHistory(prev => {
-              const newHistory = [...prev, data.grid];
-              if (newHistory.length > MAX_HISTORY) newHistory.shift();
-              return newHistory;
-            });
-            setHistoryIndex(prev => {
-              const nextIndex = prev + 1;
-              return nextIndex >= MAX_HISTORY ? MAX_HISTORY - 1 : nextIndex;
-            });
+            const pendingChanges: Record<string, any> = {};
+            for (const key of Object.keys(localGridRef.current)) {
+              if (JSON.stringify(localGridRef.current[key]) !== JSON.stringify(lastSyncedGrid.current[key])) {
+                pendingChanges[key] = localGridRef.current[key];
+              }
+            }
+            for (const key of Object.keys(lastSyncedGrid.current)) {
+               if (!(key in localGridRef.current)) {
+                 pendingChanges[key] = undefined;
+               }
+            }
+
+            const newMergedGrid = { ...data.grid };
+            for (const key in pendingChanges) {
+                if (pendingChanges[key] === undefined) {
+                   delete newMergedGrid[key];
+                } else {
+                   newMergedGrid[key] = pendingChanges[key];
+                }
+            }
+
+            if (JSON.stringify(newMergedGrid) !== JSON.stringify(localGridRef.current)) {
+               lastSyncedGrid.current = data.grid;
+               setGrid(newMergedGrid);
+               setHistory(prev => {
+                  const newHistory = [...prev, newMergedGrid];
+                  if (newHistory.length > MAX_HISTORY) newHistory.shift();
+                  return newHistory;
+               });
+               setHistoryIndex(prev => {
+                  const nextIndex = prev + 1;
+                  return nextIndex >= MAX_HISTORY ? MAX_HISTORY - 1 : nextIndex;
+               });
+            } else {
+               lastSyncedGrid.current = data.grid;
+            }
+          } else {
+            lastSyncedGrid.current = data.grid;
           }
         }
         if (data.vehicles) {
@@ -336,23 +388,35 @@ export default function App() {
   // Push local changes to Firestore
   useEffect(() => {
     if (!roomCode || quotaExceeded) return;
-    if (isRemoteChange.current) {
-      isRemoteChange.current = false;
-      return;
-    }
 
-    const worldRef = doc(db, 'worlds', roomCode);
-    const timeoutId = setTimeout(() => {
-      updateDoc(worldRef, { 
-        grid: grid, 
-        updatedAt: serverTimestamp() 
-      }).catch(err => {
+    const flushGridUpdates = () => {
+      const updates: Record<string, any> = {};
+      let hasChanges = false;
+      const currentGrid = localGridRef.current;
+      const allKeys = new Set([...Object.keys(lastSyncedGrid.current), ...Object.keys(currentGrid)]);
+      
+      for (const key of allKeys) {
+        const currentVal = currentGrid[key];
+        const lastVal = lastSyncedGrid.current[key];
+        if (JSON.stringify(currentVal) !== JSON.stringify(lastVal)) {
+          updates[`grid.${key}`] = currentVal !== undefined ? currentVal : deleteField();
+          hasChanges = true;
+        }
+      }
+      
+      if (!hasChanges) return;
+
+      updates['updatedAt'] = serverTimestamp();
+      lastSyncedGrid.current = currentGrid;
+
+      const worldRef = doc(db, 'worlds', roomCode);
+      updateDoc(worldRef, updates).catch(err => {
         if (err instanceof Error && err.message.includes('resource-exhausted')) {
           setQuotaExceeded(true);
         }
         // If document doesn't exist yet, setDoc instead
         if (err instanceof Error && err.message.includes('not-found')) {
-          setDoc(worldRef, { grid: grid, updatedAt: serverTimestamp() })
+          setDoc(worldRef, { grid: currentGrid, updatedAt: serverTimestamp() })
             .catch(e => {
               if (e instanceof Error && e.message.includes('resource-exhausted')) {
                 setQuotaExceeded(true);
@@ -364,10 +428,12 @@ export default function App() {
           handleFirestoreError(err, OperationType.UPDATE, `worlds/${roomCode}`);
         }
       });
-    }, 2000); // Increased debounce to save quota
+    };
 
-    return () => clearTimeout(timeoutId);
-  }, [grid, roomCode]);
+    const intervalId = setInterval(flushGridUpdates, 1000); // Batched 1s interval sync
+
+    return () => clearInterval(intervalId);
+  }, [roomCode, quotaExceeded]);
 
   const createRoom = () => {
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -575,7 +641,8 @@ export default function App() {
            speed: 1,
            turnAroundAtDeadEnd: true,
            randomTurning: true,
-           trailers: type === 'semi' ? 1 : undefined,
+           turnIntent: ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any,
+           trailers: type === 'semi' ? 1 : 0,
         };
     }
     setVehicles(updatedVehicles);
@@ -637,6 +704,12 @@ export default function App() {
 
     if (anyUpdates) {
       setVehicles(updatedVehicles);
+      if (roomCode && !quotaExceeded) {
+        const worldRef = doc(db, 'worlds', roomCode);
+        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
+          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+        });
+      }
     }
   };
 
@@ -658,6 +731,57 @@ export default function App() {
 
     if (anyUpdates) {
       setVehicles(updatedVehicles);
+      if (roomCode && !quotaExceeded) {
+        const worldRef = doc(db, 'worlds', roomCode);
+        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
+          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+        });
+      }
+    }
+  };
+
+  const modifySelectedRailcars = (action: 'add' | 'remove' | 'move', payload?: any) => {
+    if (selectedVehicles.size === 0) return;
+    const updatedVehicles = { ...vehicles };
+    let anyUpdates = false;
+
+    selectedVehicles.forEach(id => {
+      const v = updatedVehicles[id];
+      if (v && v.type === 'train') {
+        const rc = [...(v.railcars || [])];
+        let changed = false;
+
+        if (action === 'add' && rc.length < 12) {
+          rc.push(payload as RailcarType);
+          changed = true;
+        } else if (action === 'remove') {
+          rc.splice(payload as number, 1);
+          changed = true;
+        } else if (action === 'move') {
+          const { from, to } = payload as { from: number, to: number };
+          if (from >= 0 && from < rc.length && to >= 0 && to < rc.length) {
+            const temp = rc[from];
+            rc.splice(from, 1);
+            rc.splice(to, 0, temp);
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          updatedVehicles[id] = { ...v, railcars: rc };
+          anyUpdates = true;
+        }
+      }
+    });
+
+    if (anyUpdates) {
+      setVehicles(updatedVehicles);
+      if (roomCode && !quotaExceeded) {
+        const worldRef = doc(db, 'worlds', roomCode);
+        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
+          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+        });
+      }
     }
   };
 
@@ -674,6 +798,12 @@ export default function App() {
 
     if (anyUpdates) {
       setVehicles(updatedVehicles);
+      if (roomCode && !quotaExceeded) {
+        const worldRef = doc(db, 'worlds', roomCode);
+        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
+          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+        });
+      }
     }
   };
 
@@ -729,22 +859,17 @@ export default function App() {
               const otherPorts = ports.filter(p => p !== entryPort);
               
               if (otherPorts.length > 0) {
-                if (vehicle.randomTurning) {
-                  let exitPort = otherPorts[Math.floor(Math.random() * otherPorts.length)];
-                  exitHeading = exitPort * 90;
-                } else {
-                  let exitPort = otherPorts[0];
-                  if (otherPorts.length > 1) {
-                    const straightPort = (entryPort + 2) % 4;
-                    const leftPort = (entryPort + 3) % 4;
-                    const rightPort = (entryPort + 1) % 4;
+                let exitPort = otherPorts[0];
+                if (otherPorts.length > 1) {
+                  const straightPort = (entryPort + 2) % 4;
+                  const leftPort = (entryPort + 3) % 4;
+                  const rightPort = (entryPort + 1) % 4;
 
-                    if (turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
-                    else if (turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
-                    else if (otherPorts.includes(straightPort)) exitPort = straightPort;
-                  }
-                  exitHeading = exitPort * 90;
+                  if (turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
+                  else if (turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
+                  else if (otherPorts.includes(straightPort)) exitPort = straightPort;
                 }
+                exitHeading = exitPort * 90;
               }
             }
 
@@ -781,14 +906,14 @@ export default function App() {
                       heading: exitHeading,
                       progress: progress - 1, // Keep remainder
                       zIndex: zIndex,
-                      turnIntent: null, // Reset turn intent after entering new tile
+                      turnIntent: vehicle.randomTurning ? ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any : null, // Pick turn intent upon entering tile
                       lane: isNext4Lane ? vehicle.lane : 1 // Reset to lane 1 if not 4-lane
                     };
                   } else {
                     // Turn around at dead end (not connected port)
                     newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
                       ...vehicle, 
-                      heading: (heading + 180) % 360, 
+                      heading: (exitHeading + 180) % 360, 
                       progress: 0, 
                       isMoving: true 
                     } : { ...vehicle, progress: 0.99, isMoving: false };
@@ -797,7 +922,7 @@ export default function App() {
                   // Turn around if vehicle type doesn't match tile type
                   newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
                     ...vehicle, 
-                    heading: (heading + 180) % 360, 
+                    heading: (exitHeading + 180) % 360, 
                     progress: 0, 
                     isMoving: true 
                   } : { ...vehicle, progress: 0.99, isMoving: false };
@@ -806,7 +931,7 @@ export default function App() {
                 // Turn around if no matching tile
                 newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
                   ...vehicle, 
-                  heading: (heading + 180) % 360, 
+                  heading: (exitHeading + 180) % 360, 
                   progress: 0, 
                   isMoving: true 
                 } : { ...vehicle, progress: 0.99, isMoving: false };
@@ -815,7 +940,7 @@ export default function App() {
               // Turn around if no next tile in grid
               newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
                 ...vehicle, 
-                heading: (heading + 180) % 360, 
+                heading: (exitHeading + 180) % 360, 
                 progress: 0, 
                 isMoving: true 
               } : { ...vehicle, progress: 0.99, isMoving: false };
@@ -1449,7 +1574,8 @@ export default function App() {
             turnIntent: null,
             turnAroundAtDeadEnd: true,
             randomTurning: true,
-            trailers: newType === 'semi' ? 1 : undefined,
+            turnIntent: ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any,
+            trailers: newType === 'semi' ? 1 : 0,
           };
           const updatedVehicles = { ...vehicles, [newId]: newVehicle };
           setVehicles(updatedVehicles);
@@ -2102,6 +2228,34 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
+                {availableRooms.length > 0 && (
+                  <div className="mt-6 text-left">
+                     <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-2 mb-2">Previous Rooms</p>
+                     <div className="flex flex-col gap-2 max-h-48 overflow-y-auto pr-2 custom-scrollbar">
+                       {availableRooms.map(room => (
+                          <div key={room.id} className="flex items-center justify-between bg-slate-50 border border-slate-100 rounded-xl p-3 hover:border-blue-200 hover:bg-blue-50/50 transition-colors group cursor-pointer" onClick={() => setRoomCode(room.id)}>
+                            <div className="flex flex-col items-start px-2">
+                              <span className="font-bold text-slate-700 tracking-wider flex items-center">{room.id}</span>
+                              {room.updatedAt && <span className="text-[10px] text-slate-400">{new Date(room.updatedAt.toDate()).toLocaleString()}</span>}
+                            </div>
+                            <button 
+                              onClick={(e) => { 
+                                e.stopPropagation(); 
+                                if (window.confirm(`Are you sure you want to delete room ${room.id}?`)) {
+                                  deleteDoc(doc(db, 'worlds', room.id)).catch(err => handleFirestoreError(err, OperationType.DELETE, `worlds/${room.id}`));
+                                }
+                              }} 
+                              className="p-2 text-slate-300 hover:text-red-500 rounded-lg hover:bg-red-50 transition-colors opacity-0 group-hover:opacity-100"
+                              title="Delete Room"
+                            >
+                               <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                       ))}
+                     </div>
+                  </div>
+                )}
 
                 {authError && (
                   <div className="p-3 bg-amber-50 border border-amber-100 rounded-xl text-left relative">
@@ -2780,7 +2934,7 @@ export default function App() {
                 
                 {Array.from(selectedVehicles).some(id => vehicles[id]?.type === 'semi') && (
                   <div className="flex items-center justify-between gap-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
-                    <span className="text-sm font-medium text-slate-700">Trailers</span>
+                    <span className="text-sm font-medium text-slate-700">Trailers (max 2)</span>
                     <div className="flex items-center gap-2">
                       <button
                         onClick={() => changeSelectedTrailers(-1)}
@@ -2793,6 +2947,38 @@ export default function App() {
                         className="w-8 h-8 flex justify-center items-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold transition-colors"
                       >+</button>
                     </div>
+                  </div>
+                )}
+
+                {Array.from(selectedVehicles).some(id => vehicles[id]?.type === 'train') && (
+                  <div className="flex flex-col gap-2 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                    <span className="text-sm font-medium text-slate-700">Railcars (max 12)</span>
+                    <div className="flex flex-wrap gap-1">
+                      {(['passenger', 'flatbed', 'boxcar', 'container', 'closed-hopper', 'open-hopper', 'tank'] as RailcarType[]).map(rt => (
+                        <button
+                          key={rt}
+                          onClick={() => modifySelectedRailcars('add', rt)}
+                          disabled={!roomCode || (Array.from(selectedVehicles).length > 0 && (vehicles[Array.from(selectedVehicles)[0]]?.railcars?.length || 0) >= 12)}
+                          className="px-2 py-1 text-[10px] uppercase font-bold rounded border border-indigo-100 bg-indigo-50 text-indigo-600 hover:bg-indigo-100 transition-colors disabled:opacity-50"
+                        >
+                          + {rt.replace('-', ' ')}
+                        </button>
+                      ))}
+                    </div>
+                    {selectedVehicles.size === 1 && vehicles[Array.from(selectedVehicles)[0]]?.railcars && vehicles[Array.from(selectedVehicles)[0]]!.railcars!.length > 0 && (
+                      <div className="flex flex-col gap-1 mt-2">
+                        {vehicles[Array.from(selectedVehicles)[0]]!.railcars!.map((rt, i) => (
+                           <div key={i} className="flex justify-between items-center text-xs bg-slate-50 p-1 px-2 rounded border border-slate-100">
+                             <span className="font-mono text-slate-600 capitalize">{i+1}. {rt.replace('-', ' ')}</span>
+                             <div className="flex gap-2">
+                               <button onClick={() => modifySelectedRailcars('move', {from: i, to: i-1})} disabled={i === 0 || !roomCode} className="hover:text-slate-900 disabled:opacity-30">▲</button>
+                               <button onClick={() => modifySelectedRailcars('move', {from: i, to: i+1})} disabled={i === vehicles[Array.from(selectedVehicles)[0]]!.railcars!.length - 1 || !roomCode} className="hover:text-slate-900 disabled:opacity-30">▼</button>
+                               <button onClick={() => modifySelectedRailcars('remove', i)} disabled={!roomCode} className="text-red-500 hover:text-red-600 ml-2 disabled:opacity-30"><Trash2 className="w-3 h-3" /></button>
+                             </div>
+                           </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
                 

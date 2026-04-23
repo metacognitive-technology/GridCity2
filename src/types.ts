@@ -51,6 +51,8 @@ export interface Point {
   y: number;
 }
 
+export type RailcarType = 'passenger' | 'flatbed' | 'boxcar' | 'container' | 'closed-hopper' | 'open-hopper' | 'tank';
+
 export interface Vehicle {
   id: string; // unique id (usually owner uid)
   x: number; // grid x
@@ -62,6 +64,7 @@ export interface Vehicle {
   zIndex: number; // 0 for ground, 1 for bridge
   type?: 'car' | 'train' | 'semi';
   trailers?: number;
+  railcars?: RailcarType[];
   isMoving?: boolean;
   speed?: number;
   turnIntent?: 'left' | 'right' | 'straight' | null;
