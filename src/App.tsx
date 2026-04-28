@@ -41,14 +41,23 @@ import {
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent } from './components/Vehicle';
 import { TileType, GridData, Point, GridTile, Vehicle, RailcarType } from './types';
-import { auth, db, handleFirestoreError, OperationType, loginAnonymously, logout as firebaseLogout } from './firebase';
+import { auth, db, handleFirestoreError, isQuotaError, OperationType, loginAnonymously, logout as firebaseLogout } from './firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp, collection, addDoc, deleteDoc, disableNetwork, deleteField } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp, collection, addDoc, deleteDoc, disableNetwork, deleteField, getDoc } from 'firebase/firestore';
 
 const GRID_SIZE = 64;
 const INITIAL_ZOOM = 1;
 const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 3;
+
+const WORDS = [
+  "red", "blue", "green", "fast", "slow", "happy", "sad", "big", "small", "tall", 
+  "short", "hot", "cold", "brave", "calm", "cool", "dark", "light", "loud", "quiet", 
+  "cat", "dog", "bird", "fish", "bear", "lion", "tiger", "wolf", "fox", "deer", 
+  "sun", "moon", "star", "sky", "sea", "tree", "rock", "wind", "fire", "ice", 
+  "car", "bus", "train", "boat", "ship", "jet", "road", "rail", "path", "town", 
+  "city", "farm", "lake", "river", "hill", "mountain", "alpha", "beta", "gamma", "delta"
+];
 const SIDEBAR_WIDTH = 288;
 const MAX_HISTORY = 50;
 
@@ -229,6 +238,8 @@ export default function App() {
 
   // Sync library from Firestore
   useEffect(() => {
+    if (quotaExceeded) return;
+    
     if (!roomCode) {
       const worldsRef = collection(db, 'worlds');
       const unsubscribeWorlds = onSnapshot(worldsRef, (snapshot) => {
@@ -248,6 +259,7 @@ export default function App() {
   }, [roomCode]);
 
   useEffect(() => {
+    if (quotaExceeded) return;
     const layoutsRef = collection(db, 'layouts');
     const unsubscribeLayouts = onSnapshot(layoutsRef, (snapshot) => {
       const newLibrary = snapshot.docs.map(docSnap => ({
@@ -272,7 +284,7 @@ export default function App() {
       unsubscribeLayouts();
       unsubscribeSims();
     };
-  }, []);
+  }, [quotaExceeded]);
 
   // Auth listener
   useEffect(() => {
@@ -297,7 +309,7 @@ export default function App() {
 
   // Sync grid from Firestore
   useEffect(() => {
-    if (!roomCode) return;
+    if (!roomCode || quotaExceeded) return;
     
     const worldRef = doc(db, 'worlds', roomCode);
     const unsubscribe = onSnapshot(worldRef, (docSnap) => {
@@ -383,7 +395,7 @@ export default function App() {
     }, (err) => handleFirestoreError(err, OperationType.GET, `worlds/${roomCode}`));
 
     return () => unsubscribe();
-  }, [roomCode]);
+  }, [roomCode, quotaExceeded]);
 
   // Push local changes to Firestore
   useEffect(() => {
@@ -411,14 +423,14 @@ export default function App() {
 
       const worldRef = doc(db, 'worlds', roomCode);
       updateDoc(worldRef, updates).catch(err => {
-        if (err instanceof Error && err.message.includes('resource-exhausted')) {
+        if (isQuotaError(err)) {
           setQuotaExceeded(true);
         }
         // If document doesn't exist yet, setDoc instead
         if (err instanceof Error && err.message.includes('not-found')) {
           setDoc(worldRef, { grid: currentGrid, updatedAt: serverTimestamp() })
             .catch(e => {
-              if (e instanceof Error && e.message.includes('resource-exhausted')) {
+              if (isQuotaError(e)) {
                 setQuotaExceeded(true);
               } else {
                 handleFirestoreError(e, OperationType.WRITE, `worlds/${roomCode}`);
@@ -435,9 +447,31 @@ export default function App() {
     return () => clearInterval(intervalId);
   }, [roomCode, quotaExceeded]);
 
-  const createRoom = () => {
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    setRoomCode(code);
+  const createRoom = async () => {
+    let uniqueCode = "";
+    let isUnique = false;
+
+    while (!isUnique) {
+        const w1 = WORDS[Math.floor(Math.random() * WORDS.length)];
+        const w2 = WORDS[Math.floor(Math.random() * WORDS.length)];
+        const w3 = WORDS[Math.floor(Math.random() * WORDS.length)];
+        const candidateCode = `${w1}-${w2}-${w3}`;
+        
+        try {
+            const docRef = doc(db, 'worlds', candidateCode);
+            const docSnap = await getDoc(docRef);
+            if (!docSnap.exists()) {
+                uniqueCode = candidateCode;
+                isUnique = true;
+            }
+        } catch (error) {
+            console.error("Error checking room code uniqueness", error);
+            // Fallback just in case
+            uniqueCode = candidateCode;
+            isUnique = true;
+        }
+    }
+    setRoomCode(uniqueCode);
   };
 
   const joinRoom = () => {
@@ -483,7 +517,7 @@ export default function App() {
       setSelectionStart(null);
       setSelectionEnd(null);
     } catch (err) {
-      if (err instanceof Error && err.message.includes('resource-exhausted')) {
+      if (isQuotaError(err)) {
         setQuotaExceeded(true);
       } else {
         handleFirestoreError(err, OperationType.CREATE, 'layouts');
@@ -507,7 +541,7 @@ export default function App() {
       setNewSimulationName('');
       setShowSaveSimulationConfirm(false);
     } catch (err) {
-      if (err instanceof Error && err.message.includes('resource-exhausted')) {
+      if (isQuotaError(err)) {
         setQuotaExceeded(true);
       } else {
         handleFirestoreError(err, OperationType.CREATE, 'simulations');
@@ -526,7 +560,7 @@ export default function App() {
         forceReloadVehicles: Date.now(),
         updatedAt: serverTimestamp() 
       }).catch(err => {
-        if (err instanceof Error && err.message.includes('resource-exhausted')) {
+        if (isQuotaError(err)) {
           setQuotaExceeded(true);
         } else {
           console.error("Error updating world:", err);
@@ -541,7 +575,7 @@ export default function App() {
       await deleteDoc(doc(db, 'simulations', showDeleteSimulationConfirm.id));
       setShowDeleteSimulationConfirm(null);
     } catch (err) {
-      if (err instanceof Error && err.message.includes('resource-exhausted')) {
+      if (isQuotaError(err)) {
         setQuotaExceeded(true);
       } else {
         handleFirestoreError(err, OperationType.DELETE, `simulations/${showDeleteSimulationConfirm.id}`);
@@ -575,12 +609,17 @@ export default function App() {
         let zIndex = 0;
         if (targetTile.type.includes('bridge') || targetTile.type.includes('trestle')) zIndex = 1;
 
+        let heading = targetTile.rotation;
+        if (targetTile.type === 'rail-road-crossing' && vType !== 'train') {
+           heading = (heading + 90) % 360;
+        }
+
         const is4Lane = targetTile.type.includes('4lane');
         updatedVehicles[id] = {
            ...v,
            x: rx,
            y: ry,
-           heading: targetTile.rotation,
+           heading: heading,
            progress: Math.random(),
            lane: vType === 'train' ? 0 : (is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1)),
            zIndex
@@ -605,6 +644,8 @@ export default function App() {
       })
     );
 
+    if (roadTiles.length === 0) return;
+
     const updatedVehicles = { ...vehicles };
     const newIds = [];
     
@@ -614,18 +655,19 @@ export default function App() {
         const randomColor = '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0');
         
         let newX = 0, newY = 0, heading = 0, lane = 1, zIndex = 0;
-        if (roadTiles.length > 0) {
-          const randomRoad = roadTiles[Math.floor(Math.random() * roadTiles.length)];
-          const [rx, ry] = randomRoad[0].split(',').map(Number);
-          const tilesList = randomRoad[1] as GridTile[];
-          const topTile = tilesList[tilesList.length - 1];
-          const is4Lane = topTile.type.includes('4lane');
-          newX = rx;
-          newY = ry;
-          heading = topTile.rotation;
-          lane = type === 'train' ? 0 : (is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1));
-          zIndex = topTile.type.includes('bridge') || topTile.type.includes('trestle') ? 1 : 0;
+        const randomRoad = roadTiles[Math.floor(Math.random() * roadTiles.length)];
+        const [rx, ry] = randomRoad[0].split(',').map(Number);
+        const tilesList = randomRoad[1] as GridTile[];
+        const topTile = tilesList[tilesList.length - 1];
+        const is4Lane = topTile.type.includes('4lane');
+        newX = rx;
+        newY = ry;
+        heading = topTile.rotation;
+        if (topTile.type === 'rail-road-crossing' && type !== 'train') {
+           heading = (heading + 90) % 360; // Cars should go along the road axis
         }
+        lane = type === 'train' ? 0 : (is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1));
+        zIndex = topTile.type.includes('bridge') || topTile.type.includes('trestle') ? 1 : 0;
 
         updatedVehicles[id] = {
            id,
@@ -651,7 +693,7 @@ export default function App() {
         const worldRef = doc(db, 'worlds', roomCode);
         updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
           .catch(err => {
-            if (err instanceof Error && err.message.includes('resource-exhausted')) {
+            if (isQuotaError(err)) {
               setQuotaExceeded(true);
             }
           });
@@ -670,7 +712,7 @@ export default function App() {
       const worldRef = doc(db, 'worlds', roomCode);
       updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
         .catch(err => {
-          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+          if (isQuotaError(err)) setQuotaExceeded(true);
         });
     }
   };
@@ -707,7 +749,7 @@ export default function App() {
       if (roomCode && !quotaExceeded) {
         const worldRef = doc(db, 'worlds', roomCode);
         updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+          if (isQuotaError(err)) setQuotaExceeded(true);
         });
       }
     }
@@ -734,7 +776,7 @@ export default function App() {
       if (roomCode && !quotaExceeded) {
         const worldRef = doc(db, 'worlds', roomCode);
         updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+          if (isQuotaError(err)) setQuotaExceeded(true);
         });
       }
     }
@@ -779,7 +821,7 @@ export default function App() {
       if (roomCode && !quotaExceeded) {
         const worldRef = doc(db, 'worlds', roomCode);
         updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+          if (isQuotaError(err)) setQuotaExceeded(true);
         });
       }
     }
@@ -801,7 +843,7 @@ export default function App() {
       if (roomCode && !quotaExceeded) {
         const worldRef = doc(db, 'worlds', roomCode);
         updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (err instanceof Error && err.message.includes('resource-exhausted')) setQuotaExceeded(true);
+          if (isQuotaError(err)) setQuotaExceeded(true);
         });
       }
     }
@@ -856,7 +898,12 @@ export default function App() {
             if (currentTile) {
               const ports = (TILE_CONNECTIONS[currentTile.type] || []).map(p => (p + currentTile.rotation / 90) % 4);
               const entryPort = (heading / 90 + 2) % 4;
-              const otherPorts = ports.filter(p => p !== entryPort);
+              let otherPorts = ports.filter(p => p !== entryPort);
+              
+              if (currentTile.type === 'rail-road-crossing') {
+                const straightPort = (entryPort + 2) % 4;
+                otherPorts = otherPorts.includes(straightPort) ? [straightPort] : [];
+              }
               
               if (otherPorts.length > 0) {
                 let exitPort = otherPorts[0];
@@ -881,34 +928,63 @@ export default function App() {
             
             if (grid[nextKey]) {
               const nextTiles = grid[nextKey];
-              let nextTile = nextTiles.find(t => {
-                const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
-                return (zIndex === 1 && isBridge) || (zIndex === 0 && !isBridge);
+              let validNextTiles = nextTiles.filter(t => {
+                const isCrossing = t.type === 'rail-road-crossing';
+                if (vehicle.type === 'train') return t.type.startsWith('rail') || isCrossing;
+                else return t.type.startsWith('road') || isCrossing;
               });
 
-              if (nextTile) {
-                const isTrain = (vehicle.type === 'train');
-                const isNextRail = nextTile.type.startsWith('rail') || nextTile.type.includes('trestle');
-                const isNextRoad = nextTile.type.startsWith('road');
-                const isCrossing = nextTile.type === 'rail-road-crossing';
-                
-                if ((isTrain && (isNextRail || isCrossing)) || (!isTrain && (isNextRoad || isCrossing))) {
-                  const nextPorts = (TILE_CONNECTIONS[nextTile.type] || []).map(p => (p + nextTile.rotation / 90) % 4);
-                  const nextEntryPort = (exitHeading / 90 + 2) % 4;
+              let nextTile = validNextTiles.find(t => {
+                const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
+                return (zIndex === 1 && isBridge) || (zIndex === 0 && !isBridge);
+              }) || validNextTiles[0];
 
-                  if (nextPorts.includes(nextEntryPort)) {
-                    const isNext4Lane = nextTile.type.includes('4lane');
-                    
+              if (nextTile) {
+                const nextPorts = (TILE_CONNECTIONS[nextTile.type] || []).map(p => (p + nextTile.rotation / 90) % 4);
+                const nextEntryPort = (exitHeading / 90 + 2) % 4;
+
+                if (nextPorts.includes(nextEntryPort)) {
+                  const isNext4Lane = nextTile.type.includes('4lane');
+                  const nextIsBridge = nextTile.type.includes('bridge') || nextTile.type.includes('trestle');
+                  
+                  // Force vehicles strictly forward on rail crossings without turning
+                  if (nextTile.type === 'rail-road-crossing') {
+                     const isEnteringRailAxis = (nextEntryPort % 2 === (nextTile.rotation / 90) % 2);
+                     if (vehicle.type === 'train' && !isEnteringRailAxis) {
+                         // Turn around if Train entering road axis
+                         newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                           ...vehicle, heading: (exitHeading + 180) % 360, progress: 0, isMoving: true 
+                         } : { ...vehicle, progress: 0.99, isMoving: false };
+                     } else if (vehicle.type !== 'train' && isEnteringRailAxis) {
+                         // Turn around if Car entering rail axis
+                         newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                           ...vehicle, heading: (exitHeading + 180) % 360, progress: 0, isMoving: true 
+                         } : { ...vehicle, progress: 0.99, isMoving: false };
+                     } else {
+                         // Must continue straight over the crossing without turning intent checking
+                         newVehicleState = {
+                           ...vehicle,
+                           x: nextX,
+                           y: nextY,
+                           heading: exitHeading,
+                           progress: progress - 1,
+                           zIndex: 0,
+                           turnIntent: null,
+                           lane: vehicle.type === 'train' ? 0 : 1 
+                         };
+                     }
+                  } else {
                     newVehicleState = {
                       ...vehicle,
                       x: nextX,
                       y: nextY,
                       heading: exitHeading,
-                      progress: progress - 1, // Keep remainder
-                      zIndex: zIndex,
-                      turnIntent: vehicle.randomTurning ? ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any : null, // Pick turn intent upon entering tile
-                      lane: isNext4Lane ? vehicle.lane : 1 // Reset to lane 1 if not 4-lane
+                      progress: progress - 1,
+                      zIndex: nextIsBridge ? 1 : 0,
+                      turnIntent: vehicle.randomTurning ? ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any : null,
+                      lane: vehicle.type === 'train' ? 0 : isNext4Lane ? vehicle.lane : 1 
                     };
+                  }
                   } else {
                     // Turn around at dead end (not connected port)
                     newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
@@ -919,7 +995,7 @@ export default function App() {
                     } : { ...vehicle, progress: 0.99, isMoving: false };
                   }
                 } else {
-                  // Turn around if vehicle type doesn't match tile type
+                  // Turn around if no matching tile
                   newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
                     ...vehicle, 
                     heading: (exitHeading + 180) % 360, 
@@ -928,15 +1004,6 @@ export default function App() {
                   } : { ...vehicle, progress: 0.99, isMoving: false };
                 }
               } else {
-                // Turn around if no matching tile
-                newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
-                  ...vehicle, 
-                  heading: (exitHeading + 180) % 360, 
-                  progress: 0, 
-                  isMoving: true 
-                } : { ...vehicle, progress: 0.99, isMoving: false };
-              }
-            } else {
               // Turn around if no next tile in grid
               newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
                 ...vehicle, 
@@ -971,7 +1038,7 @@ export default function App() {
       await deleteDoc(doc(db, 'layouts', showDeleteLayoutConfirm.id));
       setShowDeleteLayoutConfirm(null);
     } catch (err) {
-      if (err instanceof Error && err.message.includes('resource-exhausted')) {
+      if (isQuotaError(err)) {
         setQuotaExceeded(true);
       } else {
         handleFirestoreError(err, OperationType.DELETE, `layouts/${showDeleteLayoutConfirm.id}`);
@@ -1571,7 +1638,6 @@ export default function App() {
             zIndex: zIndex,
             isMoving: false,
             speed: 1,
-            turnIntent: null,
             turnAroundAtDeadEnd: true,
             randomTurning: true,
             turnIntent: ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any,
@@ -1584,7 +1650,7 @@ export default function App() {
             const worldRef = doc(db, 'worlds', roomCode);
             updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
               .catch(err => {
-                if (err instanceof Error && err.message.includes('resource-exhausted')) {
+                if (isQuotaError(err)) {
                   setQuotaExceeded(true);
                 } else {
                   console.error("Error updating vehicles:", err);
@@ -2596,7 +2662,13 @@ export default function App() {
 
           {/* Vehicles */}
           <AnimatePresence>
-            {(Object.values(vehicles) as Vehicle[]).map((v) => {
+            {(Object.values(vehicles) as Vehicle[])
+              .sort((a, b) => {
+                if (a.type === 'train' && b.type !== 'train') return 1;
+                if (a.type !== 'train' && b.type === 'train') return -1;
+                return 0;
+              })
+              .map((v) => {
               const currentTiles = grid[`${v.x},${v.y}`];
               const currentTile = currentTiles?.find(t => {
                 const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
@@ -2953,20 +3025,8 @@ export default function App() {
                 {Array.from(selectedVehicles).some(id => vehicles[id]?.type === 'train') && (
                   <div className="flex flex-col gap-2 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
                     <span className="text-sm font-medium text-slate-700">Railcars (max 12)</span>
-                    <div className="flex flex-wrap gap-1">
-                      {(['passenger', 'flatbed', 'boxcar', 'container', 'closed-hopper', 'open-hopper', 'tank'] as RailcarType[]).map(rt => (
-                        <button
-                          key={rt}
-                          onClick={() => modifySelectedRailcars('add', rt)}
-                          disabled={!roomCode || (Array.from(selectedVehicles).length > 0 && (vehicles[Array.from(selectedVehicles)[0]]?.railcars?.length || 0) >= 12)}
-                          className="px-2 py-1 text-[10px] uppercase font-bold rounded border border-indigo-100 bg-indigo-50 text-indigo-600 hover:bg-indigo-100 transition-colors disabled:opacity-50"
-                        >
-                          + {rt.replace('-', ' ')}
-                        </button>
-                      ))}
-                    </div>
                     {selectedVehicles.size === 1 && vehicles[Array.from(selectedVehicles)[0]]?.railcars && vehicles[Array.from(selectedVehicles)[0]]!.railcars!.length > 0 && (
-                      <div className="flex flex-col gap-1 mt-2">
+                      <div className="flex flex-col gap-1 mb-2">
                         {vehicles[Array.from(selectedVehicles)[0]]!.railcars!.map((rt, i) => (
                            <div key={i} className="flex justify-between items-center text-xs bg-slate-50 p-1 px-2 rounded border border-slate-100">
                              <span className="font-mono text-slate-600 capitalize">{i+1}. {rt.replace('-', ' ')}</span>
@@ -2979,6 +3039,18 @@ export default function App() {
                         ))}
                       </div>
                     )}
+                    <div className="flex flex-wrap gap-1">
+                      {(['passenger', 'flatbed', 'boxcar', 'container', 'closed-hopper', 'open-hopper', 'tank'] as RailcarType[]).map(rt => (
+                        <button
+                          key={rt}
+                          onClick={() => modifySelectedRailcars('add', rt)}
+                          disabled={!roomCode || (Array.from(selectedVehicles).length > 0 && (vehicles[Array.from(selectedVehicles)[0]]?.railcars?.length || 0) >= 12)}
+                          className="px-2 py-1 text-[10px] uppercase font-bold rounded border border-indigo-100 bg-indigo-50 text-indigo-600 hover:bg-indigo-100 transition-colors disabled:opacity-50"
+                        >
+                          + {rt.replace('-', ' ')}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
                 

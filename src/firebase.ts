@@ -53,8 +53,19 @@ export interface FirestoreErrorInfo {
   }
 }
 
+export function isQuotaError(error: unknown): boolean {
+  if (typeof error === 'object' && error !== null) {
+    const err = error as any;
+    if (err.code === 'resource-exhausted' || 
+        (err.message && typeof err.message === 'string' && (err.message.includes('resource-exhausted') || err.message.includes('Quota')))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  if (error instanceof Error && error.message.includes('resource-exhausted')) {
+  if (isQuotaError(error)) {
     disableNetwork(db).catch(console.error);
   }
   const errInfo: FirestoreErrorInfo = {
