@@ -1,6 +1,8 @@
 {
   "name": "GridCity",
-  "description": "A collaborative city-building and traffic simulation game with real-time multiplayer using Firebase.",
+  "description": "A collaborative city-building and traffic simulation game with real-time multiplayer using a self-hosted Docker backend.",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

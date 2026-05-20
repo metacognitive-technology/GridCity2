@@ -41,9 +41,7 @@ import {
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent } from './components/Vehicle';
 import { TileType, GridData, Point, GridTile, Vehicle, RailcarType } from './types';
-import { auth, db, handleFirestoreError, isQuotaError, OperationType, loginAnonymously, logout as firebaseLogout } from './firebase';
-import { onAuthStateChanged, User } from 'firebase/auth';
-import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp, collection, addDoc, deleteDoc, disableNetwork, deleteField, getDoc } from 'firebase/firestore';
+import socket from './socket';
 
 const GRID_SIZE = 64;
 const INITIAL_ZOOM = 1;
@@ -227,179 +225,110 @@ export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<{ uid: string } | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [availableRooms, setAvailableRooms] = useState<{ id: string, updatedAt: any }[]>([]);
-  const [quotaExceeded, _setQuotaExceeded] = useState(false);
-  const setQuotaExceeded = useCallback((val: boolean) => {
-    _setQuotaExceeded(val);
-    if (val) disableNetwork(db).catch(console.error);
-  }, []);
-
-  // Sync library from Firestore
+  const [availableRooms, setAvailableRooms] = useState<{ id: string, updatedAt: number }[]>([]);
+  
+  // Sync library from backend
   useEffect(() => {
-    if (quotaExceeded) return;
-    
     if (!roomCode) {
-      const worldsRef = collection(db, 'worlds');
-      const unsubscribeWorlds = onSnapshot(worldsRef, (snapshot) => {
-        const rooms = snapshot.docs.map(docSnap => ({
-          id: docSnap.id,
-          updatedAt: docSnap.data().updatedAt
-        })).sort((a, b) => {
-           const timeA = a.updatedAt?.toMillis() || 0;
-           const timeB = b.updatedAt?.toMillis() || 0;
-           return timeB - timeA;
-        });
-        setAvailableRooms(rooms);
-      }, (err) => handleFirestoreError(err, OperationType.LIST, 'worlds'));
+      socket.emit('join-room', 'lobby');
       
-      return () => unsubscribeWorlds();
+      const handleAvailableRooms = (rooms: any[]) => {
+        setAvailableRooms(rooms);
+      };
+      
+      socket.on('available-rooms', handleAvailableRooms);
+      return () => {
+        socket.off('available-rooms', handleAvailableRooms);
+      };
     }
   }, [roomCode]);
 
   useEffect(() => {
-    if (quotaExceeded) return;
-    const layoutsRef = collection(db, 'layouts');
-    const unsubscribeLayouts = onSnapshot(layoutsRef, (snapshot) => {
-      const newLibrary = snapshot.docs.map(docSnap => ({
-        id: docSnap.id,
-        name: docSnap.data().name,
-        data: docSnap.data().data
-      }));
+    const handleLayouts = (newLibrary: any[]) => {
       setLibrary(newLibrary);
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'layouts'));
-    // Sync simulations from Firestore
-    const simsRef = collection(db, 'simulations');
-    const unsubscribeSims = onSnapshot(simsRef, (snapshot) => {
-      const newSimulations = snapshot.docs.map(docSnap => ({
-        id: docSnap.id,
-        name: docSnap.data().name,
-        data: docSnap.data().data
-      }));
+    };
+    const handleSims = (newSimulations: any[]) => {
       setSimulations(newSimulations);
-    }, (err) => handleFirestoreError(err, OperationType.LIST, 'simulations'));
+    };
+
+    socket.on('layouts-updated', handleLayouts);
+    socket.on('simulations-updated', handleSims);
 
     return () => {
-      unsubscribeLayouts();
-      unsubscribeSims();
+      socket.off('layouts-updated', handleLayouts);
+      socket.off('simulations-updated', handleSims);
     };
-  }, [quotaExceeded]);
-
-  // Auth listener
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      if (!u) {
-        loginAnonymously().catch(err => {
-          console.error("Anonymous login failed:", err);
-          if (err.code === 'auth/admin-restricted-operation') {
-            setAuthError("Anonymous login is disabled in Firebase Console. Please enable it to allow collaborative building.");
-          }
-        });
-      } else {
-        // Assign a random color to the user
-        const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
-        const randomColor = colors[Math.floor(Math.random() * colors.length)];
-        setUserColor(randomColor);
-      }
-    });
-    return () => unsubscribe();
   }, []);
 
-  // Sync grid from Firestore
+  // Simple Auth replacement
   useEffect(() => {
-    if (!roomCode || quotaExceeded) return;
+    let uid = localStorage.getItem('gridcity_uid');
+    if (!uid) {
+      uid = Math.random().toString(36).substring(2, 11);
+      localStorage.setItem('gridcity_uid', uid);
+    }
+    setUser({ uid });
     
-    const worldRef = doc(db, 'worlds', roomCode);
-    const unsubscribe = onSnapshot(worldRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        if (data.grid) {
-          // Compare with current local grid state to avoid loops
-          if (JSON.stringify(data.grid) !== JSON.stringify(localGridRef.current)) {
-            const pendingChanges: Record<string, any> = {};
-            for (const key of Object.keys(localGridRef.current)) {
-              if (JSON.stringify(localGridRef.current[key]) !== JSON.stringify(lastSyncedGrid.current[key])) {
-                pendingChanges[key] = localGridRef.current[key];
-              }
-            }
-            for (const key of Object.keys(lastSyncedGrid.current)) {
-               if (!(key in localGridRef.current)) {
-                 pendingChanges[key] = undefined;
-               }
-            }
+    // Assign a random color
+    const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
+    const randomColor = colors[Math.floor(Math.random() * colors.length)];
+    setUserColor(randomColor);
+  }, []);
 
-            const newMergedGrid = { ...data.grid };
-            for (const key in pendingChanges) {
-                if (pendingChanges[key] === undefined) {
-                   delete newMergedGrid[key];
-                } else {
-                   newMergedGrid[key] = pendingChanges[key];
-                }
-            }
-
-            if (JSON.stringify(newMergedGrid) !== JSON.stringify(localGridRef.current)) {
-               lastSyncedGrid.current = data.grid;
-               setGrid(newMergedGrid);
-               setHistory(prev => {
-                  const newHistory = [...prev, newMergedGrid];
-                  if (newHistory.length > MAX_HISTORY) newHistory.shift();
-                  return newHistory;
-               });
-               setHistoryIndex(prev => {
-                  const nextIndex = prev + 1;
-                  return nextIndex >= MAX_HISTORY ? MAX_HISTORY - 1 : nextIndex;
-               });
-            } else {
-               lastSyncedGrid.current = data.grid;
-            }
-          } else {
-            lastSyncedGrid.current = data.grid;
-          }
-        }
-        if (data.vehicles) {
-          const isForceReload = data.forceReloadVehicles && data.forceReloadVehicles !== lastForceReloadRef.current;
-          if (isForceReload) {
-            lastForceReloadRef.current = data.forceReloadVehicles;
-            setVehicles(data.vehicles);
-          } else {
-            setVehicles(prev => {
-              const nextVehicles = { ...prev };
-              let hasChanges = false;
-              
-              const firestoreIds = new Set(Object.keys(data.vehicles));
-              
-              for (const id of Object.keys(nextVehicles)) {
-                if (!firestoreIds.has(id)) {
-                  delete nextVehicles[id];
-                  hasChanges = true;
-                }
-              }
-
-              for (const [id, v] of Object.entries(data.vehicles)) {
-                if (!nextVehicles[id]) {
-                  nextVehicles[id] = v as Vehicle;
-                  hasChanges = true;
-                }
-              }
-
-              return hasChanges ? nextVehicles : prev;
-            });
-          }
-        }
-      } else {
-        setDoc(worldRef, { grid: {}, vehicles: {}, updatedAt: serverTimestamp() })
-          .catch(err => handleFirestoreError(err, OperationType.WRITE, `worlds/${roomCode}`));
-      }
-    }, (err) => handleFirestoreError(err, OperationType.GET, `worlds/${roomCode}`));
-
-    return () => unsubscribe();
-  }, [roomCode, quotaExceeded]);
-
-  // Push local changes to Firestore
+  // Sync grid from Socket.io
   useEffect(() => {
-    if (!roomCode || quotaExceeded) return;
+    if (!roomCode) return;
+    
+    socket.emit('join-room', roomCode);
+
+    const handleWorldState = (data: any) => {
+      if (data.grid) {
+        lastSyncedGrid.current = data.grid;
+        setGrid(data.grid);
+      }
+      if (data.vehicles) {
+        setVehicles(data.vehicles);
+      }
+    };
+
+    const handleGridUpdated = (updates: Record<string, any>) => {
+      const currentGrid = localGridRef.current;
+      const newGrid = { ...currentGrid };
+      
+      Object.entries(updates).forEach(([key, val]) => {
+        if (val === null || val === undefined) {
+          delete newGrid[key];
+        } else {
+          newGrid[key] = val;
+        }
+      });
+
+      if (JSON.stringify(newGrid) !== JSON.stringify(currentGrid)) {
+        setGrid(newGrid);
+        lastSyncedGrid.current = newGrid;
+      }
+    };
+
+    const handleVehiclesUpdated = (newVehicles: any) => {
+      setVehicles(newVehicles);
+    };
+
+    socket.on('world-state', handleWorldState);
+    socket.on('grid-updated', handleGridUpdated);
+    socket.on('vehicles-updated', handleVehiclesUpdated);
+
+    return () => {
+      socket.off('world-state', handleWorldState);
+      socket.off('grid-updated', handleGridUpdated);
+      socket.off('vehicles-updated', handleVehiclesUpdated);
+    };
+  }, [roomCode]);
+
+  // Push local changes to backend
+  useEffect(() => {
+    if (!roomCode) return;
 
     const flushGridUpdates = () => {
       const updates: Record<string, any> = {};
@@ -411,67 +340,27 @@ export default function App() {
         const currentVal = currentGrid[key];
         const lastVal = lastSyncedGrid.current[key];
         if (JSON.stringify(currentVal) !== JSON.stringify(lastVal)) {
-          updates[`grid.${key}`] = currentVal !== undefined ? currentVal : deleteField();
+          updates[key] = currentVal !== undefined ? currentVal : null;
           hasChanges = true;
         }
       }
       
       if (!hasChanges) return;
 
-      updates['updatedAt'] = serverTimestamp();
       lastSyncedGrid.current = currentGrid;
-
-      const worldRef = doc(db, 'worlds', roomCode);
-      updateDoc(worldRef, updates).catch(err => {
-        if (isQuotaError(err)) {
-          setQuotaExceeded(true);
-        }
-        // If document doesn't exist yet, setDoc instead
-        if (err instanceof Error && err.message.includes('not-found')) {
-          setDoc(worldRef, { grid: currentGrid, updatedAt: serverTimestamp() })
-            .catch(e => {
-              if (isQuotaError(e)) {
-                setQuotaExceeded(true);
-              } else {
-                handleFirestoreError(e, OperationType.WRITE, `worlds/${roomCode}`);
-              }
-            });
-        } else {
-          handleFirestoreError(err, OperationType.UPDATE, `worlds/${roomCode}`);
-        }
-      });
+      socket.emit('update-grid', { roomCode, updates });
     };
 
-    const intervalId = setInterval(flushGridUpdates, 1000); // Batched 1s interval sync
-
+    const intervalId = setInterval(flushGridUpdates, 1000);
     return () => clearInterval(intervalId);
-  }, [roomCode, quotaExceeded]);
+  }, [roomCode]);
 
   const createRoom = async () => {
-    let uniqueCode = "";
-    let isUnique = false;
-
-    while (!isUnique) {
-        const w1 = WORDS[Math.floor(Math.random() * WORDS.length)];
-        const w2 = WORDS[Math.floor(Math.random() * WORDS.length)];
-        const w3 = WORDS[Math.floor(Math.random() * WORDS.length)];
-        const candidateCode = `${w1}-${w2}-${w3}`;
-        
-        try {
-            const docRef = doc(db, 'worlds', candidateCode);
-            const docSnap = await getDoc(docRef);
-            if (!docSnap.exists()) {
-                uniqueCode = candidateCode;
-                isUnique = true;
-            }
-        } catch (error) {
-            console.error("Error checking room code uniqueness", error);
-            // Fallback just in case
-            uniqueCode = candidateCode;
-            isUnique = true;
-        }
-    }
-    setRoomCode(uniqueCode);
+    const w1 = WORDS[Math.floor(Math.random() * WORDS.length)];
+    const w2 = WORDS[Math.floor(Math.random() * WORDS.length)];
+    const w3 = WORDS[Math.floor(Math.random() * WORDS.length)];
+    const candidateCode = `${w1}-${w2}-${w3}`;
+    setRoomCode(candidateCode);
   };
 
   const joinRoom = () => {
@@ -507,21 +396,16 @@ export default function App() {
     }
 
     try {
-      await addDoc(collection(db, 'layouts'), {
+      socket.emit('save-layout', {
         name: newLayoutName.trim(),
-        data: dataToSave,
-        createdAt: serverTimestamp()
+        data: dataToSave
       });
       setNewLayoutName('');
       setLastSavedGrid(grid);
       setSelectionStart(null);
       setSelectionEnd(null);
     } catch (err) {
-      if (isQuotaError(err)) {
-        setQuotaExceeded(true);
-      } else {
-        handleFirestoreError(err, OperationType.CREATE, 'layouts');
-      }
+      console.error("Error saving layout:", err);
     }
   };
 
@@ -533,19 +417,14 @@ export default function App() {
     if (!newSimulationName.trim()) return;
 
     try {
-      await addDoc(collection(db, 'simulations'), {
+      socket.emit('save-simulation', {
         name: newSimulationName.trim(),
-        data: { grid, vehicles },
-        createdAt: serverTimestamp()
+        data: { grid, vehicles }
       });
       setNewSimulationName('');
       setShowSaveSimulationConfirm(false);
     } catch (err) {
-      if (isQuotaError(err)) {
-        setQuotaExceeded(true);
-      } else {
-        handleFirestoreError(err, OperationType.CREATE, 'simulations');
-      }
+      console.error("Error saving simulation:", err);
     }
   };
 
@@ -553,34 +432,16 @@ export default function App() {
     setGrid(sim.data.grid || {});
     setVehicles(sim.data.vehicles || {});
     setSelectedVehicles(new Set());
-    if (roomCode && !quotaExceeded) {
-      updateDoc(doc(db, 'worlds', roomCode), { 
-        grid: sim.data.grid || {}, 
-        vehicles: sim.data.vehicles || {}, 
-        forceReloadVehicles: Date.now(),
-        updatedAt: serverTimestamp() 
-      }).catch(err => {
-        if (isQuotaError(err)) {
-          setQuotaExceeded(true);
-        } else {
-          console.error("Error updating world:", err);
-        }
-      });
+    if (roomCode) {
+      socket.emit('update-grid', { roomCode, updates: sim.data.grid || {} });
+      socket.emit('update-vehicles', { roomCode, vehicles: sim.data.vehicles || {} });
     }
   };
 
   const confirmDeleteSimulation = async () => {
     if (!showDeleteSimulationConfirm) return;
-    try {
-      await deleteDoc(doc(db, 'simulations', showDeleteSimulationConfirm.id));
-      setShowDeleteSimulationConfirm(null);
-    } catch (err) {
-      if (isQuotaError(err)) {
-        setQuotaExceeded(true);
-      } else {
-        handleFirestoreError(err, OperationType.DELETE, `simulations/${showDeleteSimulationConfirm.id}`);
-      }
-    }
+    socket.emit('delete-simulation', showDeleteSimulationConfirm.id);
+    setShowDeleteSimulationConfirm(null);
   };
 
   const distributeSelectedCars = () => {
@@ -689,14 +550,8 @@ export default function App() {
     }
     setVehicles(updatedVehicles);
     setSelectedVehicles(new Set([...selectedVehicles, ...newIds]));
-    if (roomCode && !quotaExceeded) {
-        const worldRef = doc(db, 'worlds', roomCode);
-        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
-          .catch(err => {
-            if (isQuotaError(err)) {
-              setQuotaExceeded(true);
-            }
-          });
+    if (roomCode) {
+      socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
     }
   };
 
@@ -708,12 +563,8 @@ export default function App() {
     });
     setVehicles(updatedVehicles);
     setSelectedVehicles(new Set());
-    if (roomCode && !quotaExceeded) {
-      const worldRef = doc(db, 'worlds', roomCode);
-      updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
-        .catch(err => {
-          if (isQuotaError(err)) setQuotaExceeded(true);
-        });
+    if (roomCode) {
+      socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
     }
   };
 
@@ -746,11 +597,8 @@ export default function App() {
 
     if (anyUpdates) {
       setVehicles(updatedVehicles);
-      if (roomCode && !quotaExceeded) {
-        const worldRef = doc(db, 'worlds', roomCode);
-        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (isQuotaError(err)) setQuotaExceeded(true);
-        });
+      if (roomCode) {
+        socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
       }
     }
   };
@@ -773,11 +621,8 @@ export default function App() {
 
     if (anyUpdates) {
       setVehicles(updatedVehicles);
-      if (roomCode && !quotaExceeded) {
-        const worldRef = doc(db, 'worlds', roomCode);
-        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (isQuotaError(err)) setQuotaExceeded(true);
-        });
+      if (roomCode) {
+        socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
       }
     }
   };
@@ -818,11 +663,8 @@ export default function App() {
 
     if (anyUpdates) {
       setVehicles(updatedVehicles);
-      if (roomCode && !quotaExceeded) {
-        const worldRef = doc(db, 'worlds', roomCode);
-        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (isQuotaError(err)) setQuotaExceeded(true);
-        });
+      if (roomCode) {
+        socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
       }
     }
   };
@@ -840,11 +682,8 @@ export default function App() {
 
     if (anyUpdates) {
       setVehicles(updatedVehicles);
-      if (roomCode && !quotaExceeded) {
-        const worldRef = doc(db, 'worlds', roomCode);
-        updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() }).catch(err => {
-          if (isQuotaError(err)) setQuotaExceeded(true);
-        });
+      if (roomCode) {
+        socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
       }
     }
   };
@@ -1035,14 +874,10 @@ export default function App() {
   const confirmDeleteFromLibrary = async () => {
     if (!showDeleteLayoutConfirm) return;
     try {
-      await deleteDoc(doc(db, 'layouts', showDeleteLayoutConfirm.id));
+      socket.emit('delete-layout', showDeleteLayoutConfirm.id);
       setShowDeleteLayoutConfirm(null);
     } catch (err) {
-      if (isQuotaError(err)) {
-        setQuotaExceeded(true);
-      } else {
-        handleFirestoreError(err, OperationType.DELETE, `layouts/${showDeleteLayoutConfirm.id}`);
-      }
+      console.error("Error deleting layout:", err);
     }
   };
 
@@ -1646,16 +1481,8 @@ export default function App() {
           const updatedVehicles = { ...vehicles, [newId]: newVehicle };
           setVehicles(updatedVehicles);
           setSelectedVehicles(new Set([...selectedVehicles, newId]));
-          if (roomCode && !quotaExceeded) {
-            const worldRef = doc(db, 'worlds', roomCode);
-            updateDoc(worldRef, { vehicles: updatedVehicles, updatedAt: serverTimestamp() })
-              .catch(err => {
-                if (isQuotaError(err)) {
-                  setQuotaExceeded(true);
-                } else {
-                  console.error("Error updating vehicles:", err);
-                }
-              });
+          if (roomCode) {
+            socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
           }
         }
       }
@@ -2302,14 +2129,14 @@ export default function App() {
                        {availableRooms.map(room => (
                           <div key={room.id} className="flex items-center justify-between bg-slate-50 border border-slate-100 rounded-xl p-3 hover:border-blue-200 hover:bg-blue-50/50 transition-colors group cursor-pointer" onClick={() => setRoomCode(room.id)}>
                             <div className="flex flex-col items-start px-2">
-                              <span className="font-bold text-slate-700 tracking-wider flex items-center">{room.id}</span>
-                              {room.updatedAt && <span className="text-[10px] text-slate-400">{new Date(room.updatedAt.toDate()).toLocaleString()}</span>}
+                               <span className="font-bold text-slate-700 tracking-wider flex items-center">{room.id}</span>
+                              {room.updatedAt && <span className="text-[10px] text-slate-400">{new Date(room.updatedAt).toLocaleString()}</span>}
                             </div>
                             <button 
                               onClick={(e) => { 
                                 e.stopPropagation(); 
                                 if (window.confirm(`Are you sure you want to delete room ${room.id}?`)) {
-                                  deleteDoc(doc(db, 'worlds', room.id)).catch(err => handleFirestoreError(err, OperationType.DELETE, `worlds/${room.id}`));
+                                  socket.emit('delete-room', room.id);
                                 }
                               }} 
                               className="p-2 text-slate-300 hover:text-red-500 rounded-lg hover:bg-red-50 transition-colors opacity-0 group-hover:opacity-100"
@@ -2814,16 +2641,6 @@ export default function App() {
         {/* Floating Controls */}
         <div className="absolute bottom-8 right-8 flex flex-col gap-2">
           <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 p-2 flex flex-col gap-1">
-            <a 
-              href="https://console.firebase.google.com/project/gen-lang-client-0324544485/firestore/databases/ai-studio-fa3f03dd-c38d-413b-92db-5e11a2c39a73/data"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="p-3 rounded-xl transition-colors text-slate-400 hover:text-orange-500 hover:bg-orange-50 flex items-center justify-center"
-              title="Open Firebase Console"
-            >
-              <Database className="w-5 h-5" />
-            </a>
-            <div className="h-px bg-slate-100 mx-2" />
             <button 
               onClick={() => setShowGridLines(!showGridLines)}
               className={`p-3 rounded-xl transition-colors ${showGridLines ? 'text-blue-600 bg-blue-50' : 'text-slate-400 hover:bg-slate-50'}`}
