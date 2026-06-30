@@ -1,1 +1,33 @@
 @import "tailwindcss";
+
+@keyframes badge-blink-red {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgb(239 68 68 / 0.75);
+  }
+  50% {
+    opacity: 0.5;
+    box-shadow: 0 0 8px 2px rgb(239 68 68 / 0.95);
+  }
+}
+
+@keyframes badge-blink-yellow {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgb(245 158 11 / 0.75);
+  }
+  50% {
+    opacity: 0.6;
+    box-shadow: 0 0 8px 2px rgb(245 158 11 / 0.95);
+  }
+}
+
+.badge-blink-red {
+  animation: badge-blink-red 1s ease-in-out infinite;
+  border-color: rgb(239 68 68) !important;
+}
+
+.badge-blink-yellow {
+  animation: badge-blink-yellow 1s ease-in-out infinite;
+  border-color: rgb(245 158 11) !important;
+}

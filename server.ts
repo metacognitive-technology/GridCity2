@@ -4,10 +4,6 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import Database from 'better-sqlite3';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const httpServer = createServer(app);
@@ -15,11 +11,15 @@ const io = new Server(httpServer, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
+  },
+  transports: ['websocket', 'polling'], // WebSocket first, with polling fallback for proxies
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
-const PORT = 3000;
-const DB_PATH = process.env.NODE_ENV === 'production' ? '/data/gridcity.db' : './gridcity.db';
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const DB_PATH = process.env.NODE_ENV === 'production' ? '/app/data/gridcity.db' : './gridcity.db';
 
 // Ensure data directory exists if needed
 const db = new Database(DB_PATH);
@@ -48,6 +48,13 @@ db.exec(`
   );
 `);
 
+// Add economy column if missing (safe for existing DBs)
+try {
+  db.exec(`ALTER TABLE worlds ADD COLUMN economy TEXT DEFAULT '{}';`);
+} catch (e) {
+  // column already exists
+}
+
 app.use(express.json());
 
 // API Routes
@@ -55,9 +62,18 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Simple health endpoint for Docker healthchecks and landing page monitoring
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', service: 'gridcity' });
+});
+
 // Socket.io Real-time Logic
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+  console.log(`User connected: ${socket.id} (transport: ${socket.conn.transport.name})`);
+
+  socket.on('disconnect', (reason) => {
+    console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
+  });
 
   socket.on('join-room', (roomCode) => {
     socket.join(roomCode);
@@ -68,17 +84,18 @@ io.on('connection', (socket) => {
     if (world) {
       socket.emit('world-state', {
         grid: JSON.parse((world as any).grid),
-        vehicles: JSON.parse((world as any).vehicles)
+        vehicles: JSON.parse((world as any).vehicles),
+        economy: JSON.parse((world as any).economy || '{}')
       });
     } else {
       // Create room if it doesn't exist
       const now = Date.now();
-      db.prepare('INSERT INTO worlds (id, grid, vehicles, updatedAt) VALUES (?, ?, ?, ?)').run(roomCode, '{}', '{}', now);
-      socket.emit('world-state', { grid: {}, vehicles: {} });
+      db.prepare('INSERT INTO worlds (id, grid, vehicles, economy, updatedAt) VALUES (?, ?, ?, ?, ?)').run(roomCode, '{}', '{}', '{}', now);
+      socket.emit('world-state', { grid: {}, vehicles: {}, economy: {} });
     }
     
     // Broadcast updated room list to everyone not in a room (for library-like view if needed)
-    const rooms = db.prepare('SELECT id, updatedAt FROM worlds WHERE id != "lobby" ORDER BY updatedAt DESC').all();
+    const rooms = db.prepare("SELECT id, updatedAt FROM worlds WHERE id != 'lobby' ORDER BY updatedAt DESC").all();
     io.emit('available-rooms', rooms);
   });
 
@@ -113,6 +130,11 @@ io.on('connection', (socket) => {
   socket.on('update-vehicles', ({ roomCode, vehicles }) => {
     db.prepare('UPDATE worlds SET vehicles = ?, updatedAt = ? WHERE id = ?').run(JSON.stringify(vehicles), Date.now(), roomCode);
     socket.to(roomCode).emit('vehicles-updated', vehicles);
+  });
+
+  socket.on('update-economy', ({ roomCode, economy }) => {
+    db.prepare('UPDATE worlds SET economy = ?, updatedAt = ? WHERE id = ?').run(JSON.stringify(economy), Date.now(), roomCode);
+    socket.to(roomCode).emit('economy-updated', economy);
   });
 
   socket.on('save-layout', ({ name, data }) => {

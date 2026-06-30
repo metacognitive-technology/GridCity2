@@ -4,7 +4,8 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies including python and build tools for native modules
+RUN apk add --no-cache python3 make g++
 COPY package*.json ./
 RUN npm install
 
@@ -17,7 +18,8 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Install production dependencies only
+# Install production dependencies including python and build tools for native modules
+RUN apk add --no-cache python3 make g++
 COPY package*.json ./
 RUN npm install --production
 
@@ -38,6 +40,7 @@ USER node
 EXPOSE 3000
 
 ENV NODE_ENV=production
+ENV PORT=3000
 
 # Use the bundled server
 CMD ["node", "dist/server.cjs"]

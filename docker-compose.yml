@@ -1,0 +1,43 @@
+services:
+  gridcity:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gridcity:local
+    container_name: gridcity
+    ports:
+      # IMPORTANT: WebSocket (Socket.io) connections are most reliable when accessing
+      # directly via this mapped port (http://your-host:3001).
+      # The Traefik HTTPS domain can have upgrade issues depending on your Traefik setup.
+      - "3001:3000"
+    volumes:
+      - gridcity_data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "traefik.enable=true"
+      # Main HTTPS router
+      - "traefik.http.routers.grid.rule=Host(`grid.metacognitive-bot.tech`)"
+      - "traefik.http.routers.grid.entrypoints=websecure"
+      - "traefik.http.routers.grid.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.grid.priority=10"
+      - "traefik.http.services.grid.loadbalancer.server.port=3000"
+
+      # WebSocket-specific router (helps with upgrade headers)
+      - "traefik.http.routers.grid-ws.rule=Host(`grid.metacognitive-bot.tech`) && PathPrefix(`/socket.io/`)"
+      - "traefik.http.routers.grid-ws.entrypoints=websecure"
+      - "traefik.http.routers.grid-ws.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.grid-ws.service=grid"
+      - "traefik.http.routers.grid-ws.priority=20"
+
+volumes:
+  gridcity_data:
+    driver: local

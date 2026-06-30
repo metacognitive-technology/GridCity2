@@ -1,5 +1,5 @@
 {
-  "name": "GridCity",
+  "name": "Grid City",
   "description": "A collaborative city-building and traffic simulation game with real-time multiplayer using a self-hosted Docker backend.",
   "requestFramePermissions": [],
   "majorCapabilities": [
