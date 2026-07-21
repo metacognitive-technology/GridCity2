@@ -1,4 +1,13 @@
 import React from 'react';
+import {
+  RAILCAR_LENGTH,
+  RAILCAR_OFFSET_BASE,
+  RAILCAR_OFFSET_SPACING,
+  TRAILER_LENGTH,
+  TRAILER_OFFSET_BASE,
+  TRAILER_OFFSET_SPACING,
+  VEHICLE_DIMS,
+} from '../vehicleShapes';
 import { motion } from 'motion/react';
 
 import { RailcarType } from '../types';
@@ -16,7 +25,7 @@ interface VehicleProps {
   tileRotation?: number;
   turnIntent?: 'left' | 'right' | null;
   exitHeading?: number;
-  type?: 'car' | 'train' | 'semi';
+  type?: 'car' | 'train' | 'semi' | 'fire-truck' | 'police' | 'ambulance' | 'tow-truck' | 'taxi' | 'bus';
   trailers?: number;
   railcars?: RailcarType[];
   tilePart?: 'anchor' | 'member';
@@ -25,8 +34,12 @@ interface VehicleProps {
   tileW?: number;
   tileH?: number;
   parkingStopUntil?: number;
+  trafficStopUntil?: number;
+  trafficStopReason?: 'stop-sign' | 'stoplight' | 'yield' | 'vehicle';
   parkingStallIndex?: number;
   lastParkingKey?: string;
+  /** When false, service vehicle light bar is dark (default true for service types). */
+  emergencyLightsOn?: boolean;
   onSelect?: (e: React.MouseEvent) => void;
   onTrailerSelect?: (trailerIndex: number, e: React.MouseEvent) => void;
   onRailcarSelect?: (railcarIndex: number, e: React.MouseEvent) => void;
@@ -102,6 +115,16 @@ export function getParkingStallOffset(
         localRot = 90;
       }
     }
+  } else if (tileType === 'building-repair-shop' || tileType === 'building-hospital') {
+    // Service / ambulance bays: center vehicle in the bay cell, nose toward building
+    offsetX = 32;
+    offsetY = 32;
+    localRot = 0;
+  } else if (tileType === 'building-home') {
+    // Driveway parking in front of the house
+    offsetX = 32;
+    offsetY = 50;
+    localRot = 0;
   }
 
   return { offsetX, offsetY, localRot };
@@ -133,64 +156,9 @@ export function getParkingStallWorldPosition(
   };
 }
 
-export function getTrajectory(x: number, y: number, heading: number, targetHeading: number, lane: number, progress: number) {
-  const centerX = (x + 0.5) * GRID_SIZE;
-  const centerY = (y + 0.5) * GRID_SIZE;
-  
-  const laneWidth = 12; // Half of 24
-  const lOffset = lane * (laneWidth / 2);
-  
-  let posX = centerX;
-  let posY = centerY;
-  let currentRotation = heading;
+import { getTrajectory } from '../vehicleTrajectory';
 
-  if (targetHeading !== heading) {
-    let turnAngle = targetHeading - heading;
-    if (turnAngle > 180) turnAngle -= 360;
-    if (turnAngle < -180) turnAngle += 360;
-    
-    const entryRad = (heading - 90) * (Math.PI / 180);
-    const ex = Math.cos(entryRad);
-    const ey = Math.sin(entryRad);
-    
-    const rightRad = heading * (Math.PI / 180);
-    const rx = Math.cos(rightRad);
-    const ry = Math.sin(rightRad);
-    
-    const turnDir = turnAngle > 0 ? 1 : -1;
-    
-    const arcCenterX = centerX - ex * (GRID_SIZE / 2) + rx * (GRID_SIZE / 2) * turnDir;
-    const arcCenterY = centerY - ey * (GRID_SIZE / 2) + ry * (GRID_SIZE / 2) * turnDir;
-    
-    const radius = Math.abs((GRID_SIZE / 2) - lOffset * turnDir);
-    
-    const startAngleRad = entryRad - (Math.PI / 2) * turnDir;
-    const currentAngleRad = startAngleRad + progress * (Math.PI / 2) * turnDir;
-    
-    posX = arcCenterX + Math.cos(currentAngleRad) * radius;
-    posY = arcCenterY + Math.sin(currentAngleRad) * radius;
-    
-    currentRotation = heading + progress * turnAngle;
-  } else {
-    const pOffset = (progress - 0.5) * GRID_SIZE;
-    
-    const rad = (heading - 90) * (Math.PI / 180);
-    const dx = Math.cos(rad);
-    const dy = Math.sin(rad);
-    
-    posX += dx * pOffset;
-    posY += dy * pOffset;
-    
-    const rightRad = heading * (Math.PI / 180);
-    const rx = Math.cos(rightRad);
-    const ry = Math.sin(rightRad);
-    
-    posX += rx * lOffset;
-    posY += ry * lOffset;
-  }
-
-  return { posX, posY, rotation: currentRotation };
-}
+export { getTrajectory };
 
 function sampleHistory(history: {x: number, y: number, r: number, d: number}[], targetDist: number) {
   if (history.length === 1 || targetDist <= history[0].d) {
@@ -264,8 +232,8 @@ export const TrailerVisual: React.FC<{
     <motion.div
       style={{
         position: 'absolute',
-        width: 12,
-        height: 40,
+        width: VEHICLE_DIMS.trailer.width,
+        height: VEHICLE_DIMS.trailer.length,
         backgroundColor: '#94a3b8',
         borderRadius: 1,
         border: `1px solid rgba(0,0,0,0.3)`,
@@ -398,8 +366,8 @@ const Railcar: React.FC<{
     <motion.div
       style={{
         position: 'absolute',
-        width: 18,
-        height: 48,
+        width: VEHICLE_DIMS.railcar.width,
+        height: VEHICLE_DIMS.railcar.length,
         backgroundColor: bg,
         borderRadius: 2,
         border: `1px solid rgba(0,0,0,0.4)`,
@@ -474,30 +442,32 @@ export const Vehicle: React.FC<VehicleProps> = ({
   x, y, heading, lane, progress, color, zIndex, exitHeading, 
   type = 'car', trailers = 0, railcars = [],
   tileType, tileRotation, tilePart, tileLocalX = 0, tileLocalY = 0, tileW = 1, tileH = 1,
-  parkingStopUntil, parkingStallIndex = 0, lastParkingKey, onSelect, onTrailerSelect, onRailcarSelect,
+  parkingStopUntil, trafficStopUntil, trafficStopReason, parkingStallIndex = 0, lastParkingKey,
+  emergencyLightsOn,
+  onSelect, onTrailerSelect, onRailcarSelect,
   trailerCargos, railcarCargos, selectedRailcarIndex, showCargoLabels, itemEmojiResolver
 }) => {
   const targetHeading = exitHeading !== undefined ? exitHeading : heading;
   
-  // Local state for countdown timer
+  const stopUntil = parkingStopUntil || trafficStopUntil;
   const [timeLeft, setTimeLeft] = React.useState<number | null>(null);
 
   React.useEffect(() => {
-    if (parkingStopUntil) {
+    if (stopUntil) {
       const update = () => {
-        const remaining = Math.max(0, Math.ceil((parkingStopUntil - Date.now()) / 1000));
-        setTimeLeft(remaining);
-        if (remaining > 0) {
-          requestAnimationFrame(update);
-        } else {
+        const remainingMs = stopUntil - Date.now();
+        if (remainingMs <= 0) {
           setTimeLeft(null);
+          return;
         }
+        setTimeLeft(Math.max(1, Math.ceil(remainingMs / 1000)));
+        requestAnimationFrame(update);
       };
       update();
     } else {
       setTimeLeft(null);
     }
-  }, [parkingStopUntil]);
+  }, [stopUntil]);
 
   const { posX: standardX, posY: standardY, rotation: standardRot } = getTrajectory(x, y, heading, targetHeading, lane, progress);
 
@@ -516,7 +486,13 @@ export const Vehicle: React.FC<VehicleProps> = ({
   let posY = standardY;
   let displayRotation = standardDisplayRotation;
 
-  const isParkedCell = tileType && tileType.startsWith('parking-') && lastParkingKey;
+  const isParkedCell =
+    tileType &&
+    lastParkingKey &&
+    (tileType.startsWith('parking-') ||
+      tileType === 'building-repair-shop' ||
+      tileType === 'building-hospital' ||
+      tileType === 'building-home');
   if (isParkedCell) {
     const stall = parkingStallIndex ?? 0;
     const { posX: parkedX, posY: parkedY, rotation: parkedRot } = getParkingStallWorldPosition(
@@ -579,10 +555,42 @@ export const Vehicle: React.FC<VehicleProps> = ({
     }
   }
 
-  let baseHeight = 20;
-  let baseWidth = 12;
-  if (type === 'semi') baseHeight = 10;
-  else if (type === 'train') { baseHeight = 40; baseWidth = 18; }
+  const isEmergency =
+    type === 'fire-truck' || type === 'police' || type === 'ambulance' || type === 'tow-truck';
+  const isTransit = type === 'taxi' || type === 'bus';
+  const isService = isEmergency || isTransit;
+  // Emergency lights default ON unless explicitly turned off (taxi/bus have no light bar)
+  const lightsFlashing = isEmergency && emergencyLightsOn !== false;
+  const dims =
+    type === 'semi' || type === 'fire-truck' || type === 'tow-truck' || type === 'bus'
+      ? VEHICLE_DIMS.semi
+      : type === 'train'
+        ? VEHICLE_DIMS.train
+        : VEHICLE_DIMS.car;
+  const baseWidth = type === 'bus' ? dims.width + 2 : dims.width;
+  const baseHeight =
+    type === 'fire-truck' || type === 'tow-truck'
+      ? VEHICLE_DIMS.car.length + 6
+      : type === 'bus'
+        ? VEHICLE_DIMS.car.length + 14
+        : dims.length;
+
+  const bodyBorder =
+    type === 'fire-truck'
+      ? '#7f1d1d'
+      : type === 'police'
+        ? '#172554'
+        : type === 'ambulance'
+          ? '#dc2626'
+          : type === 'tow-truck'
+            ? '#854d0e'
+            : type === 'taxi'
+              ? '#a16207'
+              : type === 'bus'
+                ? '#1e3a8a'
+                : color === '#ef4444'
+                  ? '#991b1b'
+                  : 'rgba(0,0,0,0.2)';
 
   return (
     <>
@@ -593,10 +601,12 @@ export const Vehicle: React.FC<VehicleProps> = ({
           height: baseHeight,
           backgroundColor: color,
           borderRadius: 2,
-          border: `1px solid ${color === '#ef4444' ? '#991b1b' : 'rgba(0,0,0,0.2)'}`,
+          border: `1px solid ${bodyBorder}`,
           zIndex: 100 + zIndex,
           pointerEvents: onSelect ? 'auto' : 'none',
           cursor: onSelect ? 'pointer' : undefined,
+          // Allow emergency light glow to show outside the body
+          overflow: isService ? 'visible' : 'hidden',
         }}
         initial={{ opacity: 0, scale: 0.5 }}
         animate={{
@@ -619,23 +629,132 @@ export const Vehicle: React.FC<VehicleProps> = ({
           <div 
             style={{
               position: 'absolute',
-              top: type === 'semi' ? '25%' : '15%',
+              top: type === 'semi' || type === 'fire-truck' || type === 'tow-truck' || type === 'bus' ? '12%' : '15%',
               left: '10%',
               right: '10%',
-              height: type === 'semi' ? '40%' : '20%',
-              backgroundColor: '#bfdbfe',
+              height: type === 'semi' || type === 'fire-truck' || type === 'tow-truck' || type === 'bus' ? '22%' : '20%',
+              backgroundColor: type === 'ambulance' ? '#93c5fd' : type === 'taxi' ? '#fef9c3' : '#bfdbfe',
               borderRadius: 1,
             }}
           />
         )}
+        {/* Taxi markings */}
+        {type === 'taxi' && (
+          <>
+            <div style={{ position: 'absolute', top: '36%', left: 0, right: 0, height: '16%', backgroundColor: '#111827' }} />
+            <div style={{ position: 'absolute', top: '2%', left: '28%', right: '28%', height: '12%', backgroundColor: '#facc15', borderRadius: 1, border: '1px solid #a16207' }} />
+            <div style={{ position: 'absolute', top: '4%', left: '34%', right: '34%', height: '8%', backgroundColor: '#111827', borderRadius: 1, fontSize: 5, color: '#facc15', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700 }}>TAXI</div>
+          </>
+        )}
+        {/* Bus markings */}
+        {type === 'bus' && (
+          <>
+            <div style={{ position: 'absolute', top: '38%', left: '8%', right: '8%', height: '28%', display: 'flex', gap: 2, justifyContent: 'space-between' }}>
+              {[0, 1, 2, 3].map(i => (
+                <div key={i} style={{ flex: 1, backgroundColor: '#93c5fd', borderRadius: 1, border: '1px solid #1e40af' }} />
+              ))}
+            </div>
+            <div style={{ position: 'absolute', bottom: '6%', left: '20%', right: '20%', height: '10%', backgroundColor: '#1e40af', borderRadius: 1 }} />
+          </>
+        )}
+        {/* Service markings + emergency light bars (toggleable) */}
+        {type === 'police' && (
+          <>
+            <div style={{ position: 'absolute', top: '38%', left: 0, right: 0, height: '18%', backgroundColor: '#f8fafc' }} />
+            <div className="emergency-light-bar" style={{ top: '2%', height: '14%' }}>
+              {lightsFlashing ? (
+                <>
+                  <div className="emergency-light-cell emergency-light-blue" />
+                  <div className="emergency-light-cell emergency-light-blue-alt" />
+                  <div className="emergency-light-cell emergency-light-blue" style={{ animationDelay: '0.1s' }} />
+                  <div className="emergency-light-cell emergency-light-blue-alt" style={{ animationDelay: '0.3s' }} />
+                </>
+              ) : (
+                <>
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                </>
+              )}
+            </div>
+          </>
+        )}
+        {type === 'ambulance' && (
+          <>
+            <div style={{ position: 'absolute', top: '42%', left: '35%', width: '30%', height: '8%', backgroundColor: '#dc2626' }} />
+            <div style={{ position: 'absolute', top: '36%', left: '46%', width: '8%', height: '20%', backgroundColor: '#dc2626' }} />
+            <div className="emergency-light-bar" style={{ top: '1%', height: '13%' }}>
+              {lightsFlashing ? (
+                <>
+                  <div className="emergency-light-cell emergency-light-ambulance" />
+                  <div className="emergency-light-cell emergency-light-ambulance-alt" />
+                  <div className="emergency-light-cell emergency-light-ambulance" style={{ animationDelay: '0.15s' }} />
+                  <div className="emergency-light-cell emergency-light-ambulance-alt" style={{ animationDelay: '0.45s' }} />
+                </>
+              ) : (
+                <>
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                </>
+              )}
+            </div>
+          </>
+        )}
+        {type === 'fire-truck' && (
+          <>
+            <div style={{ position: 'absolute', bottom: '8%', left: '15%', right: '15%', height: '22%', backgroundColor: '#fbbf24', borderRadius: 1, opacity: 0.9 }} />
+            <div className="emergency-light-bar" style={{ top: '2%', height: '14%' }}>
+              {lightsFlashing ? (
+                <>
+                  <div className="emergency-light-cell emergency-light-red" />
+                  <div className="emergency-light-cell emergency-light-red-alt" />
+                  <div className="emergency-light-cell emergency-light-red" style={{ animationDelay: '0.1s' }} />
+                  <div className="emergency-light-cell emergency-light-red-alt" style={{ animationDelay: '0.35s' }} />
+                </>
+              ) : (
+                <>
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                </>
+              )}
+            </div>
+          </>
+        )}
+        {type === 'tow-truck' && (
+          <>
+            <div style={{ position: 'absolute', bottom: '5%', left: '20%', right: '20%', height: '18%', backgroundColor: '#57534e', borderRadius: 1 }} />
+            <div className="emergency-light-bar" style={{ top: '2%', height: '14%' }}>
+              {lightsFlashing ? (
+                <>
+                  <div className="emergency-light-cell emergency-light-yellow" />
+                  <div className="emergency-light-cell emergency-light-yellow-alt" />
+                  <div className="emergency-light-cell emergency-light-yellow" style={{ animationDelay: '0.12s' }} />
+                  <div className="emergency-light-cell emergency-light-yellow-alt" style={{ animationDelay: '0.37s' }} />
+                </>
+              ) : (
+                <>
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                  <div className="emergency-light-cell emergency-light-off" />
+                </>
+              )}
+            </div>
+          </>
+        )}
         {/* Headlights */}
-        <div style={{ position: 'absolute', top: '0', left: '15%', width: '20%', height: type === 'semi' ? '20%' : '10%', backgroundColor: '#fef3c7', borderRadius: '50%' }} />
-        <div style={{ position: 'absolute', top: '0', right: '15%', width: '20%', height: type === 'semi' ? '20%' : '10%', backgroundColor: '#fef3c7', borderRadius: '50%' }} />
+        <div style={{ position: 'absolute', top: isEmergency ? '16%' : type === 'bus' || type === 'taxi' ? '2%' : '0', left: '15%', width: '20%', height: type === 'semi' || isService ? '12%' : '10%', backgroundColor: '#fef3c7', borderRadius: '50%' }} />
+        <div style={{ position: 'absolute', top: isEmergency ? '16%' : type === 'bus' || type === 'taxi' ? '2%' : '0', right: '15%', width: '20%', height: type === 'semi' || isService ? '12%' : '10%', backgroundColor: '#fef3c7', borderRadius: '50%' }} />
       </motion.div>
       
       {type === 'semi' && Array.from({ length: trailers }).map((_, i) => {
-        const offsetFront = 7 + i * 42;
-        const offsetRear = offsetFront + 40;
+        const offsetFront = TRAILER_OFFSET_BASE + i * TRAILER_OFFSET_SPACING;
+        const offsetRear = offsetFront + TRAILER_LENGTH;
 
         const frontPos = sampleHistory(historyRef.current, traveledRef.current - offsetFront);
         const rearPos = sampleHistory(historyRef.current, traveledRef.current - offsetRear);
@@ -673,8 +792,8 @@ export const Vehicle: React.FC<VehicleProps> = ({
       })}
 
       {type === 'train' && railcars.map((railcar, i) => {
-        const offsetFront = 25 + i * 50;
-        const offsetRear = offsetFront + 48;
+        const offsetFront = RAILCAR_OFFSET_BASE + i * RAILCAR_OFFSET_SPACING;
+        const offsetRear = offsetFront + RAILCAR_LENGTH;
 
         const frontPos = sampleHistory(historyRef.current, traveledRef.current - offsetFront);
         const rearPos = sampleHistory(historyRef.current, traveledRef.current - offsetRear);
@@ -738,7 +857,9 @@ export const Vehicle: React.FC<VehicleProps> = ({
           animate={{ scale: 1, opacity: 1 }}
           exit={{ scale: 0, opacity: 0 }}
         >
-          <span style={{ fontSize: '8px' }}>🅿️</span>
+          <span style={{ fontSize: '8px' }}>
+            {trafficStopReason === 'stop-sign' ? '🛑' : trafficStopReason === 'stoplight' ? '🚦' : '🅿️'}
+          </span>
           <span>{timeLeft}s</span>
         </motion.div>
       )}

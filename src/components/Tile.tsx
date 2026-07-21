@@ -1,4 +1,21 @@
 import React from 'react';
+import {
+  BRIDGE_PILLAR_LEFT,
+  BRIDGE_PILLAR_RIGHT,
+  DIVIDER_LEFT,
+  DIVIDER_RIGHT,
+  RAIL_LEFT,
+  RAIL_RIGHT,
+  ROAD_INSET_2L,
+  ROAD_INSET_4L,
+  ROAD_OUTER_2L,
+  ROAD_OUTER_4L,
+  ROAD_WIDTH_2L,
+  ROAD_WIDTH_4L,
+  TILE_CENTER,
+  TILE_PX,
+  svgN,
+} from '../roadGeometry';
 import { TileType } from '../types';
 
 interface TileProps {
@@ -13,6 +30,10 @@ interface TileProps {
   h?: number;
   growthProgress?: number;
   coneStageRatio?: number;
+  /** When set and in the future, render tree as burning */
+  burningUntil?: number;
+  /** Wall-clock now for burn animation progress (optional; Tile may use Date.now) */
+  burnNow?: number;
 }
 
 const PineTreeGraphic = () => (
@@ -22,61 +43,165 @@ const PineTreeGraphic = () => (
   </>
 );
 
+type Pt = [number, number];
+
+/** Point reflection through tile center — mirrors NW one-way curve art to SE. */
+function mirrorPt([x, y]: Pt): Pt {
+  return [TILE_PX - x, TILE_PX - y];
+}
+
+const ONE_WAY_CURVE_NW_CENTER: [Pt, Pt, Pt] = [[TILE_CENTER, 0], [TILE_CENTER, TILE_CENTER], [0, TILE_CENTER]];
+
+const ONE_WAY_CURVE_NW_ROAD = `M ${svgN(ROAD_INSET_2L)} 0 Q ${svgN(ROAD_INSET_2L)} ${svgN(ROAD_INSET_2L)} 0 ${svgN(ROAD_INSET_2L)} L 0 ${svgN(ROAD_OUTER_2L)} Q ${svgN(ROAD_OUTER_2L)} ${svgN(ROAD_OUTER_2L)} ${svgN(ROAD_OUTER_2L)} 0 Z`;
+
+const ONE_WAY_CURVE_SE_ROAD = `M ${svgN(ROAD_OUTER_2L)} ${TILE_PX} Q ${svgN(ROAD_OUTER_2L)} ${svgN(ROAD_OUTER_2L)} ${TILE_PX} ${svgN(ROAD_OUTER_2L)} L ${TILE_PX} ${svgN(ROAD_INSET_2L)} Q ${svgN(ROAD_INSET_2L)} ${svgN(ROAD_INSET_2L)} ${svgN(ROAD_INSET_2L)} ${TILE_PX} Z`;
+
+/** Rotation (deg) so default-up arrow matches a travel tangent vector */
+function tangentToArrowAngle(dx: number, dy: number): number {
+  return (Math.atan2(dy, dx) * 180) / Math.PI + 90;
+}
+
+function quadBezierPoint(p0: Pt, p1: Pt, p2: Pt, t: number): Pt {
+  const mt = 1 - t;
+  return [
+    mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0],
+    mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1],
+  ];
+}
+
+function quadBezierTangentAngle(p0: Pt, p1: Pt, p2: Pt, t: number): number {
+  const mt = 1 - t;
+  const dx = 2 * mt * (p1[0] - p0[0]) + 2 * t * (p2[0] - p1[0]);
+  const dy = 2 * mt * (p1[1] - p0[1]) + 2 * t * (p2[1] - p1[1]);
+  return tangentToArrowAngle(dx, dy);
+}
+
 const OneWayArrowHead: React.FC<{
   x: number;
   y: number;
   angle?: number;
   size?: number;
   color?: string;
-}> = ({ x, y, angle = 90, size = 8, color = '#ffffff' }) => (
-  <path
-    d={`M ${x} ${y - size * 1.1} L ${x - size} ${y + size * 0.75} L ${x + size} ${y + size * 0.75} Z`}
-    fill={color}
-    transform={`rotate(${angle} ${x} ${y})`}
-  />
-);
+}> = ({ x, y, angle = 0, size = 7, color = '#ffffff' }) => {
+  const halfW = size * 0.7;
+  const tipY = -size * 0.85;
+  const baseY = size * 0.55;
+  return (
+    <path
+      d={`M 0 ${tipY} L ${-halfW} ${baseY} L ${halfW} ${baseY} Z`}
+      fill={color}
+      transform={`translate(${x} ${y}) rotate(${angle})`}
+    />
+  );
+};
 
-const OneWayStraightMarkings: React.FC<{ stripeColor: string }> = ({ stripeColor }) => (
+const LaneCurveArrows: React.FC<{
+  p0: Pt;
+  p1: Pt;
+  p2: Pt;
+  samples: number[];
+  color: string;
+}> = ({ p0, p1, p2, samples, color }) => (
   <>
-    <line x1="21" y1="4" x2="21" y2="60" stroke={stripeColor} strokeWidth="1.25" strokeDasharray="6,6" opacity="0.55" />
-    <line x1="32" y1="4" x2="32" y2="60" stroke={stripeColor} strokeWidth="2" strokeDasharray="5,5" opacity="0.95" />
-    <line x1="43" y1="4" x2="43" y2="60" stroke={stripeColor} strokeWidth="1.25" strokeDasharray="6,6" opacity="0.55" />
-    <OneWayArrowHead x={26} y={18} angle={90} color={stripeColor} />
-    <OneWayArrowHead x={38} y={18} angle={90} color={stripeColor} />
-    <OneWayArrowHead x={26} y={46} angle={90} color={stripeColor} />
-    <OneWayArrowHead x={38} y={46} angle={90} color={stripeColor} />
+    {samples.map(t => {
+      const [x, y] = quadBezierPoint(p0, p1, p2, t);
+      return <OneWayArrowHead key={t} x={x} y={y} angle={quadBezierTangentAngle(p0, p1, p2, t)} color={color} />;
+    })}
   </>
 );
 
-const OneWayCurveMarkings: React.FC<{
-  stripeColor: string;
-  variant: 'nw' | 'es';
-}> = ({ stripeColor, variant }) => {
-  if (variant === 'nw') {
-    return (
-      <>
-        <path d="M 26 2 Q 26 26 2 26" fill="none" stroke={stripeColor} strokeWidth="1.25" strokeDasharray="5,5" opacity="0.55" />
-        <path d="M 32 0 Q 32 32 0 32" fill="none" stroke={stripeColor} strokeWidth="2" strokeDasharray="5,5" opacity="0.95" />
-        <path d="M 38 2 Q 38 38 2 38" fill="none" stroke={stripeColor} strokeWidth="1.25" strokeDasharray="5,5" opacity="0.55" />
-        <OneWayArrowHead x={22} y={10} angle={-35} color={stripeColor} />
-        <OneWayArrowHead x={34} y={10} angle={-35} color={stripeColor} />
-        <OneWayArrowHead x={10} y={24} angle={-80} color={stripeColor} />
-        <OneWayArrowHead x={10} y={36} angle={-80} color={stripeColor} />
-      </>
-    );
-  }
+const OneWayStraightMarkings: React.FC<{ stripeColor: string }> = ({ stripeColor }) => {
+  // Tile art is N–S; rotation handles world heading. Travel is northbound (port 0) in local space.
+  const centerX = TILE_CENTER;
+  const travelAngle = tangentToArrowAngle(0, -1);
+  const arrowYs = [14, 32, 50];
   return (
     <>
-      <path d="M 50 22 Q 50 44 22 44" fill="none" stroke={stripeColor} strokeWidth="1.25" strokeDasharray="5,5" opacity="0.55" />
-      <path d="M 44 20 Q 44 44 20 44" fill="none" stroke={stripeColor} strokeWidth="2" strokeDasharray="5,5" opacity="0.95" />
-      <path d="M 38 18 Q 38 42 16 42" fill="none" stroke={stripeColor} strokeWidth="1.25" strokeDasharray="5,5" opacity="0.55" />
-      <OneWayArrowHead x={52} y={28} angle={135} color={stripeColor} />
-      <OneWayArrowHead x={40} y={28} angle={135} color={stripeColor} />
-      <OneWayArrowHead x={26} y={50} angle={180} color={stripeColor} />
-      <OneWayArrowHead x={38} y={50} angle={180} color={stripeColor} />
+      <line
+        x1={centerX}
+        y1="4"
+        x2={centerX}
+        y2="60"
+        stroke={stripeColor}
+        strokeWidth="2"
+        strokeDasharray="5,5"
+        opacity="0.95"
+      />
+      {arrowYs.map(y => (
+        <OneWayArrowHead key={y} x={centerX} y={y} angle={travelAngle} color={stripeColor} />
+      ))}
     </>
   );
 };
+
+const OneWayCurveMarkings: React.FC<{
+  stripeColor: string;
+  variant: 'nw' | 'se';
+}> = ({ stripeColor, variant }) => {
+  const center: [Pt, Pt, Pt] =
+    variant === 'nw'
+      ? ONE_WAY_CURVE_NW_CENTER
+      : ONE_WAY_CURVE_NW_CENTER.map(mirrorPt) as [Pt, Pt, Pt];
+  const [p0, p1, p2] = center;
+
+  return (
+    <>
+      <path
+        d={`M ${p0[0]} ${p0[1]} Q ${p1[0]} ${p1[1]} ${p2[0]} ${p2[1]}`}
+        fill="none"
+        stroke={stripeColor}
+        strokeWidth="2"
+        strokeDasharray="5,5"
+        opacity="0.95"
+      />
+      <LaneCurveArrows
+        p0={p0}
+        p1={p1}
+        p2={p2}
+        samples={[0.22, 0.5, 0.78]}
+        color={stripeColor}
+      />
+    </>
+  );
+};
+
+const TREE_BURN_MS = 30_000;
+
+function BurningTreeOverlay({ burnProgress }: { burnProgress: number }) {
+  // burnProgress 0 = just lit, 1 = about to ash
+  const intensity = 0.55 + 0.45 * Math.min(1, Math.max(0, burnProgress));
+  const char = Math.min(1, Math.max(0, burnProgress));
+  return (
+    <g className="tree-fire-layer" style={{ pointerEvents: 'none' }}>
+      {/* Scorched ground */}
+      <ellipse
+        cx="32"
+        cy="56"
+        rx={14 + char * 6}
+        ry={5 + char * 2}
+        fill={`rgba(28, 25, 23, ${0.25 + char * 0.45})`}
+      />
+      {/* Flame body */}
+      <g className="tree-flame" opacity={intensity}>
+        <ellipse cx="28" cy="28" rx="7" ry="14" fill="#fbbf24" className="tree-flame-core" />
+        <ellipse cx="36" cy="24" rx="6" ry="12" fill="#f97316" className="tree-flame-mid" />
+        <ellipse cx="32" cy="18" rx="5" ry="11" fill="#ef4444" className="tree-flame-tip" />
+        <ellipse cx="24" cy="34" rx="4" ry="8" fill="#fde047" className="tree-flame-side" />
+        <ellipse cx="40" cy="32" rx="3.5" ry="7" fill="#fb923c" className="tree-flame-side" />
+      </g>
+      {/* Smoke */}
+      <g className="tree-smoke" opacity={0.35 + char * 0.4}>
+        <circle cx="30" cy="10" r="4" fill="#94a3b8" className="tree-smoke-puff" />
+        <circle cx="38" cy="6" r="5" fill="#64748b" className="tree-smoke-puff tree-smoke-puff-delay" />
+        <circle cx="26" cy="4" r="3.5" fill="#475569" className="tree-smoke-puff tree-smoke-puff-delay2" />
+      </g>
+      {/* Ember sparks */}
+      <circle cx="22" cy="22" r="1.2" fill="#fef08a" className="tree-ember" />
+      <circle cx="42" cy="18" r="1" fill="#fdba74" className="tree-ember tree-ember-delay" />
+      <circle cx="34" cy="12" r="0.9" fill="#fecaca" className="tree-ember tree-ember-delay2" />
+    </g>
+  );
+}
 
 export const Tile: React.FC<TileProps> = ({ 
   type, 
@@ -90,7 +215,14 @@ export const Tile: React.FC<TileProps> = ({
   h = 1,
   growthProgress = 0,
   coneStageRatio = 0.125,
+  burningUntil,
+  burnNow,
 }) => {
+  const now = burnNow ?? Date.now();
+  const isBurning = typeof burningUntil === 'number' && burningUntil > now;
+  const burnProgress = isBurning
+    ? Math.min(1, Math.max(0, 1 - (burningUntil! - now) / TREE_BURN_MS))
+    : 0;
   const isRail = type.startsWith('rail');
   const color = isRail ? 'transparent' : '#374151'; // Transparent for rail, Gray-700 for road
   const stripeColor = isRail ? '#9ca3af' : '#ffffff'; // Gray-400 for rail ties, White for road lines
@@ -354,8 +486,8 @@ export const Tile: React.FC<TileProps> = ({
         const isBridge = type === 'road-bridge' || type === 'road-oneway-bridge' || type === 'rail-trestle' || type === 'road-4lane-bridge';
         const is4Lane = type === 'road-4lane-straight' || type === 'road-4lane-bridge';
         const isOneWay = type === 'road-oneway-straight' || type === 'road-oneway-bridge';
-        const roadWidth = is4Lane ? 40 : 24;
-        const roadX = (64 - roadWidth) / 2;
+        const roadWidth = is4Lane ? ROAD_WIDTH_4L : ROAD_WIDTH_2L;
+        const roadX = is4Lane ? ROAD_INSET_4L : ROAD_INSET_2L;
         
         return (
           <>
@@ -364,36 +496,36 @@ export const Tile: React.FC<TileProps> = ({
               <>
                 {/* Rail ties */}
                 {[8, 24, 40, 56].map(y => (
-                  <rect key={y} x="16" y={y-2} width="32" height="4" fill={stripeColor} />
+                  <rect key={y} x={svgN(RAIL_LEFT - 3)} y={y-2} width={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} height="4" fill={stripeColor} />
                 ))}
                 {/* Metal rails */}
-                <rect x="22" y="0" width="2" height="64" fill={railMetalColor} />
-                <rect x="40" y="0" width="2" height="64" fill={railMetalColor} />
+                <rect x={svgN(RAIL_LEFT)} y="0" width="2" height="64" fill={railMetalColor} />
+                <rect x={svgN(RAIL_RIGHT)} y="0" width="2" height="64" fill={railMetalColor} />
               </>
             ) : is4Lane ? (
               // 4-lane stripes: Yellow center, white dashed lanes
               <>
                 {/* Yellow centerline */}
-                <rect x="31" y="0" width="2" height="64" fill="#fbbf24" />
+                <rect x={TILE_CENTER - 1} y="0" width="2" height="64" fill="#fbbf24" />
                 {/* White dashed lane boundaries */}
-                <line x1="21" y1="0" x2="21" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                <line x1="43" y1="0" x2="43" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                <line x1={svgN(DIVIDER_LEFT)} y1="0" x2={svgN(DIVIDER_LEFT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                <line x1={svgN(DIVIDER_RIGHT)} y1="0" x2={svgN(DIVIDER_RIGHT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
               </>
             ) : isOneWay ? (
               <OneWayStraightMarkings stripeColor={stripeColor} />
             ) : (
               // Standard road stripes
               <>
-                <rect x="31" y="8" width="2" height="12" fill={stripeColor} />
-                <rect x="31" y="44" width="2" height="12" fill={stripeColor} />
+                <rect x={TILE_CENTER - 1} y="8" width="2" height="12" fill={stripeColor} />
+                <rect x={TILE_CENTER - 1} y="44" width="2" height="12" fill={stripeColor} />
               </>
             )}
             {isBridge && (
               <>
-                <rect x="16" y="0" width="4" height="64" fill="#94a3b8" />
-                <rect x="44" y="0" width="4" height="64" fill="#94a3b8" />
+                <rect x={svgN(BRIDGE_PILLAR_LEFT)} y="0" width="4" height="64" fill="#94a3b8" />
+                <rect x={svgN(BRIDGE_PILLAR_RIGHT)} y="0" width="4" height="64" fill="#94a3b8" />
                 {[4, 20, 36, 52].map(y => (
-                  <rect key={y} x="16" y={y} width="32" height="2" fill="#64748b" />
+                  <rect key={y} x={svgN(BRIDGE_PILLAR_LEFT)} y={y} width={svgN(BRIDGE_PILLAR_RIGHT - BRIDGE_PILLAR_LEFT)} height="2" fill="#64748b" />
                 ))}
               </>
             )}
@@ -410,30 +542,32 @@ export const Tile: React.FC<TileProps> = ({
         return (
           <>
             {is4LaneCurve ? (
-               <path d="M 52 0 Q 52 52 0 52 L 0 12 Q 12 12 12 0 Z" fill={color} />
+               <path d={`M ${svgN(ROAD_OUTER_4L)} 0 Q ${svgN(ROAD_OUTER_4L)} ${svgN(ROAD_OUTER_4L)} 0 ${svgN(ROAD_OUTER_4L)} L 0 ${svgN(ROAD_INSET_4L)} Q ${svgN(ROAD_INSET_4L)} ${svgN(ROAD_INSET_4L)} ${svgN(ROAD_INSET_4L)} 0 Z`} fill={color} />
             ) : isOneWayCurveReverse ? (
-               <path d="M 44 20 Q 44 44 20 44 L 20 64 Q 64 64 64 20 Z" fill={color} />
+               <path d={ONE_WAY_CURVE_SE_ROAD} fill={color} />
+            ) : isOneWayCurve ? (
+               <path d={ONE_WAY_CURVE_NW_ROAD} fill={color} />
             ) : (
-               <path d="M 20 0 Q 20 20 0 20 L 0 44 Q 44 44 44 0 Z" fill={color} />
+               <path d={`M ${svgN(ROAD_INSET_2L)} 0 Q ${svgN(ROAD_INSET_2L)} ${svgN(ROAD_INSET_2L)} 0 ${svgN(ROAD_INSET_2L)} L 0 ${svgN(ROAD_OUTER_2L)} Q ${svgN(ROAD_OUTER_2L)} ${svgN(ROAD_OUTER_2L)} ${svgN(ROAD_OUTER_2L)} 0 Z`} fill={color} />
             )}
             {isRail ? (
                <>
-                 <path d="M 32 0 Q 32 32 0 32" fill="none" stroke={stripeColor} strokeWidth="4" strokeDasharray="4,4" />
-                 <path d="M 22 0 Q 22 22 0 22" fill="none" stroke={railMetalColor} strokeWidth="2" />
-                 <path d="M 42 0 Q 42 42 0 42" fill="none" stroke={railMetalColor} strokeWidth="2" />
+                 <path d={`M ${TILE_CENTER} 0 Q ${TILE_CENTER} ${TILE_CENTER} 0 ${TILE_CENTER}`} fill="none" stroke={stripeColor} strokeWidth="4" strokeDasharray="4,4" />
+                 <path d={`M ${svgN(RAIL_LEFT)} 0 Q ${svgN(RAIL_LEFT)} ${svgN(RAIL_LEFT)} 0 ${svgN(RAIL_LEFT)}`} fill="none" stroke={railMetalColor} strokeWidth="2" />
+                 <path d={`M ${svgN(RAIL_RIGHT)} 0 Q ${svgN(RAIL_RIGHT)} ${svgN(RAIL_RIGHT)} 0 ${svgN(RAIL_RIGHT)}`} fill="none" stroke={railMetalColor} strokeWidth="2" />
                </>
             ) : is4LaneCurve ? (
                <>
-                 <path d="M 32 0 Q 32 32 0 32" fill="none" stroke="#fbbf24" strokeWidth="2" />
-                 <path d="M 42 0 Q 42 42 0 42" fill="none" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                 <path d="M 22 0 Q 22 22 0 22" fill="none" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                 <path d={`M ${TILE_CENTER} 0 Q ${TILE_CENTER} ${TILE_CENTER} 0 ${TILE_CENTER}`} fill="none" stroke="#fbbf24" strokeWidth="2" />
+                 <path d={`M ${svgN(DIVIDER_RIGHT)} 0 Q ${svgN(DIVIDER_RIGHT)} ${svgN(DIVIDER_RIGHT)} 0 ${svgN(DIVIDER_RIGHT)}`} fill="none" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                 <path d={`M ${svgN(DIVIDER_LEFT)} 0 Q ${svgN(DIVIDER_LEFT)} ${svgN(DIVIDER_LEFT)} 0 ${svgN(DIVIDER_LEFT)}`} fill="none" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
                </>
             ) : isOneWayCurve ? (
               <OneWayCurveMarkings stripeColor={stripeColor} variant="nw" />
             ) : isOneWayCurveReverse ? (
-              <OneWayCurveMarkings stripeColor={stripeColor} variant="es" />
+              <OneWayCurveMarkings stripeColor={stripeColor} variant="se" />
             ) : (
-               <path d="M 32 0 Q 32 32 0 32" fill="none" stroke={stripeColor} strokeWidth="2" strokeDasharray="8,8" />
+               <path d={`M ${TILE_CENTER} 0 Q ${TILE_CENTER} ${TILE_CENTER} 0 ${TILE_CENTER}`} fill="none" stroke={stripeColor} strokeWidth="2" strokeDasharray="8,8" />
             )}
           </>
         );
@@ -441,8 +575,8 @@ export const Tile: React.FC<TileProps> = ({
       case 'rail-t':
       case 'road-4lane-t':
         const is4LaneT = type === 'road-4lane-t';
-        const tRoadWidth = is4LaneT ? 40 : 24;
-        const tRoadX = (64 - tRoadWidth) / 2;
+        const tRoadWidth = is4LaneT ? ROAD_WIDTH_4L : ROAD_WIDTH_2L;
+        const tRoadX = is4LaneT ? ROAD_INSET_4L : ROAD_INSET_2L;
         return (
           <>
             <rect x={tRoadX} y="0" width={tRoadWidth} height="64" fill={color} />
@@ -451,39 +585,36 @@ export const Tile: React.FC<TileProps> = ({
               <>
                 {/* Vertical ties */}
                 {[8, 24, 40, 56].map(y => (
-                  <rect key={y} x="16" y={y-2} width="32" height="4" fill={stripeColor} />
+                  <rect key={y} x={svgN(RAIL_LEFT - 3)} y={y-2} width={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} height="4" fill={stripeColor} />
                 ))}
                 {/* Horizontal ties */}
                 {[8, 24].map(x => (
-                  <rect key={x} x={x-2} y="16" width="4" height="32" fill={stripeColor} />
+                  <rect key={x} x={x-2} y={svgN(RAIL_LEFT - 3)} width="4" height={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} fill={stripeColor} />
                 ))}
                 {/* Vertical rails */}
-                <rect x="22" y="0" width="2" height="64" fill={railMetalColor} />
-                <rect x="40" y="0" width="2" height="64" fill={railMetalColor} />
+                <rect x={svgN(RAIL_LEFT)} y="0" width="2" height="64" fill={railMetalColor} />
+                <rect x={svgN(RAIL_RIGHT)} y="0" width="2" height="64" fill={railMetalColor} />
                 {/* Horizontal rails */}
-                <rect x="0" y="22" width="32" height="2" fill={railMetalColor} />
-                <rect x="0" y="40" width="32" height="2" fill={railMetalColor} />
+                <rect x="0" y={svgN(RAIL_LEFT)} width="32" height="2" fill={railMetalColor} />
+                <rect x="0" y={svgN(RAIL_RIGHT)} width="32" height="2" fill={railMetalColor} />
               </>
             )}
             {!isRail && (
               <>
                 {is4LaneT ? (
                   <>
-                    {/* Vertical yellow center */}
-                    <rect x="31" y="0" width="2" height="64" fill="#fbbf24" />
-                    {/* Horizontal yellow center */}
-                    <rect x="0" y="31" width="32" height="2" fill="#fbbf24" />
-                    {/* Dashed lines */}
-                    <line x1="21" y1="0" x2="21" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                    <line x1="43" y1="0" x2="43" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                    <line x1="0" y1="21" x2="32" y2="21" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                    <line x1="0" y1="43" x2="32" y2="43" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <rect x={TILE_CENTER - 1} y="0" width="2" height="64" fill="#fbbf24" />
+                    <rect x="0" y={TILE_CENTER - 1} width="32" height="2" fill="#fbbf24" />
+                    <line x1={svgN(DIVIDER_LEFT)} y1="0" x2={svgN(DIVIDER_LEFT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <line x1={svgN(DIVIDER_RIGHT)} y1="0" x2={svgN(DIVIDER_RIGHT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <line x1="0" y1={svgN(DIVIDER_LEFT)} x2="32" y2={svgN(DIVIDER_LEFT)} stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <line x1="0" y1={svgN(DIVIDER_RIGHT)} x2="32" y2={svgN(DIVIDER_RIGHT)} stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
                   </>
                 ) : (
                   <>
-                    <rect x="31" y="8" width="2" height="12" fill={stripeColor} />
-                    <rect x="31" y="44" width="2" height="12" fill={stripeColor} />
-                    <rect x="8" y="31" width="12" height="2" fill={stripeColor} />
+                    <rect x={TILE_CENTER - 1} y="8" width="2" height="12" fill={stripeColor} />
+                    <rect x={TILE_CENTER - 1} y="44" width="2" height="12" fill={stripeColor} />
+                    <rect x={svgN(ROAD_INSET_2L - 12)} y={TILE_CENTER - 1} width="12" height="2" fill={stripeColor} />
                   </>
                 )}
               </>
@@ -494,8 +625,8 @@ export const Tile: React.FC<TileProps> = ({
       case 'rail-cross':
       case 'road-4lane-cross':
         const is4LaneCross = type === 'road-4lane-cross';
-        const crossRoadWidth = is4LaneCross ? 40 : 24;
-        const crossRoadX = (64 - crossRoadWidth) / 2;
+        const crossRoadWidth = is4LaneCross ? ROAD_WIDTH_4L : ROAD_WIDTH_2L;
+        const crossRoadX = is4LaneCross ? ROAD_INSET_4L : ROAD_INSET_2L;
         return (
           <>
             <rect x={crossRoadX} y="0" width={crossRoadWidth} height="64" fill={color} />
@@ -504,37 +635,37 @@ export const Tile: React.FC<TileProps> = ({
               <>
                 {/* Vertical ties */}
                 {[8, 24, 40, 56].map(y => (
-                  <rect key={y} x="16" y={y-2} width="32" height="4" fill={stripeColor} />
+                  <rect key={y} x={svgN(RAIL_LEFT - 3)} y={y-2} width={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} height="4" fill={stripeColor} />
                 ))}
                 {/* Horizontal ties */}
                 {[8, 24, 40, 56].map(x => (
-                  <rect key={x} x={x-2} y="16" width="4" height="32" fill={stripeColor} />
+                  <rect key={x} x={x-2} y={svgN(RAIL_LEFT - 3)} width="4" height={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} fill={stripeColor} />
                 ))}
                 {/* Vertical rails */}
-                <rect x="22" y="0" width="2" height="64" fill={railMetalColor} />
-                <rect x="40" y="0" width="2" height="64" fill={railMetalColor} />
+                <rect x={svgN(RAIL_LEFT)} y="0" width="2" height="64" fill={railMetalColor} />
+                <rect x={svgN(RAIL_RIGHT)} y="0" width="2" height="64" fill={railMetalColor} />
                 {/* Horizontal rails */}
-                <rect x="0" y="22" width="64" height="2" fill={railMetalColor} />
-                <rect x="0" y="40" width="64" height="2" fill={railMetalColor} />
+                <rect x="0" y={svgN(RAIL_LEFT)} width="64" height="2" fill={railMetalColor} />
+                <rect x="0" y={svgN(RAIL_RIGHT)} width="64" height="2" fill={railMetalColor} />
               </>
             )}
             {!isRail && (
               <>
                 {is4LaneCross ? (
                   <>
-                    <rect x="31" y="0" width="2" height="64" fill="#fbbf24" />
-                    <rect x="0" y="31" width="64" height="2" fill="#fbbf24" />
-                    <line x1="21" y1="0" x2="21" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                    <line x1="43" y1="0" x2="43" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                    <line x1="0" y1="21" x2="64" y2="21" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                    <line x1="0" y1="43" x2="64" y2="43" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <rect x={TILE_CENTER - 1} y="0" width="2" height="64" fill="#fbbf24" />
+                    <rect x="0" y={TILE_CENTER - 1} width="64" height="2" fill="#fbbf24" />
+                    <line x1={svgN(DIVIDER_LEFT)} y1="0" x2={svgN(DIVIDER_LEFT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <line x1={svgN(DIVIDER_RIGHT)} y1="0" x2={svgN(DIVIDER_RIGHT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <line x1="0" y1={svgN(DIVIDER_LEFT)} x2="64" y2={svgN(DIVIDER_LEFT)} stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                    <line x1="0" y1={svgN(DIVIDER_RIGHT)} x2="64" y2={svgN(DIVIDER_RIGHT)} stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
                   </>
                 ) : (
                   <>
-                    <rect x="31" y="8" width="2" height="12" fill={stripeColor} />
-                    <rect x="31" y="44" width="2" height="12" fill={stripeColor} />
-                    <rect x="8" y="31" width="12" height="2" fill={stripeColor} />
-                    <rect x="44" y="31" width="12" height="2" fill={stripeColor} />
+                    <rect x={TILE_CENTER - 1} y="8" width="2" height="12" fill={stripeColor} />
+                    <rect x={TILE_CENTER - 1} y="44" width="2" height="12" fill={stripeColor} />
+                    <rect x={svgN(ROAD_INSET_2L - 12)} y={TILE_CENTER - 1} width="12" height="2" fill={stripeColor} />
+                    <rect x={svgN(ROAD_OUTER_2L)} y={TILE_CENTER - 1} width="12" height="2" fill={stripeColor} />
                   </>
                 )}
               </>
@@ -546,49 +677,49 @@ export const Tile: React.FC<TileProps> = ({
           <>
             {/* The roundabout arc (quarter circle) */}
             <path 
-              d="M 20 64 A 44 44 0 0 1 64 20 L 64 44 A 20 20 0 0 0 44 64 Z" 
+              d={`M ${svgN(ROAD_INSET_2L)} 64 A ${svgN(ROAD_OUTER_2L)} ${svgN(ROAD_OUTER_2L)} 0 0 1 64 ${svgN(ROAD_INSET_2L)} L 64 ${svgN(ROAD_OUTER_2L)} A ${svgN(ROAD_INSET_2L)} ${svgN(ROAD_INSET_2L)} 0 0 0 ${svgN(ROAD_OUTER_2L)} 64 Z`}
               fill={color} 
             />
             {/* The entrance/exit road */}
-            <rect x="0" y="20" width="32" height="24" fill={color} />
+            <rect x="0" y={svgN(ROAD_INSET_2L)} width="32" height={svgN(ROAD_WIDTH_2L)} fill={color} />
             {/* Markings */}
             <path 
-              d="M 32 64 A 32 32 0 0 1 64 32" 
+              d={`M ${TILE_CENTER} 64 A ${TILE_CENTER} ${TILE_CENTER} 0 0 1 64 ${TILE_CENTER}`}
               fill="none" 
               stroke={stripeColor} 
               strokeWidth="2" 
               strokeDasharray="8,8" 
             />
-            <line x1="0" y1="31" x2="24" y2="31" stroke={stripeColor} strokeWidth="2" strokeDasharray="8,8" />
+            <line x1="0" y1={TILE_CENTER - 1} x2={svgN(ROAD_OUTER_2L - 20)} y2={TILE_CENTER - 1} stroke={stripeColor} strokeWidth="2" strokeDasharray="8,8" />
           </>
         );
       case 'road-end':
       case 'road-4lane-end':
       case 'rail-end':
         const is4LaneEnd = type === 'road-4lane-end';
-        const endWidth = is4LaneEnd ? 40 : 24;
-        const endX = (64 - endWidth) / 2;
+        const endWidth = is4LaneEnd ? ROAD_WIDTH_4L : ROAD_WIDTH_2L;
+        const endX = is4LaneEnd ? ROAD_INSET_4L : ROAD_INSET_2L;
         return (
           <>
             <rect x={endX} y="32" width={endWidth} height="32" fill={color} />
             {isRail ? (
               <>
-                <rect x="16" y="40" width="32" height="4" fill={stripeColor} />
-                <rect x="16" y="56" width="32" height="4" fill={stripeColor} />
-                <rect x="22" y="32" width="2" height="32" fill={railMetalColor} />
-                <rect x="40" y="32" width="2" height="32" fill={railMetalColor} />
-                <rect x="16" y="32" width="32" height="4" fill="#64748b" />
+                <rect x={svgN(RAIL_LEFT - 3)} y="40" width={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} height="4" fill={stripeColor} />
+                <rect x={svgN(RAIL_LEFT - 3)} y="56" width={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} height="4" fill={stripeColor} />
+                <rect x={svgN(RAIL_LEFT)} y="32" width="2" height="32" fill={railMetalColor} />
+                <rect x={svgN(RAIL_RIGHT)} y="32" width="2" height="32" fill={railMetalColor} />
+                <rect x={svgN(RAIL_LEFT - 3)} y="32" width={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} height="4" fill="#64748b" />
               </>
             ) : is4LaneEnd ? (
               <>
-                <rect x="31" y="32" width="2" height="32" fill="#fbbf24" />
-                <line x1="21" y1="32" x2="21" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
-                <line x1="43" y1="32" x2="43" y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                <rect x={TILE_CENTER - 1} y="32" width="2" height="32" fill="#fbbf24" />
+                <line x1={svgN(DIVIDER_LEFT)} y1="32" x2={svgN(DIVIDER_LEFT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                <line x1={svgN(DIVIDER_RIGHT)} y1="32" x2={svgN(DIVIDER_RIGHT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
                 <rect x={endX} y="32" width={endWidth} height="4" fill="#475569" />
               </>
             ) : (
               <>
-                <rect x="31" y="44" width="2" height="12" fill={stripeColor} />
+                <rect x={TILE_CENTER - 1} y="44" width="2" height="12" fill={stripeColor} />
                 <rect x={endX} y="32" width={endWidth} height="4" fill="#475569" />
               </>
             )}
@@ -597,11 +728,11 @@ export const Tile: React.FC<TileProps> = ({
       case 'road-transition-2to4':
         return (
           <>
-            <path d="M 20 0 L 44 0 L 52 64 L 12 64 Z" fill={color} />
-            <rect x="31" y="8" width="2" height="12" fill={stripeColor} />
-            <rect x="31" y="44" width="2" height="12" fill={stripeColor} />
-            <path d="M 22 40 L 23 56" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
-            <path d="M 42 40 L 41 56" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
+            <path d={`M ${svgN(ROAD_INSET_2L)} 0 L ${svgN(ROAD_OUTER_2L)} 0 L ${svgN(ROAD_OUTER_4L)} 64 L ${svgN(ROAD_INSET_4L)} 64 Z`} fill={color} />
+            <rect x={TILE_CENTER - 1} y="8" width="2" height="12" fill={stripeColor} />
+            <rect x={TILE_CENTER - 1} y="44" width="2" height="12" fill={stripeColor} />
+            <path d={`M ${svgN(DIVIDER_LEFT)} 40 L ${svgN(DIVIDER_LEFT)} 56`} stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
+            <path d={`M ${svgN(DIVIDER_RIGHT)} 40 L ${svgN(DIVIDER_RIGHT)} 56`} stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
           </>
         );
       case 'building-home':
@@ -667,15 +798,15 @@ export const Tile: React.FC<TileProps> = ({
       case 'rail-road-crossing':
         return (
           <>
-            <rect x="0" y="20" width="64" height="24" fill="#374151" />
-            <rect x="20" y="0" width="24" height="64" fill="transparent" />
+            <rect x="0" y={svgN(ROAD_INSET_2L)} width="64" height={svgN(ROAD_WIDTH_2L)} fill="#374151" />
+            <rect x={svgN(ROAD_INSET_2L)} y="0" width={svgN(ROAD_WIDTH_2L)} height="64" fill="transparent" />
             {[8, 24, 40, 56].map(y => (
-              <rect key={y} x="16" y={y-2} width="32" height="4" fill="#9ca3af" />
+              <rect key={y} x={svgN(RAIL_LEFT - 3)} y={y-2} width={svgN(RAIL_RIGHT - RAIL_LEFT + 6)} height="4" fill="#9ca3af" />
             ))}
-            <rect x="22" y="0" width="2" height="64" fill={railMetalColor} />
-            <rect x="40" y="0" width="2" height="64" fill={railMetalColor} />
-            <rect x="8" y="31" width="12" height="2" fill="#ffffff" />
-            <rect x="44" y="31" width="12" height="2" fill="#ffffff" />
+            <rect x={svgN(RAIL_LEFT)} y="0" width="2" height="64" fill={railMetalColor} />
+            <rect x={svgN(RAIL_RIGHT)} y="0" width="2" height="64" fill={railMetalColor} />
+            <rect x={svgN(ROAD_INSET_2L - 12)} y={TILE_CENTER - 1} width="12" height="2" fill="#ffffff" />
+            <rect x={svgN(ROAD_OUTER_2L)} y={TILE_CENTER - 1} width="12" height="2" fill="#ffffff" />
             <circle cx="12" cy="12" r="4" fill="#ef4444" />
             <circle cx="52" cy="52" r="4" fill="#ef4444" />
           </>
@@ -872,6 +1003,94 @@ export const Tile: React.FC<TileProps> = ({
             <text x="32" y="26" fill="#e2e8f0" fontSize="8" textAnchor="middle" fontWeight="bold">WAREHOUSE</text>
           </>
         );
+      case 'building-repair-shop': {
+        // 4×6 shop + 4 deep service bays (localY >= 3)
+        const bay = (localY ?? 0) >= 3;
+        const bayNum = (localX ?? 0) + 1;
+        return (
+          <>
+            {bay ? (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#475569" />
+                <rect x="4" y="2" width="56" height="60" fill="#334155" />
+                {/* Bay lane stripes */}
+                <line x1="32" y1="4" x2="32" y2="60" stroke="#fbbf24" strokeWidth="1.5" strokeDasharray="4 4" />
+                <rect x="8" y="6" width="48" height="8" fill="#1e293b" opacity="0.5" />
+                <text x="32" y="36" fill="#fbbf24" fontSize="10" textAnchor="middle" fontWeight="bold">
+                  BAY {bayNum}
+                </text>
+                <text x="32" y="48" fill="#94a3b8" fontSize="5" textAnchor="middle">SERVICE</text>
+              </>
+            ) : (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#e2e8f0" />
+                <rect x="4" y="8" width="56" height="40" fill="#fb923c" stroke="#c2410c" strokeWidth="2" />
+                <rect x="10" y="14" width="18" height="14" fill="#fdba74" />
+                <rect x="36" y="14" width="18" height="14" fill="#fdba74" />
+                <rect x="24" y="34" width="16" height="14" fill="#7c2d12" />
+                {/* Tool / lift hint */}
+                {(localX ?? 0) === 0 && (localY ?? 0) === 0 && (
+                  <text x="32" y="6" fill="#9a3412" fontSize="6" textAnchor="middle" fontWeight="bold">REPAIR</text>
+                )}
+                {(localY ?? 0) === 2 && (
+                  <rect x="0" y="52" width="64" height="12" fill="#334155" />
+                )}
+                <text x="32" y="30" fill="#fff7ed" fontSize="7" textAnchor="middle" fontWeight="bold">
+                  {(localY ?? 0) === 1 ? 'SHOP' : 'GARAGE'}
+                </text>
+              </>
+            )}
+          </>
+        );
+      }
+      case 'building-hospital': {
+        // 4×4 hospital: wards (localY 0–1) + ambulance bays (localY 2–3)
+        const ambBay = (localY ?? 0) >= 2;
+        const bayNum = (localX ?? 0) + 1;
+        return (
+          <>
+            {ambBay ? (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#64748b" />
+                <rect x="3" y="2" width="58" height="60" fill="#475569" />
+                <line x1="32" y1="4" x2="32" y2="60" stroke="#f8fafc" strokeWidth="1.5" strokeDasharray="4 3" />
+                <rect x="10" y="8" width="44" height="10" fill="#1e293b" opacity="0.45" />
+                <text x="32" y="34" fill="#fecaca" fontSize="9" textAnchor="middle" fontWeight="bold">
+                  EMS {bayNum}
+                </text>
+                <text x="32" y="46" fill="#e2e8f0" fontSize="5" textAnchor="middle">AMBULANCE</text>
+                {/* Red cross hint on bay apron */}
+                <rect x="28" y="52" width="8" height="2" fill="#ef4444" />
+                <rect x="31" y="49" width="2" height="8" fill="#ef4444" />
+              </>
+            ) : (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#fce7f3" />
+                <rect x="4" y="6" width="56" height="46" fill="#fff" stroke="#e11d48" strokeWidth="2" />
+                {/* Red cross */}
+                <rect x="26" y="16" width="12" height="28" fill="#ef4444" />
+                <rect x="18" y="24" width="28" height="12" fill="#ef4444" />
+                {/* Windows */}
+                <rect x="8" y="12" width="8" height="8" fill="#bfdbfe" />
+                <rect x="48" y="12" width="8" height="8" fill="#bfdbfe" />
+                <rect x="8" y="40" width="8" height="8" fill="#bfdbfe" />
+                <rect x="48" y="40" width="8" height="8" fill="#bfdbfe" />
+                {(localX ?? 0) === 0 && (localY ?? 0) === 0 && (
+                  <text x="32" y="8" fill="#9f1239" fontSize="6" textAnchor="middle" fontWeight="bold">HOSPITAL</text>
+                )}
+                {(localY ?? 0) === 1 && (
+                  <>
+                    <rect x="0" y="54" width="64" height="10" fill="#e11d48" />
+                    <text x="32" y="61" fill="#fff" fontSize="6" textAnchor="middle" fontWeight="bold">
+                      {(localX ?? 0) === 0 ? 'ER' : (localX ?? 0) === 3 ? 'WARDS' : 'CARE'}
+                    </text>
+                  </>
+                )}
+              </>
+            )}
+          </>
+        );
+      }
       case 'building-factory-large':
         // 3x2 industrial + chimneys + 2 docks
         return (
@@ -934,7 +1153,10 @@ export const Tile: React.FC<TileProps> = ({
         return (
           <>
             <rect x="0" y="0" width="64" height="64" fill="#dcfce7" />
-            <PineTreeGraphic />
+            <g style={isBurning ? { filter: `saturate(${1 - burnProgress * 0.85}) brightness(${1 - burnProgress * 0.45})` } : undefined}>
+              <PineTreeGraphic />
+            </g>
+            {isBurning && <BurningTreeOverlay burnProgress={burnProgress} />}
           </>
         );
       case 'tree-pine-seedling': {
@@ -944,10 +1166,13 @@ export const Tile: React.FC<TileProps> = ({
           return (
             <>
               <rect x="0" y="0" width="64" height="64" fill="#dcfce7" />
-              <ellipse cx="32" cy="50" rx="5" ry="7" fill="#92400e" />
-              <path d="M 32 42 L 26 50 L 38 50 Z" fill="#78350f" />
-              <path d="M 28 48 Q 32 44 36 48" fill="none" stroke="#451a03" strokeWidth="0.8" />
-              <path d="M 27 52 Q 32 48 37 52" fill="none" stroke="#451a03" strokeWidth="0.8" />
+              <g style={isBurning ? { filter: `saturate(${1 - burnProgress * 0.85}) brightness(${1 - burnProgress * 0.45})` } : undefined}>
+                <ellipse cx="32" cy="50" rx="5" ry="7" fill="#92400e" />
+                <path d="M 32 42 L 26 50 L 38 50 Z" fill="#78350f" />
+                <path d="M 28 48 Q 32 44 36 48" fill="none" stroke="#451a03" strokeWidth="0.8" />
+                <path d="M 27 52 Q 32 48 37 52" fill="none" stroke="#451a03" strokeWidth="0.8" />
+              </g>
+              {isBurning && <BurningTreeOverlay burnProgress={burnProgress} />}
             </>
           );
         }
@@ -956,9 +1181,13 @@ export const Tile: React.FC<TileProps> = ({
         return (
           <>
             <rect x="0" y="0" width="64" height="64" fill="#dcfce7" />
-            <g transform={`translate(32 56) scale(${scale}) translate(-32 -56)`}>
+            <g
+              transform={`translate(32 56) scale(${scale}) translate(-32 -56)`}
+              style={isBurning ? { filter: `saturate(${1 - burnProgress * 0.85}) brightness(${1 - burnProgress * 0.45})` } : undefined}
+            >
               <PineTreeGraphic />
             </g>
+            {isBurning && <BurningTreeOverlay burnProgress={burnProgress} />}
           </>
         );
       }
@@ -966,8 +1195,11 @@ export const Tile: React.FC<TileProps> = ({
         return (
           <>
             <rect x="0" y="0" width="64" height="64" fill="#dcfce7" />
-            <circle cx="32" cy="24" r="16" fill="#166534" />
-            <rect x="28" y="40" width="8" height="16" fill="#451a03" />
+            <g style={isBurning ? { filter: `saturate(${1 - burnProgress * 0.85}) brightness(${1 - burnProgress * 0.45})` } : undefined}>
+              <circle cx="32" cy="24" r="16" fill="#166534" />
+              <rect x="28" y="40" width="8" height="16" fill="#451a03" />
+            </g>
+            {isBurning && <BurningTreeOverlay burnProgress={burnProgress} />}
           </>
         );
       case 'landscape-gravel':

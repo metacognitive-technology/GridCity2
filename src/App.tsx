@@ -49,14 +49,99 @@ import {
   ParkingCircle,
   CircleX,
   MapPin,
-  Truck
+  Truck,
+  Timer,
+  Link2,
+  Unlink,
+  Flame,
+  Shield,
+  Cross,
+  Wrench,
+  Siren,
+  Bus,
+  CarTaxiFront,
+  Users,
+  Home,
+  UserPlus,
+  UserMinus,
+  Pencil,
+  Briefcase,
 } from 'lucide-react';
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent, ParkedTrailerVisual } from './components/Vehicle';
-import { TileType, GridData, Point, GridTile, Vehicle, RailcarType, EconomyState, BuildingConfig, ItemDef, Cargo, ItemId, PlantGrowthSettings, ParkedTrailer } from './types';
+import { TrafficOverlay, getAllTrafficControls, trafficControlKey } from './components/TrafficOverlay';
+import { RemoteCursors } from './components/RemoteCursors';
+import { diffGrid, mergeAcceptedIntoBaseline } from './gridSync';
+import {
+  TileType, GridData, Point, GridTile, Vehicle, VehicleType, RailcarType, EconomyState, BuildingConfig,
+  ItemDef, Cargo, ItemId, PlantGrowthSettings, ParkedTrailer, TrafficState, TrafficControl, TrafficLightPhase,
+  RemoteCursor, LayoutSnapshot, ServiceVehicleType, SERVICE_VEHICLE_TYPES, isServiceVehicleType,
+  hasEmergencyLights,
+  RepairRecipe, ActiveRepair, IllnessRecipe, ActivePatient,
+  Person, Family,
+} from './types';
+import {
+  populateHomes,
+  tickPeopleSimulation,
+  personDisplayName,
+  formatAge,
+  locationLabel,
+  getMaxPassengers,
+  boardPerson,
+  alightPerson,
+  canBoardAsDriver,
+  canBoardAsPassenger,
+  getDriverId,
+  getPassengerIds,
+  getPeopleInVehicle,
+  peopleAtHome,
+  peopleResidingAt,
+  familiesAtHome,
+  peopleInBuilding,
+  syncVehicleOccupancy,
+  isAdult,
+  MS_PER_AGE_YEAR,
+  countEmployeesAtBuilding,
+  assignPeopleWorkplace,
+  createPerson,
+  randomFirstName,
+  randomLastName,
+  listHomeKeys,
+} from './people';
+import {
+  DEFAULT_TRAFFIC_STATE,
+  normalizeTraffic,
+  isRoadTile,
+  canPlaceStopSignOnTile,
+  getGroundRoadTile,
+  detectStopSignPlacementClick,
+  getTrafficRoadTile,
+  detectLightSlotClick,
+  createStopSign,
+  findStopSignAt,
+  createStoplight,
+  cycleLightPhase,
+  advanceLightPhase,
+  coordinateLightGroup,
+  getLightGroupSize,
+  unlinkStoplights,
+  shouldStopForSign,
+  findStopSignForVehicle,
+  shouldStopForLight,
+  hasConflictingTraffic,
+  getAvailableLightSlots,
+  getStoplightsAt,
+  edgePortLabel,
+} from './traffic';
+import {
+  canResumeAfterVehicleStop,
+  findMaxSafeProgress,
+} from './vehicleCollision';
 import socket from './socket';
 
 const GRID_SIZE = 64;
+/** Retry delayed grid edits after server rejects due to another user's cell lock. */
+const CELL_LOCK_RETRY_MS = 200;
 const GRID_CANVAS_CELLS = 500;
 const GRID_CANVAS_MIN = -Math.floor(GRID_CANVAS_CELLS / 2);
 const GRID_CANVAS_MAX = GRID_CANVAS_MIN + GRID_CANVAS_CELLS - 1;
@@ -166,6 +251,11 @@ const TILE_CONNECTIONS: Record<string, number[]> = {
   'parking-2x2': [0, 1, 2, 3],
   'parking-2x4': [0, 1, 2, 3],
   'parking-4x4': [0, 1, 2, 3],
+  // Service bays driveable from any adjacent road / bay cell
+  'building-repair-shop': [0, 1, 2, 3],
+  'building-hospital': [0, 1, 2, 3],
+  // Houses are approachable driveway-style parking for assigned cars
+  'building-home': [0, 1, 2, 3],
 };
 
 const FOUR_LANE_INNER = 1;
@@ -243,6 +333,10 @@ export function getMultiTileDimensions(type: string): { w: number; h: number } {
   if (type === 'building-warehouse-large') return { w: 3, h: 2 };
   if (type === 'building-factory-large') return { w: 3, h: 2 };
   if (type === 'building-train-station-large') return { w: 2, h: 2 };
+  // 4 bays wide × 6 deep (shop + long service bays for any vehicle size)
+  if (type === 'building-repair-shop') return { w: 4, h: 6 };
+  // 4×4 hospital: wards + ambulance parking strip
+  if (type === 'building-hospital') return { w: 4, h: 4 };
   return { w: 1, h: 1 };
 }
 
@@ -251,17 +345,165 @@ export function isEconomyBuilding(type: string): boolean {
   return type.startsWith('building-') && (
     type.includes('warehouse') || type.includes('factory') || type === 'building-store' ||
     type === 'building-strip-mall' || type === 'building-lumbermill' || type === 'building-station' ||
-    type === 'building-train-station-large'
+    type === 'building-train-station-large' || type === 'building-repair-shop' ||
+    type === 'building-hospital'
   );
 }
 
-export function getBuildingRole(type: string): 'warehouse' | 'factory' | 'store' | 'lumbermill' | 'none' {
+export function getBuildingRole(type: string): BuildingConfig['role'] {
   if (type === 'building-warehouse' || type === 'building-warehouse-large') return 'warehouse';
   if (type === 'building-factory' || type === 'building-factory-large') return 'factory';
   if (type === 'building-lumbermill') return 'lumbermill';
   if (type === 'building-store' || type === 'building-strip-mall') return 'store';
+  if (type === 'building-repair-shop') return 'repair-shop';
+  if (type === 'building-hospital') return 'hospital';
   return 'none';
 }
+
+/** Service bay rows are the bottom 3 tiles of the 4×6 repair shop (deep enough for semis). */
+export function isRepairShopServiceBay(tile: GridTile | undefined | null): boolean {
+  if (!tile || tile.type !== 'building-repair-shop') return false;
+  return (tile.localY ?? 0) >= 3;
+}
+
+export function getRepairShopBayIndex(tile: GridTile): number {
+  return Math.max(0, Math.min(3, tile.localX ?? 0));
+}
+
+/** Ambulance parking: bottom 2 rows of the 4×4 hospital (4 bays × 2 deep). */
+export function isHospitalAmbulanceBay(tile: GridTile | undefined | null): boolean {
+  if (!tile || tile.type !== 'building-hospital') return false;
+  return (tile.localY ?? 0) >= 2;
+}
+
+export function getHospitalBayIndex(tile: GridTile): number {
+  return Math.max(0, Math.min(3, tile.localX ?? 0));
+}
+
+/** Any building cell that vehicles can park in (repair bays or hospital ambulance bays). */
+export function isBuildingParkingBay(tile: GridTile | undefined | null): boolean {
+  return isRepairShopServiceBay(tile) || isHospitalAmbulanceBay(tile);
+}
+
+export function getBuildingParkingBayIndex(tile: GridTile): number {
+  if (isHospitalAmbulanceBay(tile)) return getHospitalBayIndex(tile);
+  return getRepairShopBayIndex(tile);
+}
+
+export const DEFAULT_REPAIR_RECIPES: RepairRecipe[] = [
+  {
+    id: 'oil-change',
+    name: 'Oil Change',
+    description: 'Drain and refill engine oil, replace filter.',
+    inputs: [{ item: 'motor-oil', amount: 1 }, { item: 'oil-filter', amount: 1 }],
+    cycleTimeSec: 12,
+  },
+  {
+    id: 'tire-swap',
+    name: 'Tire Replacement',
+    description: 'Mount and balance a new tire.',
+    inputs: [{ item: 'tire', amount: 1 }],
+    cycleTimeSec: 18,
+  },
+  {
+    id: 'brake-job',
+    name: 'Brake Job',
+    description: 'Replace pads and resurface rotors.',
+    inputs: [{ item: 'brake-pads', amount: 1 }, { item: 'brake-fluid', amount: 1 }],
+    cycleTimeSec: 24,
+  },
+  {
+    id: 'battery-service',
+    name: 'Battery Service',
+    description: 'Test and replace the vehicle battery.',
+    inputs: [{ item: 'battery', amount: 1 }],
+    cycleTimeSec: 10,
+  },
+  {
+    id: 'engine-repair',
+    name: 'Engine Repair',
+    description: 'Major mechanical repair using engine parts.',
+    inputs: [{ item: 'engine-parts', amount: 2 }, { item: 'motor-oil', amount: 1 }],
+    cycleTimeSec: 45,
+  },
+  {
+    id: 'body-work',
+    name: 'Body Work',
+    description: 'Panel replacement and finish supplies.',
+    inputs: [{ item: 'body-panels', amount: 1 }, { item: 'paint', amount: 1 }],
+    cycleTimeSec: 36,
+  },
+  {
+    id: 'tow-hookup',
+    name: 'Tow Hookup Prep',
+    description: 'Inspect and prep a vehicle for towing.',
+    inputs: [{ item: 'tow-supplies', amount: 1 }],
+    cycleTimeSec: 8,
+    vehicleTypes: ['tow-truck', 'car', 'semi', 'fire-truck', 'police', 'ambulance'],
+  },
+];
+
+export const SERVICE_VEHICLE_META: Record<
+  ServiceVehicleType,
+  { label: string; color: string; emoji: string }
+> = {
+  'fire-truck': { label: 'Fire Truck', color: '#dc2626', emoji: '🚒' },
+  police: { label: 'Police Car', color: '#1e3a8a', emoji: '🚓' },
+  ambulance: { label: 'Ambulance', color: '#f8fafc', emoji: '🚑' },
+  'tow-truck': { label: 'Tow Truck', color: '#ca8a04', emoji: '🚛' },
+  taxi: { label: 'Taxi', color: '#facc15', emoji: '🚕' },
+  bus: { label: 'Bus', color: '#2563eb', emoji: '🚌' },
+};
+
+export const DEFAULT_ILLNESS_RECIPES: IllnessRecipe[] = [
+  {
+    id: 'flu',
+    name: 'Flu / Viral Infection',
+    description: 'Rest, fluids, and antiviral support.',
+    inputs: [{ item: 'medicine', amount: 1 }, { item: 'iv-fluids', amount: 1 }],
+    stayDurationSec: 20,
+    vehicleTypes: ['ambulance'],
+  },
+  {
+    id: 'broken-bone',
+    name: 'Broken Bone',
+    description: 'Set, cast, and pain management.',
+    inputs: [{ item: 'bandages', amount: 2 }, { item: 'painkillers', amount: 1 }],
+    stayDurationSec: 40,
+    vehicleTypes: ['ambulance'],
+  },
+  {
+    id: 'cardiac',
+    name: 'Cardiac Event',
+    description: 'Stabilize heart rhythm and monitor.',
+    inputs: [{ item: 'defibrillator-pads', amount: 1 }, { item: 'epinephrine', amount: 1 }, { item: 'iv-fluids', amount: 1 }],
+    stayDurationSec: 55,
+    vehicleTypes: ['ambulance'],
+  },
+  {
+    id: 'trauma',
+    name: 'Trauma / Accident',
+    description: 'Emergency trauma care and transfusion support.',
+    inputs: [{ item: 'blood-bags', amount: 2 }, { item: 'bandages', amount: 2 }, { item: 'painkillers', amount: 1 }],
+    stayDurationSec: 70,
+    vehicleTypes: ['ambulance'],
+  },
+  {
+    id: 'infection',
+    name: 'Severe Infection',
+    description: 'IV antibiotics and monitoring.',
+    inputs: [{ item: 'antibiotics', amount: 2 }, { item: 'iv-fluids', amount: 1 }],
+    stayDurationSec: 35,
+    vehicleTypes: ['ambulance'],
+  },
+  {
+    id: 'observation',
+    name: 'Observation / Checkup',
+    description: 'Short stay for evaluation.',
+    inputs: [{ item: 'medicine', amount: 1 }],
+    stayDurationSec: 12,
+  },
+];
 
 const ITEM_EMOJI_MAP: Record<string, string> = {
   lumber: '🪵',
@@ -275,6 +517,25 @@ const ITEM_EMOJI_MAP: Record<string, string> = {
   fuel: '⛽',
   plastic: '🧴',
   glass: '🫙',
+  'motor-oil': '🛢️',
+  'oil-filter': '🔧',
+  tire: '🛞',
+  'brake-pads': '🛑',
+  'brake-fluid': '🧴',
+  battery: '🔋',
+  'engine-parts': '⚙️',
+  'body-panels': '🪟',
+  paint: '🎨',
+  'tow-supplies': '🪝',
+  medicine: '💊',
+  bandages: '🩹',
+  painkillers: '💉',
+  'blood-bags': '🩸',
+  'iv-fluids': '💧',
+  antibiotics: '🧴',
+  'defibrillator-pads': '⚡',
+  epinephrine: '🧪',
+  'medical-supplies': '🏥',
   cotton: '🧵',
   wheat: '🌾',
   meat: '🥩',
@@ -303,6 +564,187 @@ function guessItemEmoji(itemId: string): string {
   if (/ore|rock|stone|coal/.test(label)) return '⛏️';
   if (/tool|part|goods/.test(label)) return '🔧';
   return '📦';
+}
+
+/** Human-readable label from an item id (e.g. "motor-oil" → "Motor Oil"). */
+function itemIdToDisplayName(itemId: string): string {
+  return itemId
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ') || itemId;
+}
+
+function makeItemDef(itemId: string, existing?: ItemDef): ItemDef {
+  if (existing?.id) {
+    return {
+      id: existing.id,
+      name: existing.name || itemIdToDisplayName(existing.id),
+      emoji: existing.emoji || guessItemEmoji(existing.id),
+    };
+  }
+  return {
+    id: itemId,
+    name: itemIdToDisplayName(itemId),
+    emoji: guessItemEmoji(itemId),
+  };
+}
+
+/**
+ * Collect item ids required/produced/stored by a building.
+ * Includes inventory stock, consumption rates, recipe I/O, and shop/hospital protocol inputs.
+ * Capacity-only keys are ignored so default capacities cannot re-add a deleted Logistics item.
+ */
+function collectItemIdsFromBuilding(cfg: BuildingConfig | undefined | null): string[] {
+  if (!cfg) return [];
+  const ids = new Set<string>();
+  const add = (id?: string) => {
+    if (id && typeof id === 'string' && id.trim()) ids.add(id.trim());
+  };
+  Object.keys(cfg.inventory || {}).forEach(add);
+  Object.keys(cfg.consumptionRates || {}).forEach(add);
+  (cfg.recipeInputs || []).forEach(r => add(r?.item));
+  (cfg.recipeOutputs || []).forEach(r => add(r?.item));
+  (cfg.repairRecipes || []).forEach(r => (r.inputs || []).forEach(i => add(i?.item)));
+  (cfg.illnessRecipes || []).forEach(r => (r.inputs || []).forEach(i => add(i?.item)));
+  return Array.from(ids);
+}
+
+/** All item ids required/produced/stored by buildings (and optional parked trailer cargo). */
+function collectReferencedItemIds(
+  buildings: Record<string, BuildingConfig> | undefined,
+  parkedTrailers?: Record<string, ParkedTrailer>,
+): Set<string> {
+  const ids = new Set<string>();
+  Object.values(buildings || {}).forEach(cfg => {
+    collectItemIdsFromBuilding(cfg).forEach(id => ids.add(id));
+  });
+  Object.values(parkedTrailers || {}).forEach(t => {
+    Object.keys(t?.cargo || {}).forEach(id => {
+      if (id) ids.add(id);
+    });
+  });
+  return ids;
+}
+
+/**
+ * Ensure Logistics itemDefs includes every item referenced by buildings.
+ * Existing defs keep name/emoji; new ones get a display name + guessed emoji.
+ */
+function mergeItemDefsWithBuildingReferences(
+  itemDefs: ItemDef[] | undefined,
+  buildings: Record<string, BuildingConfig> | undefined,
+  parkedTrailers?: Record<string, ParkedTrailer>,
+): ItemDef[] {
+  const byId = new Map<string, ItemDef>();
+  (itemDefs || []).forEach(d => {
+    if (d?.id) byId.set(d.id, makeItemDef(d.id, d));
+  });
+  collectReferencedItemIds(buildings, parkedTrailers).forEach(id => {
+    if (!byId.has(id)) byId.set(id, makeItemDef(id));
+  });
+  return Array.from(byId.values()).sort((a, b) =>
+    (a.name || a.id).localeCompare(b.name || b.id, undefined, { sensitivity: 'base' }),
+  );
+}
+
+/** Remove an item from a single building wherever it is referenced. */
+function stripItemFromBuilding(cfg: BuildingConfig, itemId: string): BuildingConfig {
+  const inventory = { ...(cfg.inventory || {}) };
+  delete inventory[itemId];
+  const inventoryCapacity = { ...(cfg.inventoryCapacity || {}) };
+  delete inventoryCapacity[itemId];
+  let consumptionRates = cfg.consumptionRates ? { ...cfg.consumptionRates } : undefined;
+  if (consumptionRates) {
+    delete consumptionRates[itemId];
+    if (Object.keys(consumptionRates).length === 0 && cfg.role !== 'store') {
+      consumptionRates = undefined;
+    }
+  }
+  return {
+    ...cfg,
+    inventory,
+    inventoryCapacity: Object.keys(inventoryCapacity).length > 0 ? inventoryCapacity : cfg.inventoryCapacity,
+    consumptionRates,
+    recipeInputs: cfg.recipeInputs
+      ? cfg.recipeInputs.filter(r => r.item !== itemId)
+      : cfg.recipeInputs,
+    recipeOutputs: cfg.recipeOutputs
+      ? cfg.recipeOutputs.filter(r => r.item !== itemId)
+      : cfg.recipeOutputs,
+    repairRecipes: cfg.repairRecipes
+      ? cfg.repairRecipes.map(r => ({
+          ...r,
+          inputs: (r.inputs || []).filter(i => i.item !== itemId),
+        }))
+      : cfg.repairRecipes,
+    illnessRecipes: cfg.illnessRecipes
+      ? cfg.illnessRecipes.map(r => ({
+          ...r,
+          inputs: (r.inputs || []).filter(i => i.item !== itemId),
+        }))
+      : cfg.illnessRecipes,
+  };
+}
+
+/** Delete an item from Logistics and strip it from all buildings / parked trailers. */
+function removeItemFromEconomy(economy: EconomyState, itemId: string): EconomyState {
+  const buildings: Record<string, BuildingConfig> = {};
+  Object.entries(economy.buildings || {}).forEach(([k, b]) => {
+    buildings[k] = stripItemFromBuilding(b, itemId);
+  });
+  const parkedTrailers: Record<string, ParkedTrailer> = { ...(economy.parkedTrailers || {}) };
+  Object.keys(parkedTrailers).forEach(tid => {
+    const t = parkedTrailers[tid];
+    if (!t?.cargo || !(itemId in t.cargo)) return;
+    const cargo = { ...t.cargo };
+    delete cargo[itemId];
+    parkedTrailers[tid] = { ...t, cargo };
+  });
+  return {
+    ...economy,
+    itemDefs: (economy.itemDefs || []).filter(d => d.id !== itemId),
+    buildings,
+    parkedTrailers,
+  };
+}
+
+/** Strip an item from vehicle trailer/railcar cargos (not part of EconomyState). */
+function stripItemFromVehicles(
+  vehicles: Record<string, Vehicle>,
+  itemId: string,
+): Record<string, Vehicle> {
+  const next: Record<string, Vehicle> = {};
+  let changed = false;
+  Object.entries(vehicles || {}).forEach(([vid, v]) => {
+    let nv = v;
+    if (v.trailerCargos?.some(c => c && itemId in c)) {
+      nv = {
+        ...nv,
+        trailerCargos: v.trailerCargos!.map(c => {
+          if (!c || !(itemId in c)) return c;
+          const cargo = { ...c };
+          delete cargo[itemId];
+          return cargo;
+        }),
+      };
+      changed = true;
+    }
+    if (v.railcarCargos?.some(c => c && itemId in c)) {
+      nv = {
+        ...nv,
+        railcarCargos: (nv.railcarCargos || v.railcarCargos)!.map(c => {
+          if (!c || !(itemId in c)) return c;
+          const cargo = { ...c };
+          delete cargo[itemId];
+          return cargo;
+        }),
+      };
+      changed = true;
+    }
+    next[vid] = nv;
+  });
+  return changed ? next : vehicles;
 }
 
 export function getItemEmoji(itemId: string, itemDefs?: ItemDef[]): string {
@@ -335,6 +777,12 @@ function VehicleTypeIcon({ type }: { type?: Vehicle['type'] }) {
   const cls = 'w-3.5 h-3.5 shrink-0 text-slate-500';
   if (type === 'train') return <Train className={cls} aria-hidden />;
   if (type === 'semi') return <CarFront className={cls} aria-hidden />;
+  if (type === 'fire-truck') return <Flame className={`${cls} text-red-500`} aria-hidden />;
+  if (type === 'police') return <Shield className={`${cls} text-blue-700`} aria-hidden />;
+  if (type === 'ambulance') return <Cross className={`${cls} text-red-400`} aria-hidden />;
+  if (type === 'tow-truck') return <Wrench className={`${cls} text-amber-600`} aria-hidden />;
+  if (type === 'taxi') return <CarTaxiFront className={`${cls} text-yellow-500`} aria-hidden />;
+  if (type === 'bus') return <Bus className={`${cls} text-blue-600`} aria-hidden />;
   return <Car className={cls} aria-hidden />;
 }
 
@@ -450,6 +898,8 @@ function getDefaultItemCapacity(role: BuildingConfig['role'], itemId: string): n
     if (itemId === 'lumber') return 100;
     return DEFAULT_INVENTORY_CAPACITY;
   }
+  if (role === 'repair-shop') return 80;
+  if (role === 'hospital') return 100;
   return DEFAULT_INVENTORY_CAPACITY;
 }
 
@@ -459,6 +909,8 @@ function buildDefaultInventoryCapacities(cfg: BuildingConfig): Record<string, nu
   Object.keys(cfg.inventory || {}).forEach(id => seedItems.add(id));
   (cfg.recipeInputs || []).forEach(i => i.item && seedItems.add(i.item));
   (cfg.recipeOutputs || []).forEach(o => o.item && seedItems.add(o.item));
+  (cfg.repairRecipes || []).forEach(r => (r.inputs || []).forEach(i => i.item && seedItems.add(i.item)));
+  (cfg.illnessRecipes || []).forEach(r => (r.inputs || []).forEach(i => i.item && seedItems.add(i.item)));
   Object.keys(cfg.consumptionRates || {}).forEach(id => seedItems.add(id));
   if (cfg.role === 'factory') ['lumber', 'goods'].forEach(id => seedItems.add(id));
   if (cfg.role === 'lumbermill') ['logs', 'lumber'].forEach(id => seedItems.add(id));
@@ -551,6 +1003,8 @@ function BuildingTileBadges({
   economyPaused = false,
   onToggleProduction,
   canControlProduction = false,
+  staffCount = 0,
+  requiredStaff = 0,
 }: {
   cfg: BuildingConfig;
   buildingW: number;
@@ -561,9 +1015,12 @@ function BuildingTileBadges({
   economyPaused?: boolean;
   onToggleProduction?: () => void;
   canControlProduction?: boolean;
+  staffCount?: number;
+  requiredStaff?: number;
 }) {
   const footprintW = buildingW * GRID_SIZE;
   const footprintH = buildingH * GRID_SIZE;
+  const understaffed = requiredStaff > 0 && staffCount < requiredStaff;
 
   if (isProcessBuilding(cfg)) {
     if (!showInventoryLabels) return null;
@@ -589,6 +1046,19 @@ function BuildingTileBadges({
               />
             ))}
           </div>
+        )}
+
+        {requiredStaff > 0 && (
+          <span
+            className={`inline-flex items-center gap-px px-0.5 py-px rounded border text-[8px] font-bold leading-none shadow-sm ${
+              understaffed
+                ? 'bg-rose-100/95 border-rose-300 text-rose-900'
+                : 'bg-emerald-100/95 border-emerald-300 text-emerald-900'
+            }`}
+            title={`${staffCount}/${requiredStaff} employees assigned`}
+          >
+            👷{staffCount}/{requiredStaff}
+          </span>
         )}
 
         {(cycleRemaining !== null || cycleSec || onToggleProduction) && (
@@ -619,8 +1089,12 @@ function BuildingTileBadges({
                 )}
               </button>
             )}
-            {cycleRemaining !== null ? (
+            {cycleRemaining !== null && !understaffed ? (
               <CycleCountdownBadge remaining={cycleRemaining} className="text-[8px] px-0.5 py-px" />
+            ) : understaffed ? (
+              <span className="inline-flex items-center gap-px px-0.5 py-px rounded border text-[8px] font-bold leading-none shadow-sm bg-rose-100/95 border-rose-300 text-rose-900">
+                Need staff
+              </span>
             ) : cycleSec ? (
               <span className="inline-flex items-center gap-px px-0.5 py-px rounded border text-[8px] font-bold leading-none shadow-sm bg-violet-100/95 border-violet-300 text-violet-950">
                 <span className="text-[8px]">🕐</span>
@@ -757,7 +1231,7 @@ export type TrailerRef =
 
 export type RailcarRef = { vehicleId: string; railcarIndex: number };
 
-export type VehiclePanelType = 'car' | 'semi' | 'train';
+export type VehiclePanelType = 'car' | 'semi' | 'train' | 'service';
 
 function railcarCanHoldCargo(railcarType: RailcarType): boolean {
   return railcarType !== 'passenger';
@@ -1023,6 +1497,7 @@ function vehicleMatchesPanelType(v: Vehicle | undefined, panelType: VehiclePanel
   if (!v) return false;
   if (panelType === 'car') return !v.type || v.type === 'car';
   if (panelType === 'semi') return isSemiVehicle(v);
+  if (panelType === 'service') return isServiceVehicleType(v.type);
   return v.type === 'train';
 }
 
@@ -1128,6 +1603,307 @@ interface RouteNode {
   prev?: { x: number; y: number; heading: number; exit: number };
 }
 
+function isHouseTile(tile: GridTile | undefined | null): boolean {
+  return !!tile && tile.type === 'building-home';
+}
+
+/** Badge overlay: people currently at home on a house tile. */
+function HomeOccupancyBadge({
+  atHomeCount,
+  residentCount,
+}: {
+  atHomeCount: number;
+  residentCount: number;
+}) {
+  if (residentCount === 0 && atHomeCount === 0) return null;
+  return (
+    <div
+      className="absolute inset-0 pointer-events-none z-10 flex items-start justify-center pt-1"
+      style={{ width: GRID_SIZE, height: GRID_SIZE }}
+    >
+      <span
+        className={`inline-flex items-center gap-0.5 px-1 py-px rounded-full border text-[9px] font-bold leading-none shadow-sm ${
+          atHomeCount > 0
+            ? 'bg-violet-100/95 border-violet-300 text-violet-950'
+            : 'bg-slate-100/95 border-slate-300 text-slate-600'
+        }`}
+        title={`${atHomeCount} at home · ${residentCount} resident${residentCount === 1 ? '' : 's'}`}
+      >
+        <span className="text-[10px]">🏠</span>
+        <span>{atHomeCount}</span>
+        {residentCount > 0 && residentCount !== atHomeCount && (
+          <span className="text-[8px] font-semibold opacity-70">/{residentCount}</span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function HomeInspectorModal({
+  homeKey,
+  economy,
+  vehicles,
+  onClose,
+  onSelectPerson,
+}: {
+  homeKey: string;
+  economy: EconomyState;
+  vehicles: Record<string, Vehicle>;
+  onClose: () => void;
+  onSelectPerson?: (personId: string) => void;
+}) {
+  const people = economy.people || {};
+  const residents = peopleResidingAt(people, homeKey).sort((a, b) =>
+    personDisplayName(a).localeCompare(personDisplayName(b)),
+  );
+  const atHome = peopleAtHome(people, homeKey);
+  const atHomeIds = new Set(atHome.map(p => p.id));
+  const families = familiesAtHome(economy.families, people, homeKey);
+  const carsAtHome = Object.values(vehicles).filter(
+    v => v.homeKey === homeKey || `${v.x},${v.y}` === homeKey,
+  );
+
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const dragOffsetRef = useRef({ x: 0, y: 0 });
+  const [position, setPosition] = useState<Point | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const centerPanel = useCallback(() => {
+    const overlay = overlayRef.current;
+    const panel = panelRef.current;
+    if (!overlay || !panel) return;
+    const x = Math.max(0, (overlay.clientWidth - panel.offsetWidth) / 2);
+    const y = Math.max(0, (overlay.clientHeight - panel.offsetHeight) / 2);
+    setPosition({ x, y });
+  }, []);
+
+  useLayoutEffect(() => {
+    centerPanel();
+  }, [homeKey, centerPanel]);
+
+  useEffect(() => {
+    if (!isDragging) return;
+    const onMove = (e: MouseEvent) => {
+      e.preventDefault();
+      const overlay = overlayRef.current;
+      const panel = panelRef.current;
+      if (!overlay || !panel) return;
+      const rect = overlay.getBoundingClientRect();
+      const maxX = Math.max(0, overlay.clientWidth - panel.offsetWidth);
+      const maxY = Math.max(0, overlay.clientHeight - panel.offsetHeight);
+      const x = Math.max(0, Math.min(maxX, e.clientX - rect.left - dragOffsetRef.current.x));
+      const y = Math.max(0, Math.min(maxY, e.clientY - rect.top - dragOffsetRef.current.y));
+      setPosition({ x, y });
+    };
+    const onUp = () => setIsDragging(false);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [isDragging]);
+
+  const handleHeaderMouseDown = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!position || !overlayRef.current) return;
+    const rect = overlayRef.current.getBoundingClientRect();
+    dragOffsetRef.current = {
+      x: e.clientX - rect.left - position.x,
+      y: e.clientY - rect.top - position.y,
+    };
+    setIsDragging(true);
+  };
+
+  const activityLabel = (p: Person) => {
+    if (atHomeIds.has(p.id)) return 'At home';
+    return p.activity || locationLabel(p.location);
+  };
+
+  return (
+    <div
+      ref={overlayRef}
+      className="absolute inset-0 z-[120] pointer-events-none"
+      data-grid-control
+      {...blockGridPointerEvents}
+    >
+      <div
+        ref={panelRef}
+        className="absolute pointer-events-auto bg-white rounded-2xl shadow-2xl border border-violet-200 w-[22rem] max-h-[min(80vh,560px)] flex flex-col overflow-hidden"
+        style={
+          position
+            ? { left: position.x, top: position.y }
+            : { left: '50%', top: '20%', transform: 'translateX(-50%)' }
+        }
+        onMouseDown={e => e.stopPropagation()}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="shrink-0 px-4 py-3 bg-violet-50 border-b border-violet-100 flex items-center justify-between cursor-move select-none"
+          onMouseDown={handleHeaderMouseDown}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="p-1.5 bg-violet-100 text-violet-700 rounded-lg">
+              <Home className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="font-bold text-slate-800 text-sm truncate">Home {homeKey}</div>
+              <div className="text-[10px] text-violet-700">
+                {atHome.length} at home · {residents.length} resident{residents.length === 1 ? '' : 's'} ·{' '}
+                {families.length} famil{families.length === 1 ? 'y' : 'ies'}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1.5 hover:bg-violet-100 rounded-lg text-slate-500"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-3 space-y-3 text-xs">
+          {families.length === 0 && residents.length === 0 && (
+            <div className="text-center text-slate-400 py-6">
+              No one lives here yet. Open People → Populate houses, or create a person with this home.
+            </div>
+          )}
+
+          {families.map(fam => {
+            const members = (fam.memberIds || [])
+              .map(id => people[id])
+              .filter(Boolean)
+              .sort((a, b) => b.ageYears - a.ageYears);
+            const homeMembers = members.filter(m => atHomeIds.has(m.id));
+            return (
+              <div key={fam.id} className="rounded-xl border border-violet-100 bg-violet-50/40 overflow-hidden">
+                <div className="px-3 py-2 bg-violet-100/60 border-b border-violet-100 flex items-center justify-between">
+                  <div className="font-semibold text-violet-900">
+                    {fam.lastName} family
+                  </div>
+                  <div className="text-[10px] text-violet-700">
+                    {homeMembers.length}/{members.length} home
+                  </div>
+                </div>
+                <ul className="divide-y divide-violet-50">
+                  {members.length === 0 && (
+                    <li className="px-3 py-2 text-slate-400">No members listed</li>
+                  )}
+                  {members.map(p => {
+                    const healthEmoji =
+                      p.health === 'healthy' ? '💚' : p.health === 'sick' ? '🤒' : '🩹';
+                    const isHome = atHomeIds.has(p.id);
+                    return (
+                      <li key={p.id} className="px-3 py-2 flex gap-2 items-start">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 font-semibold text-slate-800">
+                            <span>{p.sex === 'm' ? '♂' : '♀'}</span>
+                            <span className="truncate">{personDisplayName(p)}</span>
+                            <span className="text-slate-400 font-normal">{formatAge(p.ageYears)}</span>
+                            <span>{healthEmoji}</span>
+                            {isHome && (
+                              <span className="text-[9px] px-1 rounded bg-emerald-100 text-emerald-800 font-bold">
+                                home
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-500 truncate mt-0.5">
+                            {activityLabel(p)}
+                            {p.workplaceKey ? ` · 👷 ${p.workplaceKey}` : ''}
+                            {typeof p.money === 'number' ? ` · $${p.money}` : ''}
+                          </div>
+                          <div className="text-[10px] text-slate-400 truncate">
+                            {locationLabel(p.location)}
+                          </div>
+                        </div>
+                        {onSelectPerson && (
+                          <button
+                            type="button"
+                            className="shrink-0 text-[10px] text-violet-600 hover:underline"
+                            onClick={() => onSelectPerson(p.id)}
+                          >
+                            Select
+                          </button>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            );
+          })}
+
+          {/* Residents not in any listed family */}
+          {(() => {
+            const listed = new Set(families.flatMap(f => f.memberIds || []));
+            const orphan = residents.filter(p => !listed.has(p.id));
+            if (orphan.length === 0) return null;
+            return (
+              <div className="rounded-xl border border-slate-200 bg-slate-50 overflow-hidden">
+                <div className="px-3 py-2 font-semibold text-slate-700 border-b border-slate-100">
+                  Other residents
+                </div>
+                <ul className="divide-y divide-slate-100">
+                  {orphan.map(p => (
+                    <li key={p.id} className="px-3 py-2">
+                      <div className="font-semibold text-slate-800">
+                        {p.sex === 'm' ? '♂' : '♀'} {personDisplayName(p)}{' '}
+                        <span className="text-slate-400 font-normal">{formatAge(p.ageYears)}</span>
+                        {atHomeIds.has(p.id) && (
+                          <span className="ml-1 text-[9px] px-1 rounded bg-emerald-100 text-emerald-800 font-bold">
+                            home
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-slate-500">
+                        {activityLabel(p)} · {locationLabel(p.location)}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })()}
+
+          {carsAtHome.length > 0 && (
+            <div className="rounded-xl border border-slate-200 p-2">
+              <div className="font-semibold text-slate-700 mb-1">Vehicles</div>
+              <ul className="space-y-0.5 text-[10px] text-slate-600">
+                {carsAtHome.map(v => (
+                  <li key={v.id} className="flex items-center gap-1.5">
+                    <span
+                      className="w-2.5 h-2.5 rounded-full shrink-0"
+                      style={{ backgroundColor: v.color }}
+                    />
+                    <span className="font-mono truncate">{v.id.slice(0, 10)}</span>
+                    <span className="text-slate-400">
+                      {v.type || 'car'}
+                      {v.homeKey === homeKey ? ' · owner home' : ' · parked here'}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        <div className="shrink-0 p-2 border-t border-slate-100 bg-slate-50/80">
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full py-1.5 rounded-lg bg-slate-800 text-white text-xs font-bold hover:bg-slate-900"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function isDrivableForVehicle(tile: GridTile, vType: string): boolean {
   const isCrossing = tile.type === 'rail-road-crossing';
   if (vType === 'train') {
@@ -1137,7 +1913,34 @@ function isDrivableForVehicle(tile: GridTile, vType: string): boolean {
     const isBigParking = tile.type === 'parking-2x4' || tile.type === 'parking-4x4';
     return tile.type.startsWith('road') || isBigParking || isCrossing;
   }
-  return tile.type.startsWith('road') || tile.type.startsWith('parking-') || isCrossing;
+  // Cars + service vehicles: roads, lots, service/hospital bays, and houses (driveways)
+  return (
+    tile.type.startsWith('road') ||
+    tile.type.startsWith('parking-') ||
+    isCrossing ||
+    isBuildingParkingBay(tile) ||
+    isHouseTile(tile)
+  );
+}
+
+const HOME_PARK_MS = 10_000;
+const HOME_TOUR_MIN_MS = 45_000;
+const HOME_TOUR_MAX_MS = 150_000;
+const TREE_FIRE_DURATION_MS = 30_000;
+
+function isTreeTileType(type: string | undefined): boolean {
+  return type === 'tree-pine' || type === 'tree-pine-seedling' || type === 'tree-oak';
+}
+
+function randomHomeTourDelayMs(): number {
+  return HOME_TOUR_MIN_MS + Math.floor(Math.random() * (HOME_TOUR_MAX_MS - HOME_TOUR_MIN_MS));
+}
+
+function parseHomeKey(homeKey: string | undefined): Point | null {
+  if (!homeKey) return null;
+  const p = homeKey.split(',').map(Number);
+  if (p.length !== 2 || !Number.isFinite(p[0]) || !Number.isFinite(p[1])) return null;
+  return { x: p[0], y: p[1] };
 }
 
 function resolveDestinationPoint(
@@ -1184,9 +1987,38 @@ function resolveDestinationPoint(
 function getDestinationArrivalPatch(vehicle: Vehicle, tileX: number, tileY: number): Partial<Vehicle> {
   if (!vehicle.destination) return {};
   if (vehicle.destination.x === tileX && vehicle.destination.y === tileY) {
+    const key = `${tileX},${tileY}`;
+    const isHomeArrival = !!vehicle.homeKey && vehicle.homeKey === key;
+    if (isHomeArrival) {
+      const now = Date.now();
+      return {
+        destination: null,
+        isMoving: false,
+        turnIntent: null,
+        progress: 0.5,
+        parkingStopUntil: now + HOME_PARK_MS,
+        lastParkingKey: key,
+        parkingStallIndex: 0,
+        // Schedule next tour → home after this 10s stay + a random drive around town
+        nextHomeReturnAt: now + HOME_PARK_MS + randomHomeTourDelayMs(),
+      };
+    }
     return { destination: null, isMoving: false, turnIntent: null, progress: 0.5 };
   }
   return {};
+}
+
+function clearStopSignSatisfactionIfNeeded(prev: Vehicle, next: Vehicle): Vehicle {
+  const changedTile = next.x !== prev.x || next.y !== prev.y;
+  const turnedAround =
+    !changedTile &&
+    next.progress === 0 &&
+    prev.progress > 0.5 &&
+    next.heading !== prev.heading;
+  if (!next.satisfiedStopSignKey || (!changedTile && !turnedAround)) return next;
+  const cleared = { ...next };
+  delete cleared.satisfiedStopSignKey;
+  return cleared;
 }
 
 export function getRecommendedExit(
@@ -1295,38 +2127,337 @@ export function getRecommendedExit(
   return bestExit;
 }
 
-const rotateGridData = (data: GridData): GridData => {
-  const rotated: GridData = {};
-  const entries = Object.entries(data) as [string, GridTile[]][];
-  if (entries.length === 0) return {};
+const parseCoordKey = (key: string): Point | null => {
+  const parts = key.split(',');
+  if (parts.length !== 2) return null;
+  const x = Number(parts[0]);
+  const y = Number(parts[1]);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+};
+
+const coordKey = (x: number, y: number) => `${x},${y}`;
+
+const cloneBuildingConfig = (cfg: BuildingConfig, anchorKey: string): BuildingConfig => {
+  // Explicit deep copy so inventory/settings never share references with live economy
+  const raw = JSON.parse(JSON.stringify(cfg ?? {})) as BuildingConfig;
+  const inventory: Record<string, number> = {};
+  Object.entries(raw.inventory || {}).forEach(([itemId, qty]) => {
+    const n = Number(qty);
+    // Keep zero-qty keys out, but never drop positive stock (including fractional)
+    if (Number.isFinite(n) && n > 0) inventory[itemId] = n;
+  });
+  const inventoryCapacity: Record<string, number> = {};
+  Object.entries(raw.inventoryCapacity || {}).forEach(([itemId, cap]) => {
+    const n = Number(cap);
+    if (Number.isFinite(n) && n > 0) inventoryCapacity[itemId] = n;
+  });
+  const cloned = normalizeBuildingConfig({
+    ...raw,
+    anchorKey,
+    inventory,
+    inventoryCapacity: Object.keys(inventoryCapacity).length > 0 ? inventoryCapacity : raw.inventoryCapacity,
+    // Explicitly preserve factory/lumbermill run state
+    productionEnabled: raw.productionEnabled,
+    processAccum: typeof raw.processAccum === 'number' ? raw.processAccum : 0,
+    recipeInputs: raw.recipeInputs,
+    recipeOutputs: raw.recipeOutputs,
+    cycleTimeSec: raw.cycleTimeSec,
+    requiredEmployees: raw.requiredEmployees,
+    consumptionRates: raw.consumptionRates,
+    repairRecipes: raw.repairRecipes,
+    activeRepairs: raw.activeRepairs,
+    illnessRecipes: raw.illnessRecipes,
+    activePatients: raw.activePatients,
+    patientsHealed: raw.patientsHealed,
+    name: raw.name,
+    role: raw.role,
+  });
+  return cloned;
+};
+
+const inventoryQtyTotal = (cfg: BuildingConfig | undefined): number =>
+  Object.values(cfg?.inventory || {}).reduce((sum, q) => sum + (Number(q) || 0), 0);
+
+/** Prefer the config that still has stock / richer settings when merging two economy snapshots. */
+const preferBuildingConfig = (a?: BuildingConfig, b?: BuildingConfig, anchorKey?: string): BuildingConfig | undefined => {
+  if (!a && !b) return undefined;
+  if (!a) return b ? cloneBuildingConfig(b, anchorKey || b.anchorKey) : undefined;
+  if (!b) return cloneBuildingConfig(a, anchorKey || a.anchorKey);
+  // Prefer the side with more total stock as the base, then take max qty per item
+  const rich = inventoryQtyTotal(b) > inventoryQtyTotal(a) ? b : a;
+  const other = rich === a ? b : a;
+  const mergedInv: Record<string, number> = { ...(other.inventory || {}) };
+  Object.entries(rich.inventory || {}).forEach(([id, qty]) => {
+    mergedInv[id] = Math.max(mergedInv[id] || 0, Number(qty) || 0);
+  });
+  return cloneBuildingConfig({
+    ...other,
+    ...rich,
+    inventory: mergedInv,
+    inventoryCapacity: { ...(other.inventoryCapacity || {}), ...(rich.inventoryCapacity || {}) },
+    name: rich.name || other.name,
+  }, anchorKey || rich.anchorKey);
+};
+
+/** Normalize legacy GridData layouts and new LayoutSnapshot payloads. */
+const normalizeLayoutSnapshot = (data: unknown): LayoutSnapshot => {
+  if (!data || typeof data !== 'object') {
+    return { version: 2, grid: {}, buildings: {}, itemDefs: [] };
+  }
+  const obj = data as Record<string, unknown>;
+
+  // New format: explicit { grid, buildings } (version optional). Prefer this whenever `grid` is present.
+  const looksLikeSnapshot =
+    obj.grid &&
+    typeof obj.grid === 'object' &&
+    !Array.isArray(obj.grid) &&
+    (obj.version === 2 || obj.buildings !== undefined || obj.itemDefs !== undefined ||
+      !Object.keys(obj).some(k => parseCoordKey(k) !== null));
+
+  if (looksLikeSnapshot) {
+    const buildingsRaw =
+      obj.buildings && typeof obj.buildings === 'object' && !Array.isArray(obj.buildings)
+        ? (obj.buildings as Record<string, BuildingConfig>)
+        : {};
+    const buildings: Record<string, BuildingConfig> = {};
+    Object.entries(buildingsRaw).forEach(([k, cfg]) => {
+      if (parseCoordKey(k) && cfg && typeof cfg === 'object') {
+        buildings[k] = cloneBuildingConfig(cfg, k);
+      }
+    });
+    const itemDefs = Array.isArray(obj.itemDefs) ? (obj.itemDefs as ItemDef[]) : [];
+    return {
+      version: 2,
+      grid: obj.grid as GridData,
+      buildings,
+      itemDefs,
+    };
+  }
+
+  // Legacy format: bare GridData
+  return { version: 2, grid: obj as GridData, buildings: {}, itemDefs: [] };
+};
+
+/** Remap tile.anchorKey by translating coordinates (and drop invalid keys). */
+const remapTileAnchorKeys = (
+  tiles: GridTile[],
+  mapKey: (key: string) => string | null,
+): GridTile[] =>
+  tiles.map(tile => {
+    if (!tile.anchorKey) return { ...tile };
+    const next = mapKey(tile.anchorKey);
+    return next ? { ...tile, anchorKey: next } : { ...tile };
+  });
+
+const inBounds = (
+  x: number,
+  y: number,
+  bounds?: { x1: number; y1: number; x2: number; y2: number } | null,
+) => {
+  if (!bounds) return true;
+  return x >= bounds.x1 && x <= bounds.x2 && y >= bounds.y1 && y <= bounds.y2;
+};
+
+/**
+ * Capture tiles (and economy building state) for a selection or whole grid.
+ * When bounds are provided, keys are normalized to origin (0,0).
+ */
+const captureLayoutSnapshot = (
+  grid: GridData,
+  economy: EconomyState,
+  bounds?: { x1: number; y1: number; x2: number; y2: number } | null,
+): LayoutSnapshot => {
+  const outGrid: GridData = {};
+  const buildings: Record<string, BuildingConfig> = {};
+  const originX = bounds ? bounds.x1 : 0;
+  const originY = bounds ? bounds.y1 : 0;
+
+  const mapAbsoluteToRelative = (key: string): string | null => {
+    const p = parseCoordKey(key);
+    if (!p) return null;
+    return coordKey(p.x - originX, p.y - originY);
+  };
+
+  const storeBuilding = (absAnchor: string, typeHint?: string) => {
+    const ap = parseCoordKey(absAnchor);
+    if (!ap || !inBounds(ap.x, ap.y, bounds)) return;
+    const relAnchor = mapAbsoluteToRelative(absAnchor);
+    if (!relAnchor) return;
+
+    // Prefer live economy config at the absolute anchor (full inventory + run state)
+    const existing =
+      economy.buildings[absAnchor] ||
+      economy.buildings[relAnchor];
+
+    if (existing) {
+      // Economy entry always wins over any default created earlier for this cell
+      buildings[relAnchor] = cloneBuildingConfig(existing, relAnchor);
+      return;
+    }
+
+    if (!typeHint) return;
+    // No economy entry yet — seed a default only if we haven't stored one
+    if (!buildings[relAnchor]) {
+      buildings[relAnchor] = createBuildingConfig(relAnchor, typeHint);
+    }
+  };
+
+  const considerCell = (x: number, y: number) => {
+    const key = coordKey(x, y);
+    const tiles = grid[key];
+    if (!tiles?.length) return;
+    const relKey = coordKey(x - originX, y - originY);
+    outGrid[relKey] = remapTileAnchorKeys(tiles, mapAbsoluteToRelative);
+
+    for (const t of tiles) {
+      if (!isEconomyBuilding(t.type)) continue;
+      // Only capture from anchor cells so multi-tile buildings are stored once
+      if (t.part === 'member') continue;
+      // Prefer live cell key; also try tile.anchorKey for older mis-keyed placements
+      storeBuilding(key, t.type);
+      if (t.anchorKey && t.anchorKey !== key) {
+        storeBuilding(t.anchorKey, t.type);
+      }
+    }
+  };
+
+  if (bounds) {
+    for (let x = bounds.x1; x <= bounds.x2; x++) {
+      for (let y = bounds.y1; y <= bounds.y2; y++) {
+        considerCell(x, y);
+      }
+    }
+  } else {
+    Object.keys(grid).forEach(key => {
+      const p = parseCoordKey(key);
+      if (p) considerCell(p.x, p.y);
+    });
+  }
+
+  // Always pull economy buildings whose absolute anchors fall in the selection —
+  // this is the authoritative source for inventory + productionEnabled + processAccum.
+  Object.entries(economy.buildings || {}).forEach(([absKey, cfg]) => {
+    const p = parseCoordKey(absKey);
+    if (!p || !inBounds(p.x, p.y, bounds)) return;
+    const rel = mapAbsoluteToRelative(absKey);
+    if (!rel) return;
+    // Require the anchor cell to exist on the grid (or whole-grid save)
+    if (bounds && !outGrid[rel] && !grid[absKey]?.length) return;
+    buildings[rel] = cloneBuildingConfig(cfg, rel);
+  });
+
+  return {
+    version: 2,
+    grid: outGrid,
+    buildings,
+    itemDefs: Array.isArray(economy.itemDefs) ? JSON.parse(JSON.stringify(economy.itemDefs)) : [],
+  };
+};
+
+/** Place layout tiles at (baseX, baseY) offset; returns only in-canvas cells. */
+const materializeLayoutGrid = (
+  layout: LayoutSnapshot,
+  baseX: number,
+  baseY: number,
+): GridData => {
+  const result: GridData = {};
+  const mapKey = (key: string): string | null => {
+    const p = parseCoordKey(key);
+    if (!p) return null;
+    return coordKey(p.x + baseX, p.y + baseY);
+  };
+
+  (Object.entries(layout.grid) as [string, GridTile[]][]).forEach(([relKey, tiles]) => {
+    const p = parseCoordKey(relKey);
+    if (!p) return;
+    const tx = p.x + baseX;
+    const ty = p.y + baseY;
+    if (!isWithinGridCanvas(tx, ty)) return;
+    if (!tiles?.length) return;
+    result[coordKey(tx, ty)] = remapTileAnchorKeys(tiles, mapKey);
+  });
+  return result;
+};
+
+/** Restart/apply saved building configs at the given offset into economy.buildings. */
+const materializeLayoutBuildings = (
+  layout: LayoutSnapshot,
+  baseX: number,
+  baseY: number,
+): Record<string, BuildingConfig> => {
+  const result: Record<string, BuildingConfig> = {};
+  Object.entries(layout.buildings || {}).forEach(([relKey, cfg]) => {
+    const p = parseCoordKey(relKey);
+    if (!p) return;
+    const ax = p.x + baseX;
+    const ay = p.y + baseY;
+    if (!isWithinGridCanvas(ax, ay)) return;
+    const absKey = coordKey(ax, ay);
+    // Full deep clone of settings, inventory, recipes, and process/run state
+    const cloned = cloneBuildingConfig(cfg, absKey);
+    if (!cloned.inventory) cloned.inventory = {};
+    // Factories/lumbermills that were running stay running after paste
+    if (
+      (cloned.role === 'factory' || cloned.role === 'lumbermill') &&
+      cfg.productionEnabled !== undefined
+    ) {
+      cloned.productionEnabled = !!cfg.productionEnabled;
+    }
+    if (typeof cfg.processAccum === 'number') {
+      cloned.processAccum = cfg.processAccum;
+    }
+    result[absKey] = cloned;
+  });
+  return result;
+};
+
+const rotateLayoutSnapshot = (layout: LayoutSnapshot): LayoutSnapshot => {
+  const entries = Object.entries(layout.grid) as [string, GridTile[]][];
+  if (entries.length === 0) {
+    return { grid: {}, buildings: {} };
+  }
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   entries.forEach(([key]) => {
-    const [x, y] = key.split(',').map(Number);
-    minX = Math.min(minX, x);
-    minY = Math.min(minY, y);
-    maxX = Math.max(maxX, x);
-    maxY = Math.max(maxY, y);
+    const p = parseCoordKey(key);
+    if (!p) return;
+    minX = Math.min(minX, p.x);
+    minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x);
+    maxY = Math.max(maxY, p.y);
   });
 
-  const width = maxX - minX;
   const height = maxY - minY;
 
-  entries.forEach(([key, tiles]) => {
-    const [x, y] = key.split(',').map(Number);
-    const relX = x - minX;
-    const relY = y - minY;
-    
+  const mapRotatedKey = (key: string): string | null => {
+    const p = parseCoordKey(key);
+    if (!p) return null;
+    const relX = p.x - minX;
+    const relY = p.y - minY;
     const newRelX = height - relY;
     const newRelY = relX;
-    
-    rotated[`${newRelX},${newRelY}`] = tiles.map(tile => ({
+    return coordKey(newRelX, newRelY);
+  };
+
+  const rotatedGrid: GridData = {};
+  entries.forEach(([key, tiles]) => {
+    const newKey = mapRotatedKey(key);
+    if (!newKey) return;
+    rotatedGrid[newKey] = remapTileAnchorKeys(tiles, mapRotatedKey).map(tile => ({
       ...tile,
-      rotation: (tile.rotation + 90) % 360
+      rotation: (tile.rotation + 90) % 360,
     }));
   });
 
-  return rotated;
+  const rotatedBuildings: Record<string, BuildingConfig> = {};
+  Object.entries(layout.buildings || {}).forEach(([key, cfg]) => {
+    const newKey = mapRotatedKey(key);
+    if (!newKey) return;
+    rotatedBuildings[newKey] = cloneBuildingConfig(cfg, newKey);
+  });
+
+  return { grid: rotatedGrid, buildings: rotatedBuildings };
 };
 
 const DEFAULT_PLANT_GROWTH: PlantGrowthSettings = {
@@ -1442,6 +2573,8 @@ const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' 
   { type: 'building-warehouse-large', label: 'Warehouse Large + Docks (3x2)', category: 'building' },
   { type: 'building-factory-large', label: 'Factory Large + Docks (3x2)', category: 'building' },
   { type: 'building-train-station-large', label: 'Train Station Large (2x2)', category: 'building' },
+  { type: 'building-repair-shop', label: 'Vehicle Repair Shop (4×6, 4 bays)', category: 'building' },
+  { type: 'building-hospital', label: 'Hospital (4×4, ambulance bays)', category: 'building' },
 ];
 
 function getDefaultBuildingName(type: string): string {
@@ -1462,6 +2595,33 @@ function isRecipeBuilding(cfg: BuildingConfig): boolean {
   );
 }
 
+/** Default staff needed for recipe buildings (factories / lumbermills). */
+function getDefaultRequiredEmployees(role: BuildingConfig['role'], typeHint?: string): number {
+  if (role === 'lumbermill') return 2;
+  if (role === 'factory') {
+    if (typeHint === 'building-factory-large') return 6;
+    return 3;
+  }
+  return 0;
+}
+
+function getRequiredEmployees(cfg: BuildingConfig): number {
+  if (typeof cfg.requiredEmployees === 'number' && Number.isFinite(cfg.requiredEmployees)) {
+    return Math.max(0, Math.floor(cfg.requiredEmployees));
+  }
+  return getDefaultRequiredEmployees(cfg.role);
+}
+
+function isStaffedForProduction(
+  cfg: BuildingConfig,
+  buildingKey: string,
+  people?: Record<string, Person>,
+): boolean {
+  const need = getRequiredEmployees(cfg);
+  if (need <= 0) return true;
+  return countEmployeesAtBuilding(people, buildingKey) >= need;
+}
+
 function hasRecipeInputs(cfg: BuildingConfig): boolean {
   return (cfg.recipeInputs || []).every(
     inp => (cfg.inventory[inp.item] || 0) >= (inp.amount || 1)
@@ -1471,12 +2631,15 @@ function hasRecipeInputs(cfg: BuildingConfig): boolean {
 function getRecipeCycleRemaining(
   cfg: BuildingConfig,
   economyPaused: boolean,
-  elapsedSinceSyncSec = 0
+  elapsedSinceSyncSec = 0,
+  staffed = true,
 ): number | null {
   if (!isRecipeBuilding(cfg)) return null;
   const cycle = cfg.cycleTimeSec!;
   let accum = cfg.processAccum || 0;
-  if (!economyPaused && hasRecipeInputs(cfg) && hasOutputCapacity(cfg)) accum += elapsedSinceSyncSec;
+  if (!economyPaused && staffed && hasRecipeInputs(cfg) && hasOutputCapacity(cfg)) {
+    accum += elapsedSinceSyncSec;
+  }
   const mod = accum % cycle;
   const remaining = mod === 0 ? cycle : cycle - mod;
   return Math.max(0, Math.min(cycle, remaining));
@@ -1575,8 +2738,10 @@ function VehicleMotionControls({
   onPark,
   onUnpark,
   onTogglePlacing,
+  onToggleEmergencyLights,
   showParkControls = true,
   showTurnControls = true,
+  showLightsToggle = false,
 }: {
   panelType: VehiclePanelType;
   filteredSelection: Set<string>;
@@ -1591,8 +2756,10 @@ function VehicleMotionControls({
   onPark: () => void;
   onUnpark: () => void;
   onTogglePlacing: () => void;
+  onToggleEmergencyLights?: () => void;
   showParkControls?: boolean;
   showTurnControls?: boolean;
+  showLightsToggle?: boolean;
 }) {
   const selectedList = Array.from(filteredSelection);
   const activeCountIsMoving = selectedList.filter(id => vehicles[id]?.isMoving).length;
@@ -1605,6 +2772,11 @@ function VehicleMotionControls({
   const isDestinationToggleActive = !!pendingRouteVehicleId || selectedHaveDestination;
   const isParkNextActive = selectedList.some(id => vehicles[id]?.parkOnNextLot);
   const firstSpeed = selectedList.length > 0 ? (vehicles[selectedList[0]]?.speed || 1) : 1;
+  // Lights default ON when undefined (emergency vehicles only)
+  const lightsCapableIds = selectedList.filter(id => hasEmergencyLights(vehicles[id]?.type));
+  const lightsOnCount = lightsCapableIds.filter(id => vehicles[id]?.emergencyLightsOn !== false).length;
+  const serviceSelectedCount = lightsCapableIds.length;
+  const isLightsActive = serviceSelectedCount > 0 && lightsOnCount >= serviceSelectedCount / 2;
 
   return (
     <div className="flex flex-col gap-3">
@@ -1626,6 +2798,48 @@ function VehicleMotionControls({
       </div>
 
       <div className="bg-white p-2 rounded-xl border border-slate-200 shadow-sm space-y-2">
+        {showLightsToggle && onToggleEmergencyLights && (
+          <div
+            className={`flex items-center justify-between gap-3 px-2 py-1.5 rounded-lg border ${
+              filteredSelection.size === 0 || serviceSelectedCount === 0
+                ? 'opacity-40 border-slate-100 bg-slate-50'
+                : isLightsActive
+                  ? 'border-amber-300 bg-amber-50'
+                  : 'border-slate-200 bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <Siren className={`w-4 h-4 shrink-0 ${isLightsActive ? 'text-amber-600' : 'text-slate-400'}`} />
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-slate-700">Emergency lights</div>
+                <div className="text-[10px] text-slate-500 truncate">
+                  {serviceSelectedCount === 0
+                    ? 'Select a service vehicle'
+                    : isLightsActive
+                      ? 'Flashing on'
+                      : 'Lights off'}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={isLightsActive}
+              title={isLightsActive ? 'Turn lights off' : 'Turn lights on'}
+              disabled={filteredSelection.size === 0 || serviceSelectedCount === 0 || !roomCode}
+              onClick={onToggleEmergencyLights}
+              className={`relative w-11 h-6 rounded-full transition-colors shrink-0 disabled:opacity-40 ${
+                isLightsActive ? 'bg-amber-500' : 'bg-slate-300'
+              }`}
+            >
+              <span
+                className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                  isLightsActive ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </div>
+        )}
         <div className={`flex items-center gap-1 ${filteredSelection.size === 0 ? 'opacity-40' : ''}`}>
           <button
             type="button"
@@ -1737,6 +2951,311 @@ function VehicleMotionControls({
     </div>
   );
 }
+
+type TrafficTool = 'stop-sign' | 'stoplight' | null;
+
+function TrafficPanel({
+  traffic,
+  selectedIds,
+  trafficTool,
+  roomCode,
+  onSelectIds,
+  onSetTool,
+  onUpdateTraffic,
+  onDeleteByKind,
+  onLinkSelected,
+  onUnlinkSelected,
+  onToggleManual,
+}: {
+  traffic: TrafficState;
+  selectedIds: Set<string>;
+  trafficTool: TrafficTool;
+  roomCode: string | null;
+  onSelectIds: (ids: Set<string>) => void;
+  onSetTool: (tool: TrafficTool) => void;
+  onUpdateTraffic: (next: TrafficState) => void;
+  onDeleteByKind: (kind: 'stop-sign' | 'stoplight') => void;
+  onLinkSelected: () => void;
+  onUnlinkSelected: () => void;
+  onToggleManual: (manual: boolean) => void;
+}) {
+  const signs = getAllTrafficControls(traffic)
+    .filter(c => c.kind === 'stop-sign')
+    .sort((a, b) => (a.kind === 'stop-sign' && b.kind === 'stop-sign' ? a.id - b.id : 0));
+  const lights = getAllTrafficControls(traffic).filter(c => c.kind === 'stoplight');
+  const selectedLights = lights.filter(l => selectedIds.has(trafficControlKey(l)));
+  const selectedSigns = signs.filter(s => selectedIds.has(trafficControlKey(s)));
+  const firstSelected = selectedLights[0];
+  const canLink = selectedLights.length >= 2;
+  const canUnlink = selectedLights.some(l => l.groupId);
+
+  const patchSelectedLights = (patch: Partial<Extract<TrafficControl, { kind: 'stoplight' }>>) => {
+    const nextControls = { ...traffic.controls };
+    selectedIds.forEach(id => {
+      const c = nextControls[id];
+      if (c?.kind === 'stoplight') {
+        nextControls[id] = { ...c, ...patch };
+      }
+    });
+    onUpdateTraffic({ ...traffic, controls: nextControls });
+  };
+
+  const toggleLightPhase = (light: Extract<TrafficControl, { kind: 'stoplight' }>) => {
+    if (!roomCode) return;
+    const ctrlKey = trafficControlKey(light);
+    onUpdateTraffic({
+      ...traffic,
+      controls: {
+        ...traffic.controls,
+        [ctrlKey]: {
+          ...light,
+          phase: cycleLightPhase(light.phase),
+          phaseStartedAt: Date.now(),
+        },
+      },
+    });
+  };
+
+  const phaseFields = [
+    { key: 'redMs' as const, label: 'Red' },
+    { key: 'yellowMs' as const, label: 'Yellow' },
+    { key: 'greenMs' as const, label: 'Green' },
+  ];
+
+  return (
+    <div className="flex flex-col gap-4 h-full">
+      <div className="bg-slate-50 rounded-xl p-3 border border-slate-100 space-y-3 shrink-0">
+        <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">Placement Tools</div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            disabled={!roomCode}
+            onClick={() => onSetTool(trafficTool === 'stop-sign' ? null : 'stop-sign')}
+            className={`flex-1 flex flex-col items-center gap-1 py-2 px-2 rounded-lg border text-xs font-medium transition-colors ${
+              trafficTool === 'stop-sign' ? 'bg-red-600 text-white border-red-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+            }`}
+          >
+            <span className="text-lg">🛑</span>
+            Stop Sign
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode}
+            onClick={() => onSetTool(trafficTool === 'stoplight' ? null : 'stoplight')}
+            className={`flex-1 flex flex-col items-center gap-1 py-2 px-2 rounded-lg border text-xs font-medium transition-colors ${
+              trafficTool === 'stoplight' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+            }`}
+          >
+            <span className="text-lg">🚦</span>
+            Stoplight
+          </button>
+        </div>
+        <p className="text-[10px] text-slate-400 leading-snug">
+          Stop signs: click the road end corner or edge on straight roads. Stoplights: click lane end position. Click again to remove. Hover a tile to see IDs.
+        </p>
+        {(selectedSigns.length + selectedLights.length) === 1 && (
+          <p className="text-[10px] text-red-500 font-medium leading-snug">
+            One item selected — click a road edge or lane on the grid to move it.
+          </p>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl p-3 border border-slate-200 space-y-3 shrink-0">
+        <label className="text-xs font-medium text-slate-600 flex items-center justify-between gap-2">
+          Stop sign min wait
+          <span className="font-bold text-slate-800">{traffic.stopSignMinDurationSec}s</span>
+        </label>
+        <input
+          type="range"
+          min={1}
+          max={15}
+          step={0.5}
+          disabled={!roomCode}
+          value={traffic.stopSignMinDurationSec}
+          onChange={e => onUpdateTraffic({ ...traffic, stopSignMinDurationSec: parseFloat(e.target.value) })}
+          className="w-full"
+        />
+      </div>
+
+      <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-hidden">
+        <div className="flex flex-col min-h-0 shrink-0" style={{ maxHeight: '38%' }}>
+          <div className="flex items-center justify-between px-1 mb-1">
+            <span className="text-sm font-medium text-slate-700">Stop Signs ({signs.length})</span>
+            <button
+              type="button"
+              disabled={selectedSigns.length === 0 || !roomCode}
+              onClick={() => onDeleteByKind('stop-sign')}
+              className="text-red-500 hover:text-red-600 disabled:opacity-30 p-1"
+              title="Delete selected stop signs"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto border border-slate-100 rounded-xl bg-white">
+            {signs.length === 0 ? (
+              <div className="p-3 text-xs text-slate-400 text-center">No stop signs placed</div>
+            ) : (
+              signs.map(sign => {
+                if (sign.kind !== 'stop-sign') return null;
+                const key = trafficControlKey(sign);
+                return (
+                  <label key={key} className="flex items-center gap-3 p-2.5 hover:bg-slate-50 border-b border-slate-50 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(key)}
+                      disabled={!roomCode}
+                      onChange={e => {
+                        const next = new Set(selectedIds);
+                        if (e.target.checked) next.add(key);
+                        else next.delete(key);
+                        onSelectIds(next);
+                      }}
+                      className="rounded border-slate-300 text-red-600"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-bold text-slate-700">Sign #{sign.id}</div>
+                      <div className="text-[10px] text-slate-400 font-mono truncate">{sign.gridKey} · Stop {edgePortLabel(sign.edgePort)}</div>
+                    </div>
+                    <svg viewBox="0 0 20 20" className="w-4 h-4 shrink-0">
+                      <polygon points={OCTAGON_POINTS_PANEL} fill="#dc2626" />
+                    </svg>
+                  </label>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-col min-h-0 flex-1">
+          <div className="flex items-center justify-between px-1 mb-1">
+            <span className="text-sm font-medium text-slate-700">Stoplights ({lights.length})</span>
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                disabled={!canLink || !roomCode}
+                onClick={onLinkSelected}
+                className="text-blue-600 hover:text-blue-700 disabled:opacity-30 p-1"
+                title="Link & coordinate phases"
+              >
+                <Link2 className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                disabled={!canUnlink || !roomCode}
+                onClick={onUnlinkSelected}
+                className="text-slate-500 hover:text-slate-700 disabled:opacity-30 p-1"
+                title="Unlink selected stoplights"
+              >
+                <Unlink className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                disabled={selectedLights.length === 0 || !roomCode}
+                onClick={() => onDeleteByKind('stoplight')}
+                className="text-red-500 hover:text-red-600 disabled:opacity-30 p-1"
+                title="Delete selected stoplights"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto border border-slate-100 rounded-xl bg-white">
+            {lights.length === 0 ? (
+              <div className="p-3 text-xs text-slate-400 text-center">No stoplights placed</div>
+            ) : (
+              lights.map(light => {
+                if (light.kind !== 'stoplight') return null;
+                const key = trafficControlKey(light);
+                return (
+                  <label key={key} className="flex items-center gap-3 p-2.5 hover:bg-slate-50 border-b border-slate-50 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(key)}
+                      disabled={!roomCode}
+                      onChange={e => {
+                        const next = new Set(selectedIds);
+                        if (e.target.checked) next.add(key);
+                        else next.delete(key);
+                        onSelectIds(next);
+                      }}
+                      className="rounded border-slate-300 text-emerald-600"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-bold text-slate-700">Light #{light.id}</span>
+                        {light.groupId && (
+                          <span
+                            className="inline-flex items-center gap-0.5 text-[10px] font-medium text-blue-600 bg-blue-50 px-1 py-0.5 rounded"
+                            title={`Linked group (${getLightGroupSize(traffic, light.groupId)} lights)`}
+                          >
+                            <Link2 className="w-2.5 h-2.5" />
+                            ×{getLightGroupSize(traffic, light.groupId)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-slate-400 font-mono truncate">{light.gridKey} · h{light.heading} · lane {light.lane}</div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={!roomCode}
+                      onClick={e => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        toggleLightPhase(light);
+                      }}
+                      className="w-3 h-3 rounded-full shrink-0 border border-white/60 disabled:opacity-30 hover:scale-125 transition-transform cursor-pointer"
+                      style={{ backgroundColor: light.phase === 'red' ? '#ef4444' : light.phase === 'yellow' ? '#eab308' : '#22c55e' }}
+                      title={`${light.phase} — click to toggle`}
+                    />
+                  </label>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+
+      {selectedLights.length > 0 && (
+        <div className="bg-slate-50 rounded-xl p-3 border border-slate-100 space-y-3 shrink-0">
+          <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+            Edit {selectedLights.length} light{selectedLights.length > 1 ? 's' : ''}
+          </div>
+          <label className="flex items-center gap-2 text-xs text-slate-600">
+            <input
+              type="checkbox"
+              checked={firstSelected?.manualOnly ?? false}
+              disabled={!roomCode}
+              onChange={e => onToggleManual(e.target.checked)}
+            />
+            Manual toggle only
+          </label>
+          {!firstSelected?.manualOnly && (
+            <div className="space-y-2">
+              {phaseFields.map(({ key, label }) => (
+                <label key={key} className="flex items-center gap-2 text-xs text-slate-600">
+                  <span className="w-12">{label}</span>
+                  <input
+                    type="number"
+                    min={0.5}
+                    max={120}
+                    step={0.5}
+                    disabled={!roomCode}
+                    value={(firstSelected?.[key] ?? 5000) / 1000}
+                    onChange={e => patchSelectedLights({ [key]: Math.round((parseFloat(e.target.value) || 5) * 1000) })}
+                    className="flex-1 px-2 py-1 border border-slate-200 rounded text-xs"
+                  />
+                  <span className="text-slate-400 w-6">sec</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const OCTAGON_POINTS_PANEL = '6.5,1.5 13.5,1.5 18.5,6.5 18.5,13.5 13.5,18.5 6.5,18.5 1.5,13.5 1.5,6.5';
 
 function TrailerInspectorModal({
   trailerRef,
@@ -2304,19 +3823,140 @@ function RailcarInspectorModal({
 
 function createBuildingConfig(anchorKey: string, type: string): BuildingConfig {
   const role = getBuildingRole(type);
+  const repairInventory =
+    role === 'repair-shop'
+      ? {
+          'motor-oil': 20,
+          'oil-filter': 15,
+          tire: 12,
+          'brake-pads': 10,
+          'brake-fluid': 10,
+          battery: 8,
+          'engine-parts': 6,
+          'body-panels': 4,
+          paint: 8,
+          'tow-supplies': 10,
+        }
+      : {};
+  const hospitalInventory =
+    role === 'hospital'
+      ? {
+          medicine: 30,
+          bandages: 40,
+          painkillers: 25,
+          'blood-bags': 15,
+          'iv-fluids': 30,
+          antibiotics: 20,
+          'defibrillator-pads': 10,
+          epinephrine: 12,
+          'medical-supplies': 20,
+        }
+      : {};
+  const isRecipeRole = role === 'factory' || role === 'lumbermill';
   const base: BuildingConfig = {
     anchorKey,
     name: getDefaultBuildingName(type),
     role,
-    inventory: {},
-    productionEnabled: role === 'factory' || role === 'lumbermill',
+    inventory: { ...repairInventory, ...hospitalInventory },
+    productionEnabled: isRecipeRole,
     cycleTimeSec: role === 'factory' ? 18 : role === 'lumbermill' ? 12 : undefined,
     recipeInputs: role === 'factory' ? [{ item: 'lumber', amount: 2 }] : role === 'lumbermill' ? [{ item: 'logs', amount: 1 }] : undefined,
     recipeOutputs: role === 'factory' ? [{ item: 'goods', amount: 1 }] : role === 'lumbermill' ? [{ item: 'lumber', amount: 3 }] : undefined,
+    requiredEmployees: isRecipeRole ? getDefaultRequiredEmployees(role, type) : undefined,
     consumptionRates: role === 'store' ? { goods: 0.4 } : undefined,
     processAccum: 0,
+    repairRecipes: role === 'repair-shop' ? DEFAULT_REPAIR_RECIPES.map(r => ({ ...r, inputs: r.inputs.map(i => ({ ...i })) })) : undefined,
+    activeRepairs: role === 'repair-shop' ? [] : undefined,
+    illnessRecipes: role === 'hospital' ? DEFAULT_ILLNESS_RECIPES.map(r => ({ ...r, inputs: r.inputs.map(i => ({ ...i })) })) : undefined,
+    activePatients: role === 'hospital' ? [] : undefined,
+    patientsHealed: role === 'hospital' ? 0 : undefined,
   };
   return normalizeBuildingConfig(base);
+}
+
+function canStartRepair(cfg: BuildingConfig, recipe: RepairRecipe, vehicle: Vehicle): string | null {
+  if (cfg.role !== 'repair-shop') return 'Not a repair shop.';
+  if (recipe.vehicleTypes && recipe.vehicleTypes.length > 0) {
+    const vType = (vehicle.type || 'car') as VehicleType;
+    if (!recipe.vehicleTypes.includes(vType)) {
+      return `Recipe does not apply to ${vType}.`;
+    }
+  }
+  for (const inp of recipe.inputs || []) {
+    if ((cfg.inventory[inp.item] || 0) < (inp.amount || 1)) {
+      return `Need ${inp.amount || 1}× ${inp.item}.`;
+    }
+  }
+  if ((cfg.activeRepairs || []).some(r => r.vehicleId === vehicle.id)) {
+    return 'Vehicle already being repaired.';
+  }
+  return null;
+}
+
+function canStartTreatment(cfg: BuildingConfig, illness: IllnessRecipe, vehicle: Vehicle): string | null {
+  if (cfg.role !== 'hospital') return 'Not a hospital.';
+  if (illness.vehicleTypes && illness.vehicleTypes.length > 0) {
+    const vType = (vehicle.type || 'car') as VehicleType;
+    if (!illness.vehicleTypes.includes(vType)) {
+      return `Protocol prefers ${illness.vehicleTypes.join(', ')} (this is ${vType}).`;
+    }
+  }
+  for (const inp of illness.inputs || []) {
+    if ((cfg.inventory[inp.item] || 0) < (inp.amount || 1)) {
+      return `Need ${inp.amount || 1}× ${inp.item}.`;
+    }
+  }
+  if ((cfg.activePatients || []).some(p => p.vehicleId === vehicle.id)) {
+    return 'Patient from this vehicle already in care.';
+  }
+  if ((cfg.activePatients || []).some(p => p.bayIndex === (vehicle.parkingStallIndex ?? 0))) {
+    // Allow if different vehicle replaced bay — only block same bay if occupied by active patient without matching vehicle gone
+  }
+  return null;
+}
+
+function findVehiclesInBuildingBays(
+  anchorKey: string,
+  grid: GridData,
+  vehicles: Record<string, Vehicle>,
+  buildingType: 'building-repair-shop' | 'building-hospital',
+): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
+  const result: Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> = [];
+  const seen = new Set<string>();
+  for (const [key, tiles] of Object.entries(grid)) {
+    for (const t of tiles) {
+      if (t.type !== buildingType) continue;
+      const isAnchor = t.part !== 'member' && key === anchorKey;
+      const isMember = t.part === 'member' && t.anchorKey === anchorKey;
+      if (!isAnchor && !isMember) continue;
+      if (!isBuildingParkingBay(t)) continue;
+      const bayIndex = getBuildingParkingBayIndex(t);
+      const [cx, cy] = key.split(',').map(Number);
+      for (const v of Object.values(vehicles) as Vehicle[]) {
+        if (v.x === cx && v.y === cy && !seen.has(v.id)) {
+          seen.add(v.id);
+          result.push({ vehicle: v, bayIndex, cellKey: key });
+        }
+      }
+    }
+  }
+  return result.sort((a, b) => a.bayIndex - b.bayIndex || a.vehicle.id.localeCompare(b.vehicle.id));
+}
+
+function findVehiclesInRepairShopBays(
+  anchorKey: string,
+  grid: GridData,
+  vehicles: Record<string, Vehicle>,
+): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
+  return findVehiclesInBuildingBays(anchorKey, grid, vehicles, 'building-repair-shop');
+}
+
+function findVehiclesInHospitalBays(
+  anchorKey: string,
+  grid: GridData,
+  vehicles: Record<string, Vehicle>,
+): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
+  return findVehiclesInBuildingBays(anchorKey, grid, vehicles, 'building-hospital');
 }
 
 function BuildingInspectorModal({
@@ -2355,13 +3995,28 @@ function BuildingInspectorModal({
   const [localInputs, setLocalInputs] = useState<Array<{ item: string; amount: number }>>([...(cfg.recipeInputs || [])]);
   const [localOutputs, setLocalOutputs] = useState<Array<{ item: string; amount: number }>>([...(cfg.recipeOutputs || [])]);
   const [localCycle, setLocalCycle] = useState(cfg.cycleTimeSec || 30);
+  const [localRequiredEmployees, setLocalRequiredEmployees] = useState(
+    () => getRequiredEmployees(cfg)
+  );
+  const [localRepairRecipes, setLocalRepairRecipes] = useState<RepairRecipe[]>(
+    () => (cfg.repairRecipes || []).map(r => ({ ...r, inputs: (r.inputs || []).map(i => ({ ...i })) }))
+  );
+  const [localIllnessRecipes, setLocalIllnessRecipes] = useState<IllnessRecipe[]>(
+    () => (cfg.illnessRecipes || []).map(r => ({ ...r, inputs: (r.inputs || []).map(i => ({ ...i })) }))
+  );
   const [editorTick, setEditorTick] = useState(0);
   const [addInvItem, setAddInvItem] = useState('');
   const [addCapItem, setAddCapItem] = useState('');
   const [addRateItem, setAddRateItem] = useState('');
+  const [newRepairName, setNewRepairName] = useState('');
+  const [newIllnessName, setNewIllnessName] = useState('');
   const cfgSyncRef = useRef(Date.now());
   const itemDefs = economy.itemDefs || [];
   const nearbyTrailers = findNearbyTrailersForBuilding(bkey, grid, economy, vehicles, 3);
+  const vehiclesInBays = role === 'repair-shop' ? findVehiclesInRepairShopBays(bkey, grid, vehicles) : [];
+  const ambulancesInBays = role === 'hospital' ? findVehiclesInHospitalBays(bkey, grid, vehicles) : [];
+  const activeRepairs = cfg.activeRepairs || [];
+  const activePatients = cfg.activePatients || [];
 
   const getItemLabel = (id: string) => getItemDisplayName(id, itemDefs);
 
@@ -2388,19 +4043,22 @@ function BuildingInspectorModal({
     setLocalInputs([...(cfg.recipeInputs || [])]);
     setLocalOutputs([...(cfg.recipeOutputs || [])]);
     setLocalCycle(cfg.cycleTimeSec || 30);
+    setLocalRequiredEmployees(getRequiredEmployees(cfg));
+    setLocalRepairRecipes((cfg.repairRecipes || []).map(r => ({ ...r, inputs: (r.inputs || []).map(i => ({ ...i })) })));
+    setLocalIllnessRecipes((cfg.illnessRecipes || []).map(r => ({ ...r, inputs: (r.inputs || []).map(i => ({ ...i })) })));
     cfgSyncRef.current = Date.now();
     centerPanel();
   }, [bkey, centerPanel]);
 
   useEffect(() => {
     cfgSyncRef.current = Date.now();
-  }, [cfg.processAccum]);
+  }, [cfg.processAccum, cfg.activeRepairs, cfg.activePatients]);
 
   useEffect(() => {
-    if (!isRecipeBuilding(cfg) || economy.economyPaused) return;
+    if ((!isRecipeBuilding(cfg) && role !== 'repair-shop' && role !== 'hospital') || economy.economyPaused) return;
     const iv = setInterval(() => setEditorTick(t => t + 1), 100);
     return () => clearInterval(iv);
-  }, [bkey, economy.economyPaused]);
+  }, [bkey, economy.economyPaused, role]);
 
   useEffect(() => {
     if (!isDragging) return;
@@ -2437,11 +4095,16 @@ function BuildingInspectorModal({
     setIsDragging(true);
   };
 
-  const saveConfig = () => {
+  const saveConfig = (invOverride?: Record<string, number>) => {
+    const invSource = invOverride ?? localInv;
     const cappedCfg = { ...cfg, inventoryCapacity: { ...localCaps } };
-    const clampedInv = { ...localInv };
+    const clampedInv = { ...invSource };
     Object.keys(clampedInv).forEach(itemId => {
       clampedInv[itemId] = Math.min(clampedInv[itemId], getItemCapacity(cappedCfg, itemId));
+    });
+    // Drop zero-qty entries for a clean snapshot, but keep the object
+    Object.keys(clampedInv).forEach(itemId => {
+      if (!clampedInv[itemId]) delete clampedInv[itemId];
     });
     const updated: BuildingConfig = {
       ...cfg,
@@ -2452,11 +4115,42 @@ function BuildingInspectorModal({
       recipeInputs: (role === 'factory' || role === 'lumbermill') ? [...localInputs] : cfg.recipeInputs,
       recipeOutputs: (role === 'factory' || role === 'lumbermill') ? [...localOutputs] : cfg.recipeOutputs,
       cycleTimeSec: (role === 'factory' || role === 'lumbermill') ? localCycle : cfg.cycleTimeSec,
+      requiredEmployees: (role === 'factory' || role === 'lumbermill')
+        ? Math.max(0, Math.floor(localRequiredEmployees) || 0)
+        : cfg.requiredEmployees,
+      repairRecipes: role === 'repair-shop'
+        ? localRepairRecipes.map(r => ({
+            ...r,
+            name: r.name.trim() || 'Repair',
+            inputs: (r.inputs || []).filter(i => i.item).map(i => ({ item: i.item, amount: Math.max(1, i.amount || 1) })),
+            cycleTimeSec: Math.max(1, r.cycleTimeSec || 10),
+          }))
+        : cfg.repairRecipes,
+      illnessRecipes: role === 'hospital'
+        ? localIllnessRecipes.map(r => ({
+            ...r,
+            name: r.name.trim() || 'Illness',
+            description: r.description,
+            inputs: (r.inputs || []).filter(i => i.item).map(i => ({ item: i.item, amount: Math.max(1, i.amount || 1) })),
+            stayDurationSec: Math.max(1, r.stayDurationSec || 15),
+            vehicleTypes: r.vehicleTypes,
+          }))
+        : cfg.illnessRecipes,
     };
     const nextB = { ...economy.buildings, [bkey]: updated };
     const nextEco = { ...economy, buildings: nextB };
     setEconomy(nextEco);
     if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+  };
+
+  /** Persist inventory immediately so layout save/copy always sees stock. */
+  const updateInventory = (updater: (prev: Record<string, number>) => Record<string, number>) => {
+    setLocalInv(prev => {
+      const next = updater(prev);
+      // Defer economy write so it uses the latest caps/name from this render
+      queueMicrotask(() => saveConfig(next));
+      return next;
+    });
   };
 
   return (
@@ -2522,16 +4216,16 @@ function BuildingInspectorModal({
                 <div key={it} className="flex items-center justify-between py-0.5 gap-2">
                   <span className="truncate max-w-[8rem]">{getItemLabel(it)}</span>
                   <div className="flex items-center gap-1">
-                    <button onClick={() => setLocalInv(p => ({ ...p, [it]: Math.max(0, (p[it] || 0) - 1) }))} className="px-1.5">-</button>
+                    <button onClick={() => updateInventory(p => ({ ...p, [it]: Math.max(0, (p[it] || 0) - 1) }))} className="px-1.5">-</button>
                     <input
                       type="number"
                       value={qty}
-                      onChange={e => setLocalInv(p => ({ ...p, [it]: Math.min(cap, Math.max(0, parseInt(e.target.value) || 0)) }))}
+                      onChange={e => updateInventory(p => ({ ...p, [it]: Math.min(cap, Math.max(0, parseInt(e.target.value) || 0)) }))}
                       className="w-14 text-right border px-1 text-xs"
                     />
                     <span className="text-[10px] text-slate-400">/{cap}</span>
-                    <button onClick={() => setLocalInv(p => ({ ...p, [it]: Math.min(cap, (p[it] || 0) + 1) }))} className="px-1.5">+</button>
-                    <button onClick={() => { const n = { ...localInv }; delete n[it]; setLocalInv(n); }} className="text-red-500 text-[10px] ml-1">×</button>
+                    <button onClick={() => updateInventory(p => ({ ...p, [it]: Math.min(cap, (p[it] || 0) + 1) }))} className="px-1.5">+</button>
+                    <button onClick={() => updateInventory(p => { const n = { ...p }; delete n[it]; return n; })} className="text-red-500 text-[10px] ml-1">×</button>
                   </div>
                 </div>
               );
@@ -2550,7 +4244,7 @@ function BuildingInspectorModal({
               onClick={() => {
                 const cap = localCaps[addInvItem] ?? getDefaultItemCapacity(role, addInvItem);
                 setLocalCaps(p => ({ ...p, [addInvItem]: p[addInvItem] ?? cap }));
-                setLocalInv(p => ({ ...p, [addInvItem]: Math.min(cap, (p[addInvItem] || 0) + 10) }));
+                updateInventory(p => ({ ...p, [addInvItem]: Math.min(cap, (p[addInvItem] || 0) + 10) }));
                 setAddInvItem('');
               }}
               className="text-xs px-2 bg-slate-200 rounded disabled:opacity-40"
@@ -2605,6 +4299,573 @@ function BuildingInspectorModal({
             >Add</button>
           </div>
         </div>
+
+        {role === 'repair-shop' && (
+          <div className="mb-4 space-y-3">
+            <div>
+              <div className="font-semibold text-sm mb-1 flex items-center gap-1">
+                <Wrench className="w-3.5 h-3.5 text-orange-600" />
+                Service Bays ({vehiclesInBays.length}/4 occupied)
+              </div>
+              <div className="border rounded p-2 text-xs bg-orange-50/50 border-orange-100 space-y-2 max-h-48 overflow-auto">
+                {vehiclesInBays.length === 0 && (
+                  <div className="text-slate-400">Park any vehicle in a service bay to start repairs.</div>
+                )}
+                {vehiclesInBays.map(({ vehicle: v, bayIndex }) => {
+                  const job = activeRepairs.find(r => r.vehicleId === v.id);
+                  const recipe = job ? (cfg.repairRecipes || localRepairRecipes).find(r => r.id === job.recipeId) : null;
+                  const cycle = recipe?.cycleTimeSec || 15;
+                  const progress = job ? Math.min(1, (job.processAccum || 0) / cycle) : 0;
+                  void editorTick;
+                  return (
+                    <div key={v.id} className="bg-white rounded-lg border border-orange-100 p-2">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: v.color }} />
+                        <VehicleTypeIcon type={v.type} />
+                        <span className="font-mono text-[10px] text-slate-500 truncate flex-1">{v.id}</span>
+                        <span className="text-[10px] font-bold text-orange-700">Bay {bayIndex + 1}</span>
+                      </div>
+                      {job && recipe ? (
+                        <div>
+                          <div className="text-[10px] text-slate-600 mb-0.5">Repairing: {recipe.name}</div>
+                          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                            <div className="h-full bg-orange-500 transition-all" style={{ width: `${progress * 100}%` }} />
+                          </div>
+                          <div className="text-[9px] text-slate-400 mt-0.5">
+                            {Math.max(0, Math.ceil(cycle - (job.processAccum || 0)))}s remaining
+                          </div>
+                          <button
+                            type="button"
+                            className="mt-1 text-[10px] text-red-600 hover:underline"
+                            onClick={() => {
+                              const nextRepairs = (cfg.activeRepairs || []).filter(r => r.id !== job.id);
+                              // Refund parts
+                              const refundInv = { ...(cfg.inventory || {}) };
+                              (recipe.inputs || []).forEach(inp => {
+                                refundInv[inp.item] = (refundInv[inp.item] || 0) + (inp.amount || 1);
+                              });
+                              const nextEco = {
+                                ...economy,
+                                buildings: {
+                                  ...economy.buildings,
+                                  [bkey]: { ...cfg, activeRepairs: nextRepairs, inventory: refundInv },
+                                },
+                              };
+                              setEconomy(nextEco);
+                              setLocalInv(refundInv);
+                              if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                            }}
+                          >
+                            Cancel &amp; refund parts
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <div className="text-[10px] text-slate-500">Start repair:</div>
+                          <div className="flex flex-wrap gap-1">
+                            {(cfg.repairRecipes || localRepairRecipes).map(recipe => {
+                              const liveCfg = { ...cfg, inventory: localInv };
+                              const err = canStartRepair(liveCfg, recipe, v);
+                              return (
+                                <button
+                                  key={recipe.id}
+                                  type="button"
+                                  disabled={!!err || !roomCode}
+                                  title={err || recipe.description || recipe.name}
+                                  onClick={() => {
+                                    // Consume parts immediately, then queue job
+                                    const nextInv = { ...localInv };
+                                    for (const inp of recipe.inputs || []) {
+                                      nextInv[inp.item] = (nextInv[inp.item] || 0) - (inp.amount || 1);
+                                      if (nextInv[inp.item] <= 0) delete nextInv[inp.item];
+                                    }
+                                    const job: ActiveRepair = {
+                                      id: `repair-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                                      recipeId: recipe.id,
+                                      vehicleId: v.id,
+                                      bayIndex,
+                                      processAccum: 0,
+                                    };
+                                    const nextEco = {
+                                      ...economy,
+                                      buildings: {
+                                        ...economy.buildings,
+                                        [bkey]: {
+                                          ...cfg,
+                                          inventory: nextInv,
+                                          repairRecipes: localRepairRecipes,
+                                          activeRepairs: [...(cfg.activeRepairs || []), job],
+                                        },
+                                      },
+                                    };
+                                    setLocalInv(nextInv);
+                                    setEconomy(nextEco);
+                                    if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                                  }}
+                                  className="text-[10px] px-1.5 py-0.5 rounded bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-40"
+                                >
+                                  {recipe.name}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          {v.lastRepairId && (
+                            <div className="text-[9px] text-emerald-600">
+                              Last repair: {v.lastRepairId}
+                              {v.lastRepairAt ? ` (${Math.round((Date.now() - v.lastRepairAt) / 1000)}s ago)` : ''}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div>
+              <div className="font-semibold text-sm mb-1">Repair Types &amp; Recipes</div>
+              <p className="text-[10px] text-slate-400 mb-1">
+                Define jobs and the parts they consume. Parts are taken from this shop&apos;s inventory when a repair starts.
+              </p>
+              <div className="border rounded p-2 text-xs bg-slate-50 space-y-2 max-h-56 overflow-auto">
+                {localRepairRecipes.length === 0 && <div className="text-slate-400">No repair types yet</div>}
+                {localRepairRecipes.map((recipe, rIdx) => (
+                  <div key={recipe.id} className="bg-white border border-slate-100 rounded p-2 space-y-1">
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="text"
+                        value={recipe.name}
+                        onChange={e => {
+                          const n = [...localRepairRecipes];
+                          n[rIdx] = { ...n[rIdx], name: e.target.value };
+                          setLocalRepairRecipes(n);
+                        }}
+                        className="flex-1 border rounded px-1.5 py-0.5 text-xs font-medium"
+                        placeholder="Repair name"
+                      />
+                      <input
+                        type="number"
+                        min={1}
+                        value={recipe.cycleTimeSec}
+                        onChange={e => {
+                          const n = [...localRepairRecipes];
+                          n[rIdx] = { ...n[rIdx], cycleTimeSec: Math.max(1, parseInt(e.target.value) || 1) };
+                          setLocalRepairRecipes(n);
+                        }}
+                        className="w-14 border rounded px-1 py-0.5 text-xs text-right"
+                        title="Seconds"
+                      />
+                      <span className="text-[9px] text-slate-400">sec</span>
+                      <button
+                        type="button"
+                        className="text-red-500 text-[10px]"
+                        onClick={() => setLocalRepairRecipes(localRepairRecipes.filter((_, i) => i !== rIdx))}
+                      >×</button>
+                    </div>
+                    <input
+                      type="text"
+                      value={recipe.description || ''}
+                      onChange={e => {
+                        const n = [...localRepairRecipes];
+                        n[rIdx] = { ...n[rIdx], description: e.target.value };
+                        setLocalRepairRecipes(n);
+                      }}
+                      className="w-full border rounded px-1.5 py-0.5 text-[10px]"
+                      placeholder="Description (optional)"
+                    />
+                    <div className="space-y-0.5">
+                      <div className="text-[10px] text-slate-500">Parts required</div>
+                      {(recipe.inputs || []).map((inp, iIdx) => (
+                        <div key={iIdx} className="flex gap-1 items-center">
+                          <input
+                            type="text"
+                            value={inp.item}
+                            onChange={e => {
+                              const n = [...localRepairRecipes];
+                              const inputs = [...(n[rIdx].inputs || [])];
+                              inputs[iIdx] = { ...inputs[iIdx], item: e.target.value };
+                              n[rIdx] = { ...n[rIdx], inputs };
+                              setLocalRepairRecipes(n);
+                            }}
+                            list={`repair-items-${bkey}`}
+                            className="flex-1 border rounded px-1 py-0.5 text-[10px]"
+                            placeholder="part id"
+                          />
+                          <input
+                            type="number"
+                            min={1}
+                            value={inp.amount}
+                            onChange={e => {
+                              const n = [...localRepairRecipes];
+                              const inputs = [...(n[rIdx].inputs || [])];
+                              inputs[iIdx] = { ...inputs[iIdx], amount: Math.max(1, parseInt(e.target.value) || 1) };
+                              n[rIdx] = { ...n[rIdx], inputs };
+                              setLocalRepairRecipes(n);
+                            }}
+                            className="w-12 border rounded px-1 py-0.5 text-[10px] text-right"
+                          />
+                          <button
+                            type="button"
+                            className="text-red-500"
+                            onClick={() => {
+                              const n = [...localRepairRecipes];
+                              n[rIdx] = {
+                                ...n[rIdx],
+                                inputs: (n[rIdx].inputs || []).filter((_, i) => i !== iIdx),
+                              };
+                              setLocalRepairRecipes(n);
+                            }}
+                          >×</button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        className="text-[10px] text-emerald-600"
+                        onClick={() => {
+                          const n = [...localRepairRecipes];
+                          n[rIdx] = {
+                            ...n[rIdx],
+                            inputs: [...(n[rIdx].inputs || []), { item: pickDefaultItem() || 'motor-oil', amount: 1 }],
+                          };
+                          setLocalRepairRecipes(n);
+                        }}
+                      >+ Add part</button>
+                    </div>
+                  </div>
+                ))}
+                <datalist id={`repair-items-${bkey}`}>
+                  {itemDefs.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                  {Object.keys(ITEM_EMOJI_MAP).map(id => <option key={id} value={id} />)}
+                </datalist>
+                <div className="flex gap-1 pt-1">
+                  <input
+                    type="text"
+                    value={newRepairName}
+                    onChange={e => setNewRepairName(e.target.value)}
+                    placeholder="New repair type name…"
+                    className="flex-1 border rounded px-2 py-1 text-xs"
+                  />
+                  <button
+                    type="button"
+                    className="px-2 py-1 bg-orange-600 text-white rounded text-xs disabled:opacity-40"
+                    disabled={!newRepairName.trim()}
+                    onClick={() => {
+                      const id = normalizeItemId(newRepairName) || `repair-${Date.now()}`;
+                      setLocalRepairRecipes(prev => [
+                        ...prev,
+                        {
+                          id: `${id}-${Date.now().toString(36).slice(-4)}`,
+                          name: newRepairName.trim(),
+                          inputs: [{ item: 'motor-oil', amount: 1 }],
+                          cycleTimeSec: 15,
+                        },
+                      ]);
+                      setNewRepairName('');
+                    }}
+                  >Add</button>
+                </div>
+              </div>
+              <div className="text-[10px] text-slate-400 mt-1">Click Save Changes to store recipe edits.</div>
+            </div>
+          </div>
+        )}
+
+        {role === 'hospital' && (
+          <div className="mb-4 space-y-3">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold text-rose-700 flex items-center gap-1">
+                <Cross className="w-3.5 h-3.5" /> Hospital
+              </span>
+              <span className="text-slate-500">
+                Healed: <strong className="text-emerald-600">{cfg.patientsHealed || 0}</strong>
+                {' · '}
+                In care: <strong>{activePatients.length}</strong>
+              </span>
+            </div>
+
+            <div>
+              <div className="font-semibold text-sm mb-1">Ambulance Bays ({ambulancesInBays.length}/4)</div>
+              <div className="border rounded p-2 text-xs bg-rose-50/50 border-rose-100 space-y-2 max-h-52 overflow-auto">
+                {ambulancesInBays.length === 0 && (
+                  <div className="text-slate-400">Park an ambulance (or any vehicle) in a bay to admit a patient.</div>
+                )}
+                {ambulancesInBays.map(({ vehicle: v, bayIndex }) => {
+                  const patient = activePatients.find(p => p.vehicleId === v.id || p.bayIndex === bayIndex);
+                  const illness = patient
+                    ? (cfg.illnessRecipes || localIllnessRecipes).find(r => r.id === patient.illnessId)
+                    : null;
+                  const stay = illness?.stayDurationSec || 20;
+                  const progress = patient ? Math.min(1, (patient.processAccum || 0) / stay) : 0;
+                  void editorTick;
+                  return (
+                    <div key={v.id} className="bg-white rounded-lg border border-rose-100 p-2">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: v.color }} />
+                        <VehicleTypeIcon type={v.type} />
+                        <span className="font-mono text-[10px] text-slate-500 truncate flex-1">{v.id}</span>
+                        <span className="text-[10px] font-bold text-rose-700">Bay {bayIndex + 1}</span>
+                      </div>
+                      {patient && illness ? (
+                        <div>
+                          <div className="text-[10px] text-slate-600 mb-0.5">
+                            Treating: <strong>{illness.name}</strong>
+                            {patient.patientLabel ? ` (${patient.patientLabel})` : ''}
+                          </div>
+                          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                            <div className="h-full bg-rose-500 transition-all" style={{ width: `${progress * 100}%` }} />
+                          </div>
+                          <div className="text-[9px] text-slate-400 mt-0.5">
+                            {Math.max(0, Math.ceil(stay - (patient.processAccum || 0)))}s remaining of {stay}s stay
+                          </div>
+                          <button
+                            type="button"
+                            className="mt-1 text-[10px] text-red-600 hover:underline"
+                            onClick={() => {
+                              const nextPatients = (cfg.activePatients || []).filter(p => p.id !== patient.id);
+                              const refundInv = { ...(cfg.inventory || {}) };
+                              (illness.inputs || []).forEach(inp => {
+                                refundInv[inp.item] = (refundInv[inp.item] || 0) + (inp.amount || 1);
+                              });
+                              const nextEco = {
+                                ...economy,
+                                buildings: {
+                                  ...economy.buildings,
+                                  [bkey]: { ...cfg, activePatients: nextPatients, inventory: refundInv },
+                                },
+                              };
+                              setEconomy(nextEco);
+                              setLocalInv(refundInv);
+                              if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                            }}
+                          >
+                            Discharge early &amp; refund supplies
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <div className="text-[10px] text-slate-500">Admit patient — choose illness:</div>
+                          <div className="flex flex-wrap gap-1">
+                            {(cfg.illnessRecipes || localIllnessRecipes).map(illness => {
+                              const liveCfg = { ...cfg, inventory: localInv };
+                              const err = canStartTreatment(liveCfg, illness, v);
+                              return (
+                                <button
+                                  key={illness.id}
+                                  type="button"
+                                  disabled={!!err || !roomCode}
+                                  title={err || illness.description || illness.name}
+                                  onClick={() => {
+                                    const nextInv = { ...localInv };
+                                    for (const inp of illness.inputs || []) {
+                                      nextInv[inp.item] = (nextInv[inp.item] || 0) - (inp.amount || 1);
+                                      if (nextInv[inp.item] <= 0) delete nextInv[inp.item];
+                                    }
+                                    const patient: ActivePatient = {
+                                      id: `patient-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                                      illnessId: illness.id,
+                                      vehicleId: v.id,
+                                      bayIndex,
+                                      processAccum: 0,
+                                      patientLabel: v.type === 'ambulance' ? 'Ambulance patient' : `From ${v.type || 'vehicle'}`,
+                                    };
+                                    const nextEco = {
+                                      ...economy,
+                                      buildings: {
+                                        ...economy.buildings,
+                                        [bkey]: {
+                                          ...cfg,
+                                          inventory: nextInv,
+                                          illnessRecipes: localIllnessRecipes,
+                                          activePatients: [...(cfg.activePatients || []), patient],
+                                        },
+                                      },
+                                    };
+                                    setLocalInv(nextInv);
+                                    setEconomy(nextEco);
+                                    if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                                  }}
+                                  className="text-[10px] px-1.5 py-0.5 rounded bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-40"
+                                >
+                                  {illness.name}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div>
+              <div className="font-semibold text-sm mb-1">Illnesses &amp; Healing Recipes</div>
+              <p className="text-[10px] text-slate-400 mb-1">
+                Describe illnesses and the supplies + stay time required to heal them. Supplies are taken when treatment starts.
+              </p>
+              <div className="border rounded p-2 text-xs bg-slate-50 space-y-2 max-h-56 overflow-auto">
+                {localIllnessRecipes.length === 0 && <div className="text-slate-400">No illness types yet</div>}
+                {localIllnessRecipes.map((illness, rIdx) => (
+                  <div key={illness.id} className="bg-white border border-slate-100 rounded p-2 space-y-1">
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="text"
+                        value={illness.name}
+                        onChange={e => {
+                          const n = [...localIllnessRecipes];
+                          n[rIdx] = { ...n[rIdx], name: e.target.value };
+                          setLocalIllnessRecipes(n);
+                        }}
+                        className="flex-1 border rounded px-1.5 py-0.5 text-xs font-medium"
+                        placeholder="Illness name"
+                      />
+                      <input
+                        type="number"
+                        min={1}
+                        value={illness.stayDurationSec}
+                        onChange={e => {
+                          const n = [...localIllnessRecipes];
+                          n[rIdx] = { ...n[rIdx], stayDurationSec: Math.max(1, parseInt(e.target.value) || 1) };
+                          setLocalIllnessRecipes(n);
+                        }}
+                        className="w-14 border rounded px-1 py-0.5 text-xs text-right"
+                        title="Stay duration (seconds)"
+                      />
+                      <span className="text-[9px] text-slate-400">sec stay</span>
+                      <button
+                        type="button"
+                        className="text-red-500 text-[10px]"
+                        onClick={() => setLocalIllnessRecipes(localIllnessRecipes.filter((_, i) => i !== rIdx))}
+                      >×</button>
+                    </div>
+                    <textarea
+                      value={illness.description || ''}
+                      onChange={e => {
+                        const n = [...localIllnessRecipes];
+                        n[rIdx] = { ...n[rIdx], description: e.target.value };
+                        setLocalIllnessRecipes(n);
+                      }}
+                      className="w-full border rounded px-1.5 py-0.5 text-[10px] min-h-[2.2rem] resize-y"
+                      placeholder="Describe the illness and healing protocol…"
+                      rows={2}
+                    />
+                    <div className="space-y-0.5">
+                      <div className="text-[10px] text-slate-500">Supplies required</div>
+                      {(illness.inputs || []).map((inp, iIdx) => (
+                        <div key={iIdx} className="flex gap-1 items-center">
+                          <input
+                            type="text"
+                            value={inp.item}
+                            onChange={e => {
+                              const n = [...localIllnessRecipes];
+                              const inputs = [...(n[rIdx].inputs || [])];
+                              inputs[iIdx] = { ...inputs[iIdx], item: e.target.value };
+                              n[rIdx] = { ...n[rIdx], inputs };
+                              setLocalIllnessRecipes(n);
+                            }}
+                            list={`hospital-items-${bkey}`}
+                            className="flex-1 border rounded px-1 py-0.5 text-[10px]"
+                            placeholder="supply id"
+                          />
+                          <input
+                            type="number"
+                            min={1}
+                            value={inp.amount}
+                            onChange={e => {
+                              const n = [...localIllnessRecipes];
+                              const inputs = [...(n[rIdx].inputs || [])];
+                              inputs[iIdx] = { ...inputs[iIdx], amount: Math.max(1, parseInt(e.target.value) || 1) };
+                              n[rIdx] = { ...n[rIdx], inputs };
+                              setLocalIllnessRecipes(n);
+                            }}
+                            className="w-12 border rounded px-1 py-0.5 text-[10px] text-right"
+                          />
+                          <button
+                            type="button"
+                            className="text-red-500"
+                            onClick={() => {
+                              const n = [...localIllnessRecipes];
+                              n[rIdx] = {
+                                ...n[rIdx],
+                                inputs: (n[rIdx].inputs || []).filter((_, i) => i !== iIdx),
+                              };
+                              setLocalIllnessRecipes(n);
+                            }}
+                          >×</button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        className="text-[10px] text-emerald-600"
+                        onClick={() => {
+                          const n = [...localIllnessRecipes];
+                          n[rIdx] = {
+                            ...n[rIdx],
+                            inputs: [...(n[rIdx].inputs || []), { item: pickDefaultItem() || 'medicine', amount: 1 }],
+                          };
+                          setLocalIllnessRecipes(n);
+                        }}
+                      >+ Add supply</button>
+                    </div>
+                    <label className="flex items-center gap-1 text-[10px] text-slate-500">
+                      <input
+                        type="checkbox"
+                        checked={(illness.vehicleTypes || []).includes('ambulance')}
+                        onChange={e => {
+                          const n = [...localIllnessRecipes];
+                          n[rIdx] = {
+                            ...n[rIdx],
+                            vehicleTypes: e.target.checked ? ['ambulance'] : undefined,
+                          };
+                          setLocalIllnessRecipes(n);
+                        }}
+                      />
+                      Prefer ambulance delivery
+                    </label>
+                  </div>
+                ))}
+                <datalist id={`hospital-items-${bkey}`}>
+                  {itemDefs.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                  {['medicine', 'bandages', 'painkillers', 'blood-bags', 'iv-fluids', 'antibiotics', 'defibrillator-pads', 'epinephrine', 'medical-supplies'].map(id => (
+                    <option key={id} value={id} />
+                  ))}
+                </datalist>
+                <div className="flex gap-1 pt-1">
+                  <input
+                    type="text"
+                    value={newIllnessName}
+                    onChange={e => setNewIllnessName(e.target.value)}
+                    placeholder="New illness name…"
+                    className="flex-1 border rounded px-2 py-1 text-xs"
+                  />
+                  <button
+                    type="button"
+                    className="px-2 py-1 bg-rose-600 text-white rounded text-xs disabled:opacity-40"
+                    disabled={!newIllnessName.trim()}
+                    onClick={() => {
+                      const id = normalizeItemId(newIllnessName) || `illness-${Date.now()}`;
+                      setLocalIllnessRecipes(prev => [
+                        ...prev,
+                        {
+                          id: `${id}-${Date.now().toString(36).slice(-4)}`,
+                          name: newIllnessName.trim(),
+                          description: '',
+                          inputs: [{ item: 'medicine', amount: 1 }],
+                          stayDurationSec: 25,
+                          vehicleTypes: ['ambulance'],
+                        },
+                      ]);
+                      setNewIllnessName('');
+                    }}
+                  >Add</button>
+                </div>
+              </div>
+              <div className="text-[10px] text-slate-400 mt-1">Click Save Changes to store illness recipes.</div>
+            </div>
+          </div>
+        )}
 
         {role === 'store' && (
           <div className="mb-4">
@@ -2702,14 +4963,62 @@ function BuildingInspectorModal({
               <input type="number" value={localCycle} onChange={e => setLocalCycle(Math.max(1, parseInt(e.target.value) || 30))} className="w-20 border px-1" />
             </div>
 
+            <div className="flex items-center gap-2 text-xs">
+              <span>Required employees:</span>
+              <input
+                type="number"
+                min={0}
+                value={localRequiredEmployees}
+                onChange={e => setLocalRequiredEmployees(Math.max(0, parseInt(e.target.value) || 0))}
+                className="w-16 border px-1"
+              />
+            </div>
+
+            {(() => {
+              const staff = countEmployeesAtBuilding(economy.people, bkey);
+              const need = localRequiredEmployees;
+              const staffed = need <= 0 || staff >= need;
+              const employees = Object.values(economy.people || {}).filter(p => p.workplaceKey === bkey);
+              return (
+                <div className={`p-2 rounded-lg border text-xs ${staffed ? 'bg-emerald-50 border-emerald-200' : 'bg-rose-50 border-rose-200'}`}>
+                  <div className="flex items-center justify-between font-medium mb-1">
+                    <span className={staffed ? 'text-emerald-800' : 'text-rose-800'}>
+                      Staffing: {staff}/{need} employees
+                    </span>
+                    {!staffed && <span className="text-rose-600 text-[10px]">Production paused</span>}
+                  </div>
+                  {employees.length === 0 ? (
+                    <p className="text-[10px] text-slate-500">
+                      No employees assigned. Select people in the People panel, then click &quot;Assign workplace&quot; and choose this building.
+                    </p>
+                  ) : (
+                    <ul className="text-[10px] text-slate-600 space-y-0.5 max-h-20 overflow-y-auto">
+                      {employees.map(p => (
+                        <li key={p.id}>{personDisplayName(p)} · {formatAge(p.ageYears)}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              );
+            })()}
+
             {isRecipeBuilding(cfg) && (() => {
               void editorTick;
               const elapsed = economy.economyPaused ? 0 : (Date.now() - cfgSyncRef.current) / 1000;
-              const remaining = getRecipeCycleRemaining(cfg, economy.economyPaused, elapsed);
+              const staffed = isStaffedForProduction(cfg, bkey, economy.people);
+              const remaining = getRecipeCycleRemaining(cfg, economy.economyPaused, elapsed, staffed);
               return remaining !== null ? (
                 <div className="flex items-center justify-between p-2 rounded-lg bg-violet-50 border border-violet-200">
-                  <span className="text-xs font-medium text-violet-800">Next batch</span>
-                  <CycleCountdownBadge remaining={remaining} className="text-[10px] px-1.5 py-0.5" />
+                  <span className="text-xs font-medium text-violet-800">
+                    {staffed ? 'Next batch' : 'Waiting for staff'}
+                  </span>
+                  {staffed ? (
+                    <CycleCountdownBadge remaining={remaining} className="text-[10px] px-1.5 py-0.5" />
+                  ) : (
+                    <span className="text-[10px] text-rose-600 font-bold">
+                      👷{countEmployeesAtBuilding(economy.people, bkey)}/{getRequiredEmployees(cfg)}
+                    </span>
+                  )}
                 </div>
               ) : null;
             })()}
@@ -2772,7 +5081,7 @@ function BuildingInspectorModal({
         )}
 
         <div className="flex gap-2 mt-4">
-          <button onClick={saveConfig} className="flex-1 bg-emerald-600 text-white rounded py-1 text-sm">Save Changes</button>
+          <button onClick={() => saveConfig()} className="flex-1 bg-emerald-600 text-white rounded py-1 text-sm">Save Changes</button>
           <button onClick={() => {
             const nextB = { ...economy.buildings };
             delete nextB[bkey];
@@ -2781,7 +5090,7 @@ function BuildingInspectorModal({
             if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
             onClose();
           }} className="text-red-600 text-xs px-3">Remove Config</button>
-          <button onClick={onClose} className="px-4 py-1 bg-slate-800 text-white rounded text-xs">Close</button>
+          <button onClick={() => { saveConfig(); onClose(); }} className="px-4 py-1 bg-slate-800 text-white rounded text-xs">Close</button>
         </div>
         <div className="text-[10px] text-emerald-600 mt-2">Tip: Click trailers on the map to edit cargo. Transfer with nearby buildings here or in the Semis &amp; Trailers panel.</div>
         </div>
@@ -2816,28 +5125,41 @@ export default function App() {
     }
   }, []);
 
-  const normalizeEconomy = (eco: Partial<EconomyState> | undefined): EconomyState => ({
-    itemDefs: Array.isArray(eco?.itemDefs) ? eco!.itemDefs : [],
-    buildings:
+  const normalizeEconomy = (eco: Partial<EconomyState> | undefined): EconomyState => {
+    const buildings =
       eco?.buildings && typeof eco.buildings === 'object'
         ? Object.fromEntries(
             Object.entries(eco.buildings).map(([k, b]) => [k, normalizeBuildingConfig(b as BuildingConfig)])
           )
-        : {},
-    parkedTrailers:
-      eco?.parkedTrailers && typeof eco.parkedTrailers === 'object' ? { ...eco.parkedTrailers } : {},
-    showInventoryLabels: eco?.showInventoryLabels ?? true,
-    showCargoLabels: eco?.showCargoLabels ?? true,
-    economyPaused: eco?.economyPaused ?? false,
-    plantGrowth: {
-      growthDurationSec: eco?.plantGrowth?.growthDurationSec ?? DEFAULT_PLANT_GROWTH.growthDurationSec,
-      germinationSec:
-        eco?.plantGrowth?.germinationSec ??
-        (eco?.plantGrowth as { coneStageSec?: number } | undefined)?.coneStageSec ??
-        DEFAULT_PLANT_GROWTH.germinationSec,
-      paused: eco?.plantGrowth?.paused ?? DEFAULT_PLANT_GROWTH.paused,
-    },
-  });
+        : {};
+    const parkedTrailers =
+      eco?.parkedTrailers && typeof eco.parkedTrailers === 'object' ? { ...eco.parkedTrailers } : {};
+    // Auto-add items required/produced/stored by buildings into the Logistics item list
+    const itemDefs = mergeItemDefsWithBuildingReferences(
+      Array.isArray(eco?.itemDefs) ? eco!.itemDefs : [],
+      buildings,
+      parkedTrailers,
+    );
+    return {
+      itemDefs,
+      buildings,
+      parkedTrailers,
+      showInventoryLabels: eco?.showInventoryLabels ?? true,
+      showCargoLabels: eco?.showCargoLabels ?? true,
+      economyPaused: eco?.economyPaused ?? false,
+      plantGrowth: {
+        growthDurationSec: eco?.plantGrowth?.growthDurationSec ?? DEFAULT_PLANT_GROWTH.growthDurationSec,
+        germinationSec:
+          eco?.plantGrowth?.germinationSec ??
+          (eco?.plantGrowth as { coneStageSec?: number } | undefined)?.coneStageSec ??
+          DEFAULT_PLANT_GROWTH.germinationSec,
+        paused: eco?.plantGrowth?.paused ?? DEFAULT_PLANT_GROWTH.paused,
+      },
+      people: eco?.people && typeof eco.people === 'object' ? { ...eco.people } : {},
+      families: eco?.families && typeof eco.families === 'object' ? { ...eco.families } : {},
+      peoplePaused: eco?.peoplePaused ?? false,
+    };
+  };
 
   const setEconomy = useCallback((newEco: EconomyState | ((prev: EconomyState) => EconomyState)) => {
     if (typeof newEco === 'function') {
@@ -2868,14 +5190,14 @@ export default function App() {
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectionStart, setSelectionStart] = useState<Point | null>(null);
   const [selectionEnd, setSelectionEnd] = useState<Point | null>(null);
-  const [clipboard, setClipboard] = useState<GridData | null>(null);
+  const [clipboard, setClipboard] = useState<LayoutSnapshot | null>(null);
   const [isPasting, setIsPasting] = useState(false);
 
   const [activeCategory, setActiveCategory] = useState<'road' | 'rail' | 'building' | 'landscape'>('road');
   const [showInfo, setShowInfo] = useState(false);
   const [showGridLines, setShowGridLines] = useState(true);
   const [showSidebar, setShowSidebar] = useState(true);
-  const [library, setLibrary] = useState<{ id: string; name: string; data: GridData }[]>([]);
+  const [library, setLibrary] = useState<{ id: string; name: string; data: LayoutSnapshot | GridData }[]>([]);
   const [newLayoutName, setNewLayoutName] = useState('');
   const [lastSavedGrid, setLastSavedGrid] = useState<GridData>({});
   const [mousePos, setMousePos] = useState<Point>({ x: 0, y: 0 });
@@ -2884,14 +5206,22 @@ export default function App() {
   const [showSaveConfirm, setShowSaveConfirm] = useState(false);
   const [showLoadConfirm, setShowLoadConfirm] = useState(false);
   const [showDeleteLayoutConfirm, setShowDeleteLayoutConfirm] = useState<{ id: string; name: string } | null>(null);
-  const [pendingLayout, setPendingLayout] = useState<GridData | null>(null);
+  const [pendingLayout, setPendingLayout] = useState<LayoutSnapshot | null>(null);
   const [pastePreviewPos, setPastePreviewPos] = useState<Point | null>(null);
   const [vehicles, _setVehicles] = useState<Record<string, Vehicle>>({});
+  const vehiclesRef = useRef<Record<string, Vehicle>>({});
+  const lastSyncedVehicles = useRef<Record<string, Vehicle>>({});
   const setVehicles = useCallback((next: Record<string, Vehicle> | ((prev: Record<string, Vehicle>) => Record<string, Vehicle>)) => {
     if (typeof next === 'function') {
-      _setVehicles(prev => normalizeVehicles(next(prev)));
+      _setVehicles(prev => {
+        const normalized = normalizeVehicles(next(prev));
+        vehiclesRef.current = normalized;
+        return normalized;
+      });
     } else {
-      _setVehicles(normalizeVehicles(next));
+      const normalized = normalizeVehicles(next);
+      vehiclesRef.current = normalized;
+      _setVehicles(normalized);
     }
   }, []);
   const [selectedVehicles, setSelectedVehicles] = useState<Set<string>>(new Set());
@@ -2899,8 +5229,18 @@ export default function App() {
   const [showCarsPanel, setShowCarsPanel] = useState(false);
   const [showSemiTrailerPanel, setShowSemiTrailerPanel] = useState(false);
   const [showTrainPanel, setShowTrainPanel] = useState(false);
+  const [showServicePanel, setShowServicePanel] = useState(false);
   const addCarsCountRef = useRef<HTMLInputElement>(null);
   const [userColor, setUserColor] = useState<string>('#ef4444');
+  const userRef = useRef<{ uid: string } | null>(null);
+  const userColorRef = useRef<string>('#ef4444');
+  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
+  const remoteCursorsRef = useRef<Map<string, RemoteCursor>>(new Map());
+  const bufferedKeysRef = useRef<Set<string>>(new Set());
+  const [hasBufferedEdits, setHasBufferedEdits] = useState(false);
+  const gridSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cursorEmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localCursorGridRef = useRef<{ gridX: number; gridY: number }>({ gridX: 0, gridY: 0 });
 
   const [simulations, setSimulations] = useState<any[]>([]);
   const [libraryTab, setLibraryTab] = useState<'layouts' | 'simulations'>('layouts');
@@ -2916,22 +5256,47 @@ export default function App() {
     showInventoryLabels: true,
     showCargoLabels: true,
     economyPaused: false,
+    people: {},
+    families: {},
+    peoplePaused: false,
   });
-  const localEconomyRef = useRef<EconomyState>({ itemDefs: [], buildings: {}, parkedTrailers: {}, showInventoryLabels: true, showCargoLabels: true, economyPaused: false });
+  const localEconomyRef = useRef<EconomyState>({
+    itemDefs: [],
+    buildings: {},
+    parkedTrailers: {},
+    showInventoryLabels: true,
+    showCargoLabels: true,
+    economyPaused: false,
+    people: {},
+    families: {},
+    peoplePaused: false,
+  });
   const economyTimerSyncRef = useRef(Date.now());
   const [cycleUiTick, setCycleUiTick] = useState(0);
-  const lastSyncedEconomy = useRef<EconomyState>({ itemDefs: [], buildings: {}, parkedTrailers: {}, showInventoryLabels: true, showCargoLabels: true, economyPaused: false });
+  const lastSyncedEconomy = useRef<EconomyState>({
+    itemDefs: [],
+    buildings: {},
+    parkedTrailers: {},
+    showInventoryLabels: true,
+    showCargoLabels: true,
+    economyPaused: false,
+    people: {},
+    families: {},
+    peoplePaused: false,
+  });
   const [showLogistics, setShowLogistics] = useState(false);
   const [newItemName, setNewItemName] = useState('');
   const [newItemEmoji, setNewItemEmoji] = useState('📦');
   const [editingItemEmoji, setEditingItemEmoji] = useState<string | null>(null);
   const [showPlantGrowth, setShowPlantGrowth] = useState(false);
 
-  const getCycleRemainingForBuilding = useCallback((cfg: BuildingConfig) => {
+  const getCycleRemainingForBuilding = useCallback((cfg: BuildingConfig, buildingKey?: string) => {
     void cycleUiTick;
     const elapsed = economy.economyPaused ? 0 : (Date.now() - economyTimerSyncRef.current) / 1000;
-    return getRecipeCycleRemaining(cfg, economy.economyPaused, elapsed);
-  }, [cycleUiTick, economy.economyPaused]);
+    const key = buildingKey || cfg.anchorKey;
+    const staffed = isStaffedForProduction(cfg, key, economy.people);
+    return getRecipeCycleRemaining(cfg, economy.economyPaused, elapsed, staffed);
+  }, [cycleUiTick, economy.economyPaused, economy.people]);
 
   useEffect(() => {
     const hasActiveRecipe = Object.values(economy.buildings).some(b => isRecipeBuilding(b));
@@ -2940,12 +5305,63 @@ export default function App() {
     return () => clearInterval(iv);
   }, [economy.buildings, economy.economyPaused]);
   const [inspectBuildingKey, setInspectBuildingKey] = useState<string | null>(null);
+  /** When set, show home people/family inspector for this house grid key */
+  const [inspectHomeKey, setInspectHomeKey] = useState<string | null>(null);
   const [inspectTrailerRef, setInspectTrailerRef] = useState<TrailerRef | null>(null);
   const [inspectRailcarRef, setInspectRailcarRef] = useState<RailcarRef | null>(null);
   const [pendingRouteVehicleId, setPendingRouteVehicleId] = useState<string | null>(null);
+  /** When true, next house click assigns homeKey for selected cars */
+  const [pendingHomeAssign, setPendingHomeAssign] = useState(false);
+  /** When true, next tree click starts a fire on that tile */
+  const [pendingFireStart, setPendingFireStart] = useState(false);
+  /** When true, next building click assigns selected people as employees */
+  const [pendingEmployeeAssign, setPendingEmployeeAssign] = useState(false);
+  /** Tick for burning tree animation re-render */
+  const [burnUiTick, setBurnUiTick] = useState(0);
+  const [showPeoplePanel, setShowPeoplePanel] = useState(false);
+  const [selectedPersonIds, setSelectedPersonIds] = useState<Set<string>>(new Set());
+  const [peopleFilter, setPeopleFilter] = useState('');
+  /** People panel create/edit form */
+  const [peopleFormMode, setPeopleFormMode] = useState<'closed' | 'create' | 'edit'>('closed');
+  const [peopleForm, setPeopleForm] = useState({
+    firstName: '',
+    lastName: '',
+    sex: 'm' as 'm' | 'f',
+    ageYears: 30,
+    homeKey: '',
+    workplaceKey: '',
+    money: 50,
+    health: 'healthy' as Person['health'],
+  });
+  const [traffic, setTraffic] = useState<TrafficState>(DEFAULT_TRAFFIC_STATE);
+  const localTrafficRef = useRef<TrafficState>(DEFAULT_TRAFFIC_STATE);
+  const [showTrafficPanel, setShowTrafficPanel] = useState(false);
+  const [trafficTool, setTrafficTool] = useState<TrafficTool>(null);
+  const [selectedTrafficIds, setSelectedTrafficIds] = useState<Set<string>>(new Set());
+  const [hoveredGridKey, setHoveredGridKey] = useState<string | null>(null);
   const roomCodeRef = useRef<string | null>(null);
+  const [isSimLeader, setIsSimLeader] = useState(false);
+  const isSimLeaderRef = useRef(false);
+  const pointerDownRef = useRef<{ x: number; y: number } | null>(null);
+  const didDragPointerRef = useRef(false);
+
+  const selectPaletteTile = useCallback((type: TileType) => {
+    setSelectedTile(type);
+    setIsPlacingVehicles(false);
+    setPendingRouteVehicleId(null);
+    setIsPasting(false);
+    setTrafficTool(null);
+  }, []);
 
   const [roomCode, setRoomCode] = useState<string | null>(null);
+
+  const emitTraffic = useCallback((next: TrafficState) => {
+    const normalized = normalizeTraffic(next);
+    setTraffic(normalized);
+    localTrafficRef.current = normalized;
+    const rc = roomCodeRef.current;
+    if (rc) socket.emit('update-traffic', { roomCode: rc, traffic: normalized });
+  }, []);
   const [tempRoomCode, setTempRoomCode] = useState('');
   const lastForceReloadRef = useRef<number>(0);
 
@@ -3138,6 +5554,7 @@ export default function App() {
       
       socket.on('available-rooms', handleAvailableRooms);
       return () => {
+        socket.emit('leave-room', 'lobby');
         socket.off('available-rooms', handleAvailableRooms);
       };
     }
@@ -3168,32 +5585,111 @@ export default function App() {
       localStorage.setItem('gridcity_uid', uid);
     }
     setUser({ uid });
+    userRef.current = { uid };
     
     // Assign a random color
     const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
     setUserColor(randomColor);
+    userColorRef.current = randomColor;
   }, []);
 
   useEffect(() => {
     roomCodeRef.current = roomCode;
   }, [roomCode]);
 
+  const resetTrafficState = useCallback(() => {
+    setTraffic(DEFAULT_TRAFFIC_STATE);
+    localTrafficRef.current = DEFAULT_TRAFFIC_STATE;
+    setSelectedTrafficIds(new Set());
+    setTrafficTool(null);
+  }, []);
+
+  const updateBufferedState = useCallback(() => {
+    setHasBufferedEdits(bufferedKeysRef.current.size > 0);
+  }, []);
+
+  const flushGridSync = useCallback(() => {
+    const rc = roomCodeRef.current;
+    if (!rc) return;
+
+    const updates = diffGrid(localGridRef.current, lastSyncedGrid.current);
+    if (Object.keys(updates).length === 0) return;
+
+    socket.emit('update-grid', { roomCode: rc, updates });
+  }, []);
+
+  const scheduleGridSync = useCallback(() => {
+    if (gridSyncTimerRef.current) clearTimeout(gridSyncTimerRef.current);
+    gridSyncTimerRef.current = setTimeout(() => {
+      gridSyncTimerRef.current = null;
+      flushGridSync();
+    }, 32);
+  }, [flushGridSync]);
+
+  const emitCursorPosition = useCallback((gridX: number, gridY: number, isBuffered: boolean) => {
+    const rc = roomCodeRef.current;
+    const uid = userRef.current?.uid;
+    if (!rc || !uid) return;
+
+    socket.emit('cursor-move', {
+      roomCode: rc,
+      gridX,
+      gridY,
+      userId: uid,
+      userColor: userColorRef.current,
+      isBuffered,
+    });
+  }, []);
+
+  const scheduleCursorEmit = useCallback((gridX: number, gridY: number, isBuffered: boolean) => {
+    localCursorGridRef.current = { gridX, gridY };
+    if (cursorEmitTimerRef.current) return;
+    cursorEmitTimerRef.current = setTimeout(() => {
+      cursorEmitTimerRef.current = null;
+      const { gridX: gx, gridY: gy } = localCursorGridRef.current;
+      emitCursorPosition(gx, gy, isBuffered);
+    }, 50);
+  }, [emitCursorPosition]);
+
   // Sync grid from Socket.io
   useEffect(() => {
-    if (!roomCode) return;
-    
+    if (!roomCode) {
+      resetTrafficState();
+      return;
+    }
+
+    resetTrafficState();
+    bufferedKeysRef.current.clear();
+    updateBufferedState();
+    remoteCursorsRef.current.clear();
+    setRemoteCursors([]);
     socket.emit('join-room', roomCode);
 
+    const uid = userRef.current?.uid;
+    if (uid) {
+      socket.emit('presence-hello', {
+        roomCode,
+        userId: uid,
+        userColor: userColorRef.current,
+      });
+    }
+
     const handleWorldState = (data: any) => {
+      if (data.roomCode && data.roomCode !== roomCodeRef.current) return;
       if (data.grid) {
         const clippedGrid = clipGridDataToCanvas(data.grid);
         lastSyncedGrid.current = clippedGrid;
         gridRef.current = clippedGrid;
+        bufferedKeysRef.current.clear();
+        updateBufferedState();
         setGrid(clippedGrid);
       }
       if (data.vehicles) {
-        setVehicles(data.vehicles);
+        const normalizedVehicles = normalizeVehicles(data.vehicles);
+        lastSyncedVehicles.current = normalizedVehicles;
+        vehiclesRef.current = normalizedVehicles;
+        setVehicles(normalizedVehicles);
       }
       if (data.economy) {
         const loaded = data.economy || {};
@@ -3202,82 +5698,203 @@ export default function App() {
         setEconomy(safeEconomy);
         localEconomyRef.current = safeEconomy;
       }
+      const safeTraffic = normalizeTraffic(data.traffic ?? null);
+      setTraffic(safeTraffic);
+      localTrafficRef.current = safeTraffic;
     };
 
     const handleGridUpdated = (updates: Record<string, any>) => {
       const currentGrid = localGridRef.current;
       const newGrid = { ...currentGrid };
-      
+      let changed = false;
+
       Object.entries(updates).forEach(([key, val]) => {
+        const pendingLocal =
+          JSON.stringify(currentGrid[key]) !== JSON.stringify(lastSyncedGrid.current[key]);
+        if (bufferedKeysRef.current.has(key) || pendingLocal) return;
+
         const [x, y] = key.split(',').map(Number);
         if (!isWithinGridCanvas(x, y)) {
-          delete newGrid[key];
+          if (newGrid[key] !== undefined) {
+            delete newGrid[key];
+            changed = true;
+          }
           return;
         }
         if (val === null || val === undefined) {
-          delete newGrid[key];
+          if (newGrid[key] !== undefined) {
+            delete newGrid[key];
+            changed = true;
+          }
         } else {
           newGrid[key] = val;
+          changed = true;
         }
       });
 
-      if (JSON.stringify(newGrid) !== JSON.stringify(currentGrid)) {
-        setGrid(newGrid);
-        lastSyncedGrid.current = newGrid;
+      lastSyncedGrid.current = mergeAcceptedIntoBaseline(lastSyncedGrid.current, updates);
+      if (changed) setGrid(newGrid);
+    };
+
+    const handleGridUpdateAck = ({ accepted, rejected }: { accepted: Record<string, any>; rejected: string[] }) => {
+      lastSyncedGrid.current = mergeAcceptedIntoBaseline(lastSyncedGrid.current, accepted);
+
+      for (const key of Object.keys(accepted)) {
+        bufferedKeysRef.current.delete(key);
+      }
+      for (const key of rejected ?? []) {
+        bufferedKeysRef.current.add(key);
+      }
+      updateBufferedState();
+
+      if ((rejected?.length ?? 0) > 0) {
+        setTimeout(() => scheduleGridSync(), CELL_LOCK_RETRY_MS);
       }
     };
 
-    const handleVehiclesUpdated = (newVehicles: any) => {
-      setVehicles(newVehicles);
+    const handlePresenceJoined = ({ socketId, userId, userColor: color }: { socketId: string; userId: string; userColor: string }) => {
+      if (socketId === socket.id) return;
+      const existing = remoteCursorsRef.current.get(socketId);
+      remoteCursorsRef.current.set(socketId, {
+        socketId,
+        userId,
+        userColor: color,
+        gridX: existing?.gridX ?? 0,
+        gridY: existing?.gridY ?? 0,
+        isBuffered: existing?.isBuffered ?? false,
+        lastSeen: Date.now(),
+      });
+      setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
     };
 
-    const handleEconomyUpdated = (newEconomy: any) => {
-      setEconomy(newEconomy);
-      lastSyncedEconomy.current = newEconomy;
-      localEconomyRef.current = newEconomy;
+    const handlePresenceLeft = ({ socketId }: { socketId: string }) => {
+      remoteCursorsRef.current.delete(socketId);
+      setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
+    };
+
+    const handleCursorMoved = (payload: {
+      socketId: string;
+      gridX: number;
+      gridY: number;
+      userId: string;
+      userColor: string;
+      isBuffered: boolean;
+    }) => {
+      if (payload.socketId === socket.id) return;
+      remoteCursorsRef.current.set(payload.socketId, {
+        ...payload,
+        lastSeen: Date.now(),
+      });
+      setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
+    };
+
+    const handleVehiclesUpdated = (payload: any) => {
+      const eventRoom = typeof payload?.roomCode === 'string' ? payload.roomCode : null;
+      const newVehicles = payload?.vehicles ?? payload;
+      if (eventRoom && eventRoom !== roomCodeRef.current) return;
+      const normalized = normalizeVehicles(newVehicles);
+      lastSyncedVehicles.current = normalized;
+      vehiclesRef.current = normalized;
+      setVehicles(normalized);
+    };
+
+    const handleEconomyUpdated = (payload: any) => {
+      const eventRoom = typeof payload?.roomCode === 'string' ? payload.roomCode : null;
+      const newEconomy = payload?.economy ?? payload;
+      if (eventRoom && eventRoom !== roomCodeRef.current) return;
+      const safeEconomy = normalizeEconomy(newEconomy || {});
+      setEconomy(safeEconomy);
+      lastSyncedEconomy.current = safeEconomy;
+      localEconomyRef.current = safeEconomy;
+    };
+
+    const handleRoomSimRole = ({ roomCode: eventRoom, simLeaderId }: { roomCode: string; simLeaderId: string }) => {
+      if (eventRoom !== roomCodeRef.current) return;
+      const leader = simLeaderId === socket.id;
+      isSimLeaderRef.current = leader;
+      setIsSimLeader(leader);
+      if (leader) {
+        lastTimeRef.current = 0;
+        lastSyncedVehicles.current = vehiclesRef.current;
+      }
+    };
+
+    const handleTrafficUpdated = (payload: any) => {
+      const eventRoom = typeof payload?.roomCode === 'string' ? payload.roomCode : null;
+      const newTraffic = payload?.traffic ?? payload;
+      if (eventRoom && eventRoom !== roomCodeRef.current) return;
+      const safe = normalizeTraffic(newTraffic);
+      setTraffic(safe);
+      localTrafficRef.current = safe;
     };
 
     socket.on('world-state', handleWorldState);
     socket.on('grid-updated', handleGridUpdated);
+    socket.on('grid-update-ack', handleGridUpdateAck);
+    socket.on('presence-joined', handlePresenceJoined);
+    socket.on('presence-left', handlePresenceLeft);
+    socket.on('cursor-moved', handleCursorMoved);
     socket.on('vehicles-updated', handleVehiclesUpdated);
     socket.on('economy-updated', handleEconomyUpdated);
+    socket.on('traffic-updated', handleTrafficUpdated);
+    socket.on('room-sim-role', handleRoomSimRole);
 
-    return () => {
-      socket.off('world-state', handleWorldState);
-      socket.off('grid-updated', handleGridUpdated);
-      socket.off('vehicles-updated', handleVehiclesUpdated);
-      socket.off('economy-updated', handleEconomyUpdated);
-    };
-  }, [roomCode]);
-
-  // Push local changes to backend
-  useEffect(() => {
-    if (!roomCode) return;
-
-    const flushGridUpdates = () => {
-      const updates: Record<string, any> = {};
-      let hasChanges = false;
-      const currentGrid = localGridRef.current;
-      const allKeys = new Set([...Object.keys(lastSyncedGrid.current), ...Object.keys(currentGrid)]);
-      
-      for (const key of allKeys) {
-        const currentVal = currentGrid[key];
-        const lastVal = lastSyncedGrid.current[key];
-        if (JSON.stringify(currentVal) !== JSON.stringify(lastVal)) {
-          updates[key] = currentVal !== undefined ? currentVal : null;
-          hasChanges = true;
+    const cursorStaleInterval = setInterval(() => {
+      const now = Date.now();
+      let pruned = false;
+      for (const [id, cursor] of remoteCursorsRef.current) {
+        if (now - cursor.lastSeen > 8000) {
+          remoteCursorsRef.current.delete(id);
+          pruned = true;
         }
       }
-      
-      if (!hasChanges) return;
+      if (pruned) setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
+    }, 4000);
 
-      lastSyncedGrid.current = currentGrid;
-      socket.emit('update-grid', { roomCode, updates });
+    return () => {
+      socket.emit('leave-room', roomCode);
+      isSimLeaderRef.current = false;
+      setIsSimLeader(false);
+      clearInterval(cursorStaleInterval);
+      socket.off('world-state', handleWorldState);
+      socket.off('grid-updated', handleGridUpdated);
+      socket.off('grid-update-ack', handleGridUpdateAck);
+      socket.off('presence-joined', handlePresenceJoined);
+      socket.off('presence-left', handlePresenceLeft);
+      socket.off('cursor-moved', handleCursorMoved);
+      socket.off('vehicles-updated', handleVehiclesUpdated);
+      socket.off('economy-updated', handleEconomyUpdated);
+      socket.off('traffic-updated', handleTrafficUpdated);
+      socket.off('room-sim-role', handleRoomSimRole);
     };
+  }, [roomCode, resetTrafficState, updateBufferedState, scheduleGridSync]);
 
-    const intervalId = setInterval(flushGridUpdates, 1000);
-    return () => clearInterval(intervalId);
-  }, [roomCode]);
+  // Push local grid changes ASAP (debounced ~32ms)
+  useEffect(() => {
+    if (!roomCode) return;
+    scheduleGridSync();
+  }, [grid, roomCode, scheduleGridSync]);
+
+  // Retry buffered edits while cell locks may still be held
+  useEffect(() => {
+    if (!roomCode || !hasBufferedEdits) return;
+    const retryId = setInterval(() => scheduleGridSync(), 300);
+    return () => clearInterval(retryId);
+  }, [roomCode, hasBufferedEdits, scheduleGridSync]);
+
+  // Broadcast buffered cursor state immediately when it changes
+  useEffect(() => {
+    if (!roomCode) return;
+    const { gridX, gridY } = localCursorGridRef.current;
+    emitCursorPosition(gridX, gridY, hasBufferedEdits);
+  }, [roomCode, hasBufferedEdits, emitCursorPosition]);
+
+  useEffect(() => {
+    if (selectedVehicles.size === 0) {
+      setIsPlacingVehicles(false);
+      setPendingRouteVehicleId(null);
+    }
+  }, [selectedVehicles]);
 
   const createRoom = async () => {
     const w1 = WORDS[Math.floor(Math.random() * WORDS.length)];
@@ -3293,10 +5910,32 @@ export default function App() {
     }
   };
 
+  /** Merge React economy state with the live ref so inventory is never missed on save. */
+  const getLiveEconomy = useCallback((): EconomyState => {
+    const fromState = economy;
+    const fromRef = localEconomyRef.current;
+    const mergedBuildings: Record<string, BuildingConfig> = { ...(fromState.buildings || {}) };
+    Object.entries(fromRef.buildings || {}).forEach(([k, cfg]) => {
+      const preferred = preferBuildingConfig(mergedBuildings[k], cfg as BuildingConfig, k);
+      if (preferred) mergedBuildings[k] = preferred;
+    });
+    const itemDefsById = new Map<string, ItemDef>();
+    [...(fromState.itemDefs || []), ...(fromRef.itemDefs || [])].forEach(d => {
+      if (d?.id) itemDefsById.set(d.id, d);
+    });
+    return {
+      ...fromState,
+      ...fromRef,
+      buildings: mergedBuildings,
+      itemDefs: Array.from(itemDefsById.values()),
+    };
+  }, [economy]);
+
   const saveToLibrary = async (forceWholeGrid = false) => {
     if (!newLayoutName.trim()) return;
 
-    let dataToSave: GridData = {};
+    let dataToSave: LayoutSnapshot | null = null;
+    const liveEconomy = getLiveEconomy();
 
     if (selectionStart && selectionEnd && !forceWholeGrid) {
       const x1 = Math.min(selectionStart.x, selectionEnd.x);
@@ -3304,20 +5943,12 @@ export default function App() {
       const x2 = Math.max(selectionStart.x, selectionEnd.x);
       const y2 = Math.max(selectionStart.y, selectionEnd.y);
 
-      for (let x = x1; x <= x2; x++) {
-        for (let y = y1; y <= y2; y++) {
-          const key = `${x},${y}`;
-          const tiles = getTile(x, y);
-          if (tiles) {
-            dataToSave[`${x - x1},${y - y1}`] = [...tiles];
-          }
-        }
-      }
+      dataToSave = captureLayoutSnapshot(gridRef.current, liveEconomy, { x1, y1, x2, y2 });
     } else if (!forceWholeGrid && Object.keys(grid).length > 0) {
       setShowSaveConfirm(true);
       return;
     } else {
-      dataToSave = grid;
+      dataToSave = captureLayoutSnapshot(gridRef.current, liveEconomy, null);
     }
 
     try {
@@ -3354,11 +5985,15 @@ export default function App() {
   };
 
   const loadSimulation = (sim: any) => {
-    setGrid(sim.data.grid || {});
+    const nextGrid = clipGridDataToCanvas(sim.data.grid || {});
+    setGrid(nextGrid);
     setVehicles(sim.data.vehicles || {});
     setSelectedVehicles(new Set());
+    bufferedKeysRef.current.clear();
+    updateBufferedState();
     if (roomCode) {
-      socket.emit('update-grid', { roomCode, updates: sim.data.grid || {} });
+      lastSyncedGrid.current = nextGrid;
+      socket.emit('update-grid', { roomCode, updates: nextGrid });
       socket.emit('update-vehicles', { roomCode, vehicles: sim.data.vehicles || {} });
     }
   };
@@ -3381,8 +6016,11 @@ export default function App() {
           (tiles as GridTile[]).some(t => {
             if (t.type === 'rail-road-crossing') return true;
             if (vType === 'train') return t.type.startsWith('rail') || t.type.includes('trestle');
-            if (vType === 'semi') return t.type.startsWith('road') || t.type === 'parking-2x4' || t.type === 'parking-4x4';
-            return t.type.startsWith('road') || t.type.startsWith('parking-');
+            if (vType === 'semi') {
+              return t.type.startsWith('road') || t.type === 'parking-2x4' || t.type === 'parking-4x4' || isBuildingParkingBay(t);
+            }
+            if (vType === 'train') return t.type.startsWith('rail') || t.type.includes('trestle') || isBuildingParkingBay(t);
+            return t.type.startsWith('road') || t.type.startsWith('parking-') || isBuildingParkingBay(t);
           })
         );
         if (roadTiles.length === 0) return;
@@ -3400,6 +6038,9 @@ export default function App() {
         let heading = targetTile.rotation;
         if (targetTile.type === 'rail-road-crossing' && vType !== 'train') {
            heading = (heading + 90) % 360;
+        }
+        if (isBuildingParkingBay(targetTile)) {
+          heading = (targetTile.rotation + 180) % 360;
         }
 
         const is4Lane = targetTile.type.includes('4lane');
@@ -3421,16 +6062,18 @@ export default function App() {
     }
   };
 
-  const addRandomCars = (type: 'car' | 'train' | 'semi' = 'car') => {
+  const addRandomCars = (type: VehicleType = 'car') => {
     const count = parseInt(addCarsCountRef.current?.value || '1', 10);
     if (isNaN(count) || count <= 0) return;
 
+    const isService = isServiceVehicleType(type);
     const roadTiles = Object.entries(grid).filter(([key, tiles]) => 
       (tiles as GridTile[]).some(t => {
         if (t.type === 'rail-road-crossing') return true;
         if (type === 'train') return t.type.startsWith('rail') || t.type.includes('trestle');
-        if (type === 'semi') return t.type.startsWith('road') || t.type === 'parking-2x4' || t.type === 'parking-4x4';
-        return t.type.startsWith('road') || t.type.startsWith('parking-');
+        if (type === 'semi') return t.type.startsWith('road') || t.type === 'parking-2x4' || t.type === 'parking-4x4' || isBuildingParkingBay(t);
+        // cars + service vehicles: roads, parking lots, repair/hospital bays
+        return t.type.startsWith('road') || t.type.startsWith('parking-') || isBuildingParkingBay(t);
       })
     );
 
@@ -3442,7 +6085,10 @@ export default function App() {
     for(let i=0; i<count; i++) {
         const id = Math.random().toString(36).substring(2, 11);
         newIds.push(id);
-        const randomColor = '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0');
+        const serviceMeta = isService ? SERVICE_VEHICLE_META[type as ServiceVehicleType] : null;
+        const randomColor = serviceMeta
+          ? serviceMeta.color
+          : '#' + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0');
         
         let newX = 0, newY = 0, heading = 0, lane = 1, zIndex = 0;
         const randomRoad = roadTiles[Math.floor(Math.random() * roadTiles.length)];
@@ -3455,6 +6101,9 @@ export default function App() {
         heading = topTile.rotation;
         if (topTile.type === 'rail-road-crossing' && type !== 'train') {
            heading = (heading + 90) % 360; // Cars should go along the road axis
+        }
+        if (isBuildingParkingBay(topTile)) {
+          heading = (topTile.rotation + 180) % 360; // face into the building
         }
         lane = type === 'train' ? 0 : (is4Lane ? (Math.random() > 0.5 ? 1 : 2.5) * (Math.random() > 0.5 ? 1 : -1) : (Math.random() > 0.5 ? 1 : -1));
         zIndex = topTile.type.includes('bridge') || topTile.type.includes('trestle') ? 1 : 0;
@@ -3470,11 +6119,14 @@ export default function App() {
            color: randomColor,
            zIndex,
            isMoving: true,
-           speed: 1,
+           speed: isService ? 1.2 : 1,
            turnAroundAtDeadEnd: true,
-           randomTurning: true,
+           randomTurning: !isService,
            turnIntent: ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any,
            trailers: type === 'semi' ? 1 : 0,
+           maxPassengers: getMaxPassengers(type),
+           passengerIds: [],
+           ...(isService && hasEmergencyLights(type) ? { emergencyLightsOn: true } : {}),
         };
     }
     setVehicles(updatedVehicles);
@@ -3544,6 +6196,28 @@ export default function App() {
       if (roomCode) {
         socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
       }
+    }
+  };
+
+  /** Toggle emergency light bars on selected emergency vehicles (majority → opposite). */
+  const toggleSelectedEmergencyLights = (targetIds: Iterable<string> = selectedVehicles) => {
+    const ids = Array.from(targetIds).filter(id => hasEmergencyLights(vehicles[id]?.type));
+    if (ids.length === 0) return;
+    const updatedVehicles = { ...vehicles };
+    let onCount = 0;
+    ids.forEach(id => {
+      if (updatedVehicles[id]?.emergencyLightsOn !== false) onCount++;
+    });
+    // If majority are on, turn off; otherwise turn on
+    const newState = onCount < ids.length / 2;
+    ids.forEach(id => {
+      if (updatedVehicles[id]) {
+        updatedVehicles[id] = { ...updatedVehicles[id], emergencyLightsOn: newState };
+      }
+    });
+    setVehicles(updatedVehicles);
+    if (roomCode) {
+      socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
     }
   };
 
@@ -3625,7 +6299,96 @@ export default function App() {
       return;
     }
     setIsPlacingVehicles(false);
+    setPendingHomeAssign(false);
+    setPendingEmployeeAssign(false);
     setPendingRouteVehicleId(ids[0]);
+  };
+
+  const toggleHomeAssignMode = (targetIds: Iterable<string> = selectedVehicles) => {
+    const ids = Array.from(targetIds).filter(id => {
+      const t = vehicles[id]?.type || 'car';
+      return t !== 'train' && t !== 'semi';
+    });
+    if (ids.length === 0) return;
+    // If already assigning, cancel
+    if (pendingHomeAssign) {
+      setPendingHomeAssign(false);
+      return;
+    }
+    // If selection already has homes, allow re-assign; toggle mode on
+    setPendingRouteVehicleId(null);
+    setPendingEmployeeAssign(false);
+    setIsPlacingVehicles(false);
+    setSelectedTile(null);
+    setPendingHomeAssign(true);
+  };
+
+  const clearSelectedHomes = (targetIds: Iterable<string> = selectedVehicles) => {
+    const ids = Array.from(targetIds);
+    if (ids.length === 0) return;
+    const updatedVehicles = { ...vehicles };
+    let any = false;
+    ids.forEach(id => {
+      if (updatedVehicles[id]?.homeKey) {
+        const next = { ...updatedVehicles[id] };
+        delete next.homeKey;
+        delete next.nextHomeReturnAt;
+        updatedVehicles[id] = next;
+        any = true;
+      }
+    });
+    if (any) {
+      setVehicles(updatedVehicles);
+      if (roomCode) socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+    }
+    setPendingHomeAssign(false);
+  };
+
+  /** Assign each selected car to a random house on the map (unique when possible). */
+  const assignSelectedCarsToRandomHomes = (targetIds: Iterable<string> = selectedVehicles) => {
+    const ids = Array.from(targetIds).filter(id => {
+      const t = vehicles[id]?.type || 'car';
+      return t !== 'train' && t !== 'semi' && !!vehicles[id];
+    });
+    if (ids.length === 0) return;
+
+    const homeKeys: string[] = [];
+    const g = gridRef.current || grid;
+    Object.entries(g).forEach(([key, tiles]) => {
+      if (tiles?.some(t => t.type === 'building-home')) {
+        homeKeys.push(key);
+      }
+    });
+    if (homeKeys.length === 0) return;
+
+    // Shuffle a pool of homes; reuse shuffled list if more cars than houses
+    const shuffled = [...homeKeys];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+
+    const updatedVehicles = { ...vehicles };
+    const now = Date.now();
+    ids.forEach((id, index) => {
+      const v = updatedVehicles[id];
+      if (!v) return;
+      const homeKey =
+        index < shuffled.length
+          ? shuffled[index]
+          : homeKeys[Math.floor(Math.random() * homeKeys.length)];
+      updatedVehicles[id] = {
+        ...v,
+        homeKey,
+        nextHomeReturnAt: now + randomHomeTourDelayMs(),
+      };
+    });
+
+    setVehicles(updatedVehicles);
+    if (roomCode) {
+      socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+    }
+    setPendingHomeAssign(false);
   };
 
   const unparkSelectedVehicles = (targetIds: Iterable<string> = selectedVehicles) => {
@@ -3856,23 +6619,49 @@ export default function App() {
   const lastTimeRef = useRef<number>(0);
 
   const updateVehicleLoop = useCallback((time: number) => {
+    if (!roomCodeRef.current || !isSimLeaderRef.current) {
+      lastTimeRef.current = 0;
+      requestRef.current = requestAnimationFrame(updateVehicleLoop);
+      return;
+    }
     const currentGrid = gridRef.current || grid || {};
     if (lastTimeRef.current !== 0) {
       const deltaTime = time - lastTimeRef.current;
       
       setVehicles(prev => {
         let hasChanges = false;
-        let needsVehicleSync = false;
         const nextVehicles = { ...prev };
 
         for (const [uid, v] of Object.entries(prev)) {
           const vehicle = v as Vehicle;
+          const peopleMap = localEconomyRef.current.people || {};
+          const hasPeopleSim = Object.keys(peopleMap).length > 0;
+          // When people sim is active, vehicles need a driver to move
+          if (hasPeopleSim) {
+            const driverId = vehicle.driverId || getDriverId(peopleMap, vehicle.id);
+            if (!driverId) {
+              if (vehicle.isMoving) {
+                nextVehicles[uid] = { ...vehicle, isMoving: false, driverId: undefined };
+                hasChanges = true;
+              }
+              // Still allow parking timer / destination clear without moving
+              if (vehicle.parkingStopUntil && Date.now() >= vehicle.parkingStopUntil) {
+                const nv = { ...vehicle, isMoving: false };
+                delete nv.parkingStopUntil;
+                nextVehicles[uid] = nv;
+                hasChanges = true;
+              }
+              continue;
+            } else if (vehicle.driverId !== driverId) {
+              nextVehicles[uid] = { ...vehicle, driverId };
+              hasChanges = true;
+            }
+          }
 
           if (vehicle.destination && vehicle.x === vehicle.destination.x && vehicle.y === vehicle.destination.y) {
             const arrivalPatch = getDestinationArrivalPatch(vehicle, vehicle.x, vehicle.y);
             nextVehicles[uid] = { ...vehicle, ...arrivalPatch };
             hasChanges = true;
-            if (arrivalPatch.destination === null) needsVehicleSync = true;
             continue;
           }
 
@@ -3880,13 +6669,153 @@ export default function App() {
             if (Date.now() >= vehicle.parkingStopUntil) {
               const newVehicle = { ...vehicle };
               delete newVehicle.parkingStopUntil;
+              // Resume touring after home (or lot) parking
+              newVehicle.isMoving = true;
+              if (newVehicle.homeKey && !newVehicle.nextHomeReturnAt) {
+                newVehicle.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+              }
               nextVehicles[uid] = newVehicle;
               hasChanges = true;
             }
             continue;
           }
 
-          if (!vehicle.isMoving && !vehicle.stepForward && !vehicle.stepBackward) continue;
+          // Cars with an assigned home occasionally set destination back home
+          const vTypeForHome = vehicle.type || 'car';
+          const isCarLike =
+            vTypeForHome === 'car' || isServiceVehicleType(vTypeForHome);
+          if (
+            isCarLike &&
+            vehicle.homeKey &&
+            !vehicle.destination &&
+            vehicle.isMoving !== false
+          ) {
+            const now = Date.now();
+            if (!vehicle.nextHomeReturnAt) {
+              nextVehicles[uid] = {
+                ...vehicle,
+                nextHomeReturnAt: now + randomHomeTourDelayMs(),
+              };
+              hasChanges = true;
+              continue;
+            }
+            if (now >= vehicle.nextHomeReturnAt) {
+              const home = parseHomeKey(vehicle.homeKey);
+              if (home && currentGrid[vehicle.homeKey]) {
+                // Already sitting on home tile → park immediately
+                if (vehicle.x === home.x && vehicle.y === home.y) {
+                  nextVehicles[uid] = {
+                    ...vehicle,
+                    destination: null,
+                    isMoving: false,
+                    progress: 0.5,
+                    parkingStopUntil: now + HOME_PARK_MS,
+                    lastParkingKey: vehicle.homeKey,
+                    parkingStallIndex: 0,
+                    nextHomeReturnAt: now + HOME_PARK_MS + randomHomeTourDelayMs(),
+                  };
+                } else {
+                  nextVehicles[uid] = {
+                    ...vehicle,
+                    destination: home,
+                    isMoving: true,
+                    turnIntent: null,
+                    // next return scheduled after this home visit completes
+                    nextHomeReturnAt: now + HOME_TOUR_MAX_MS,
+                  };
+                }
+                hasChanges = true;
+                continue;
+              } else {
+                // Missing house — clear assignment schedule
+                nextVehicles[uid] = {
+                  ...vehicle,
+                  nextHomeReturnAt: now + randomHomeTourDelayMs(),
+                };
+                hasChanges = true;
+                continue;
+              }
+            }
+          }
+
+          const trafficState = localTrafficRef.current;
+          const vType = vehicle.type || 'car';
+
+          if (vehicle.trafficStopUntil && vType !== 'train') {
+            const key = `${vehicle.x},${vehicle.y}`;
+            const tiles = currentGrid[key];
+            const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
+            const conflict = roadTile
+              ? hasConflictingTraffic(vehicle, key, nextVehicles, trafficState, currentGrid)
+              : false;
+            if (Date.now() < vehicle.trafficStopUntil || conflict) {
+              if (vehicle.isMoving) {
+                nextVehicles[uid] = { ...vehicle, isMoving: false };
+                hasChanges = true;
+              }
+              continue;
+            }
+            const wasStopSign = vehicle.trafficStopReason === 'stop-sign';
+            const cleared = { ...vehicle };
+            delete cleared.trafficStopUntil;
+            delete cleared.trafficStopReason;
+            cleared.isMoving = true;
+            if (wasStopSign && roadTile) {
+              const sign = findStopSignForVehicle(
+                key, vehicle.heading, vehicle.lane, roadTile, trafficState
+              );
+              if (sign?.kind === 'stop-sign') {
+                cleared.satisfiedStopSignKey = `${key}:${sign.id}`;
+              }
+            }
+            nextVehicles[uid] = cleared;
+            hasChanges = true;
+            continue;
+          }
+
+          if (!vehicle.isMoving && !vehicle.stepForward && !vehicle.stepBackward) {
+            if (vehicle.trafficStopReason === 'stoplight' && vType !== 'train') {
+              const tiles = currentGrid[`${vehicle.x},${vehicle.y}`];
+              const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
+              if (roadTile && !shouldStopForLight(vehicle, trafficState)) {
+                const resumed = { ...vehicle, isMoving: true };
+                delete resumed.trafficStopReason;
+                nextVehicles[uid] = resumed;
+                hasChanges = true;
+              }
+            } else if (vehicle.trafficStopReason === 'vehicle') {
+              if (canResumeAfterVehicleStop(vehicle, nextVehicles, currentGrid)) {
+                const resumed = { ...vehicle, isMoving: true };
+                delete resumed.trafficStopReason;
+                nextVehicles[uid] = resumed;
+                hasChanges = true;
+              }
+            } else if (vehicle.trafficStopReason === 'stop-sign') {
+              const tiles = currentGrid[`${vehicle.x},${vehicle.y}`];
+              const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
+              if (roadTile) {
+                const signStop = shouldStopForSign(vehicle, roadTile, trafficState, nextVehicles, currentGrid);
+                if (!signStop.stop) {
+                  const resumed = { ...vehicle, isMoving: true };
+                  delete resumed.trafficStopUntil;
+                  delete resumed.trafficStopReason;
+                  const sign = findStopSignForVehicle(
+                    `${vehicle.x},${vehicle.y}`,
+                    vehicle.heading,
+                    vehicle.lane,
+                    roadTile,
+                    trafficState
+                  );
+                  if (sign?.kind === 'stop-sign') {
+                    resumed.satisfiedStopSignKey = `${vehicle.x},${vehicle.y}:${sign.id}`;
+                  }
+                  nextVehicles[uid] = resumed;
+                  hasChanges = true;
+                }
+              }
+            }
+            continue;
+          }
 
           let { x, y, heading, lane, progress, zIndex, turnIntent } = vehicle;
           
@@ -3902,20 +6831,44 @@ export default function App() {
             return (zIndex === 1 && isBridge) || (zIndex === 0 && !isBridge);
           });
           
-          if (currentTile && currentTile.type.startsWith('parking-')) {
+          const onBuildingBay = isBuildingParkingBay(currentTile);
+          const onHome = isHouseTile(currentTile);
+          const isOwnerHome = onHome && vehicle.homeKey === currentTileKey;
+          if (
+            currentTile &&
+            (currentTile.type.startsWith('parking-') ||
+              onBuildingBay ||
+              isOwnerHome ||
+              (onHome && vehicle.parkOnNextLot))
+          ) {
             const parkingLotId = currentTile.part === 'member' ? currentTile.anchorKey : currentTileKey;
             if (vehicle.lastParkingKey !== parkingLotId || vehicle.parkOnNextLot) {
               newParkingStopUntil = Date.now() + Math.floor(Math.random() * 4001) + 1000;
               newLastParkingKey = parkingLotId;
               newParkOnNextLot = false;
-              let maxStalls = 2;
-              if (currentTile.type === 'parking-4x4') {
-                const lx = currentTile.localX ?? 0;
-                if (lx >= 2) {
-                  maxStalls = 4;
+              if (onHome) {
+                // Owner driveway (or explicit park-at-house): always 10s with timer badge
+                newParkingStopUntil = Date.now() + HOME_PARK_MS;
+                newStallIndex = 0;
+                if (isOwnerHome) {
+                  newParkOnNextLot = false;
                 }
+              } else if (onBuildingBay) {
+                // One vehicle per bay (column); bay index = localX
+                newStallIndex = getBuildingParkingBayIndex(currentTile);
+                // Longer dwell so repairs/treatments can be started while parked
+                const dwellBase = isHospitalAmbulanceBay(currentTile) ? 20000 : 15000;
+                newParkingStopUntil = Date.now() + dwellBase + Math.floor(Math.random() * 10001);
+              } else {
+                let maxStalls = 2;
+                if (currentTile.type === 'parking-4x4') {
+                  const lx = currentTile.localX ?? 0;
+                  if (lx >= 2) {
+                    maxStalls = 4;
+                  }
+                }
+                newStallIndex = Math.floor(Math.random() * maxStalls);
               }
-              newStallIndex = Math.floor(Math.random() * maxStalls);
             }
           } else {
             newLastParkingKey = undefined;
@@ -3938,6 +6891,29 @@ export default function App() {
             continue;
           }
 
+          if (vType !== 'train' && currentTile && isRoadTile(currentTile.type)) {
+            if (shouldStopForLight(vehicle, trafficState)) {
+              nextVehicles[uid] = {
+                ...vehicle,
+                isMoving: false,
+                trafficStopReason: 'stoplight',
+              };
+              hasChanges = true;
+              continue;
+            }
+            const signStop = shouldStopForSign(vehicle, currentTile, trafficState, nextVehicles, currentGrid);
+            if (signStop.stop) {
+              nextVehicles[uid] = {
+                ...vehicle,
+                isMoving: false,
+                trafficStopUntil: signStop.minUntil,
+                trafficStopReason: 'stop-sign',
+              };
+              hasChanges = true;
+              continue;
+            }
+          }
+
           hasChanges = true;
 
           const speed = vehicle.speed || 1;
@@ -3950,8 +6926,23 @@ export default function App() {
           } else if (vehicle.stepBackward) {
             step = -0.1; // One step backward
           }
-          
-          progress += step;
+
+          let newProgress = progress + step;
+          if (step > 0 && (vehicle.isMoving || vehicle.stepForward)) {
+            newProgress = findMaxSafeProgress(vehicle, newProgress, nextVehicles, currentGrid);
+            if (vehicle.isMoving && newProgress <= progress + 1e-6) {
+              nextVehicles[uid] = {
+                ...vehicle,
+                isMoving: false,
+                trafficStopReason: 'vehicle',
+                progress,
+              };
+              hasChanges = true;
+              continue;
+            }
+          }
+
+          progress = newProgress;
 
           let newVehicleState = { ...vehicle, progress };
           
@@ -3983,8 +6974,8 @@ export default function App() {
                 let exitPort = otherPorts[0];
                 if (otherPorts.length > 1) {
                   const straightPort = (entryPort + 2) % 4;
-                  const leftPort = (entryPort + 3) % 4;
-                  const rightPort = (entryPort + 1) % 4;
+                  const leftPort = (entryPort + 1) % 4;
+                  const rightPort = (entryPort + 3) % 4;
 
                   if (vehicle.destination) {
                     const recExit = getRecommendedExit(x, y, heading, vehicle.destination, (vehicle.type || 'car') as any, currentGrid);
@@ -4011,13 +7002,22 @@ export default function App() {
               const nextTiles = currentGrid[nextKey];
               let validNextTiles = nextTiles.filter(t => {
                 const isCrossing = t.type === 'rail-road-crossing';
+                const isBay = isBuildingParkingBay(t);
+                const isHome = isHouseTile(t);
                 if (vehicle.type === 'train') {
-                  return t.type.startsWith('rail') || isCrossing;
+                  return t.type.startsWith('rail') || isCrossing || isBay;
                 } else if (vehicle.type === 'semi') {
                   const isBigParking = t.type === 'parking-2x4' || t.type === 'parking-4x4';
-                  return t.type.startsWith('road') || isBigParking || isCrossing;
+                  return t.type.startsWith('road') || isBigParking || isCrossing || isBay;
                 } else {
-                  return t.type.startsWith('road') || t.type.startsWith('parking-') || isCrossing;
+                  // Cars/service: roads, lots, bays, and houses (owner driveway)
+                  return (
+                    t.type.startsWith('road') ||
+                    t.type.startsWith('parking-') ||
+                    isCrossing ||
+                    isBay ||
+                    isHome
+                  );
                 }
               });
 
@@ -4060,9 +7060,7 @@ export default function App() {
                            lane: vehicle.type === 'train' ? 0 : 1,
                            ...getDestinationArrivalPatch(vehicle, nextX, nextY),
                          };
-                         if (vehicle.destination && nextX === vehicle.destination.x && nextY === vehicle.destination.y) {
-                           needsVehicleSync = true;
-                         }
+
                      }
                   } else {
                     newVehicleState = {
@@ -4076,9 +7074,6 @@ export default function App() {
                       lane: vehicle.type === 'train' ? 0 : isNext4Lane ? vehicle.lane : 1,
                       ...getDestinationArrivalPatch(vehicle, nextX, nextY),
                     };
-                    if (vehicle.destination && nextX === vehicle.destination.x && nextY === vehicle.destination.y) {
-                      needsVehicleSync = true;
-                    }
                   }
                   } else {
                     // Turn around at dead end (not connected port)
@@ -4112,13 +7107,7 @@ export default function App() {
             newVehicleState.progress = 0;
           }
 
-          nextVehicles[uid] = newVehicleState;
-        }
-
-        if (needsVehicleSync && roomCodeRef.current) {
-          queueMicrotask(() => {
-            socket.emit('update-vehicles', { roomCode: roomCodeRef.current, vehicles: nextVehicles });
-          });
+          nextVehicles[uid] = clearStopSignSatisfactionIfNeeded(vehicle, newVehicleState);
         }
 
         return hasChanges ? nextVehicles : prev;
@@ -4133,14 +7122,87 @@ export default function App() {
     return () => cancelAnimationFrame(requestRef.current);
   }, [updateVehicleLoop]);
 
+  // Sim leader broadcasts vehicle positions while they animate.
+  useEffect(() => {
+    if (!roomCode || !isSimLeader) return;
+    const iv = setInterval(() => {
+      const current = vehiclesRef.current;
+      if (JSON.stringify(current) === JSON.stringify(lastSyncedVehicles.current)) return;
+      lastSyncedVehicles.current = current;
+      socket.emit('update-vehicles', { roomCode, vehicles: current });
+    }, 150);
+    return () => clearInterval(iv);
+  }, [roomCode, isSimLeader]);
+
+  // People life simulation (age, work, shop, care, commute)
+  useEffect(() => {
+    if (!roomCode || !isSimLeader) return;
+    const iv = setInterval(() => {
+      const eco = localEconomyRef.current;
+      if (!eco || eco.peoplePaused) return;
+      if (!eco.people || Object.keys(eco.people).length === 0) return;
+      const { economy: nextEco, vehicles: nextVs } = tickPeopleSimulation(
+        eco,
+        vehiclesRef.current,
+        gridRef.current,
+        Date.now(),
+      );
+      setEconomy(nextEco);
+      setVehicles(nextVs);
+      if (roomCode) {
+        socket.emit('update-economy', { roomCode, economy: nextEco });
+        socket.emit('update-vehicles', { roomCode, vehicles: nextVs });
+      }
+    }, 2000);
+    return () => clearInterval(iv);
+  }, [roomCode, isSimLeader, setEconomy, setVehicles]);
+
+  // Burning tree animation frame + removal after 30s
+  useEffect(() => {
+    const hasBurning = Object.values(gridRef.current).some(tiles =>
+      tiles?.some(t => typeof t.burningUntil === 'number' && t.burningUntil > Date.now() - 1000)
+    );
+    if (!hasBurning) return;
+    const iv = setInterval(() => {
+      setBurnUiTick(t => t + 1);
+      const now = Date.now();
+      const currentGrid = gridRef.current;
+      let changed = false;
+      const newGrid: GridData = { ...currentGrid };
+      Object.entries(currentGrid).forEach(([key, tiles]) => {
+        if (!tiles?.length) return;
+        let cellChanged = false;
+        const nextTiles = tiles
+          .map(tile => {
+            if (typeof tile.burningUntil !== 'number') return tile;
+            if (tile.burningUntil > now) return tile;
+            // Burn finished — remove tree tile
+            cellChanged = true;
+            return null;
+          })
+          .filter((t): t is GridTile => t !== null);
+        if (cellChanged) {
+          if (nextTiles.length === 0) delete newGrid[key];
+          else newGrid[key] = nextTiles;
+          changed = true;
+        }
+      });
+      if (changed) {
+        setGrid(newGrid);
+      }
+    }, 100);
+    return () => clearInterval(iv);
+  }, [grid, setGrid]);
+
   // Economy simulation tick (simple rates + factory batches)
   useEffect(() => {
-    if (!roomCode) return;
+    if (!roomCode || !isSimLeader) return;
     const iv = setInterval(() => {
       const economy = localEconomyRef.current;
       if (!economy || economy.economyPaused) return;
       let changed = false;
       const nextB: Record<string, BuildingConfig> = { ...(economy.buildings || {}) };
+      const completedRepairs: Array<{ vehicleId: string; recipeId: string }> = [];
 
       Object.keys(nextB).forEach(ak => {
         const cfg = { ...nextB[ak] };
@@ -4154,7 +7216,8 @@ export default function App() {
           });
         }
         if ((cfg.role === 'factory' || cfg.role === 'lumbermill') && cfg.productionEnabled && cfg.cycleTimeSec && cfg.recipeInputs && cfg.recipeOutputs) {
-          if (hasRecipeInputs(cfg) && hasOutputCapacity(cfg)) {
+          const staffed = isStaffedForProduction(cfg, ak, economy.people);
+          if (staffed && hasRecipeInputs(cfg) && hasOutputCapacity(cfg)) {
             cfg.processAccum = (cfg.processAccum || 0) + dt;
             changed = true;
             const cycle = cfg.cycleTimeSec;
@@ -4166,6 +7229,44 @@ export default function App() {
             }
           }
         }
+        // Repair shop: advance in-progress repairs (parts already reserved at start)
+        if (cfg.role === 'repair-shop' && (cfg.activeRepairs || []).length > 0) {
+          const remaining: ActiveRepair[] = [];
+          (cfg.activeRepairs || []).forEach(job => {
+            const recipe = (cfg.repairRecipes || []).find(r => r.id === job.recipeId);
+            const cycle = recipe?.cycleTimeSec || 15;
+            const nextAccum = (job.processAccum || 0) + dt;
+            if (nextAccum >= cycle) {
+              completedRepairs.push({ vehicleId: job.vehicleId, recipeId: job.recipeId });
+              changed = true;
+            } else {
+              remaining.push({ ...job, processAccum: nextAccum });
+              if (nextAccum !== job.processAccum) changed = true;
+            }
+          });
+          cfg.activeRepairs = remaining;
+        }
+        // Hospital: advance patient treatments (supplies reserved at admit)
+        if (cfg.role === 'hospital' && (cfg.activePatients || []).length > 0) {
+          const remaining: ActivePatient[] = [];
+          let healed = 0;
+          (cfg.activePatients || []).forEach(patient => {
+            const illness = (cfg.illnessRecipes || []).find(r => r.id === patient.illnessId);
+            const stay = illness?.stayDurationSec || 20;
+            const nextAccum = (patient.processAccum || 0) + dt;
+            if (nextAccum >= stay) {
+              healed += 1;
+              changed = true;
+            } else {
+              remaining.push({ ...patient, processAccum: nextAccum });
+              if (nextAccum !== patient.processAccum) changed = true;
+            }
+          });
+          if (healed > 0) {
+            cfg.patientsHealed = (cfg.patientsHealed || 0) + healed;
+          }
+          cfg.activePatients = remaining;
+        }
         nextB[ak] = cfg;
       });
 
@@ -4174,13 +7275,54 @@ export default function App() {
         setEconomy(nextEco);
         if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
       }
+      if (completedRepairs.length > 0) {
+        setVehicles(prev => {
+          const next = { ...prev };
+          let vChanged = false;
+          completedRepairs.forEach(({ vehicleId, recipeId }) => {
+            const v = next[vehicleId];
+            if (!v) return;
+            next[vehicleId] = { ...v, lastRepairId: recipeId, lastRepairAt: Date.now() };
+            vChanged = true;
+          });
+          if (vChanged && roomCode) {
+            socket.emit('update-vehicles', { roomCode, vehicles: next });
+          }
+          return vChanged ? next : prev;
+        });
+      }
     }, 250);
     return () => clearInterval(iv);
-  }, [roomCode, setEconomy]);
+  }, [roomCode, isSimLeader, setEconomy]);
+
+  // Traffic light phase tick
+  useEffect(() => {
+    if (!roomCode || !isSimLeader) return;
+    const iv = setInterval(() => {
+      const current = localTrafficRef.current;
+      let changed = false;
+      const nextControls = { ...current.controls };
+      const now = Date.now();
+      for (const [id, ctrl] of Object.entries(nextControls)) {
+        const advanced = advanceLightPhase(ctrl, now);
+        if (advanced) {
+          nextControls[id] = advanced;
+          changed = true;
+        }
+      }
+      if (changed) {
+        const next = { ...current, controls: nextControls };
+        setTraffic(next);
+        localTrafficRef.current = next;
+        socket.emit('update-traffic', { roomCode, traffic: next });
+      }
+    }, 250);
+    return () => clearInterval(iv);
+  }, [roomCode, isSimLeader]);
 
   // Plant growth tick
   useEffect(() => {
-    if (!roomCode) return;
+    if (!roomCode || !isSimLeader) return;
     const iv = setInterval(() => {
       const settings = localEconomyRef.current.plantGrowth || DEFAULT_PLANT_GROWTH;
       if (settings.paused || settings.growthDurationSec <= 0) return;
@@ -4196,6 +7338,7 @@ export default function App() {
         const topIdx = tiles.length - 1;
         const tile = tiles[topIdx];
         if (tile.type !== 'tree-pine-seedling') return;
+        if (tile.burningUntil && tile.burningUntil > Date.now()) return;
 
         const progress = (tile.growthProgress ?? 0) + progressPerTick;
         const newTiles = [...tiles];
@@ -4213,7 +7356,7 @@ export default function App() {
       }
     }, 250);
     return () => clearInterval(iv);
-  }, [roomCode, setGrid]);
+  }, [roomCode, isSimLeader, setGrid]);
 
   const confirmDeleteFromLibrary = async () => {
     if (!showDeleteLayoutConfirm) return;
@@ -4280,10 +7423,54 @@ export default function App() {
     }
   };
 
-  const loadFromLibrary = (data: GridData) => {
-    setPendingLayout(data);
+  const loadFromLibrary = (data: LayoutSnapshot | GridData) => {
+    setPendingLayout(normalizeLayoutSnapshot(data));
     setShowLoadConfirm(true);
   };
+
+  /** Merge/restart layout buildings (and item defs) into economy and sync to room. */
+  const applyLayoutBuildings = useCallback((
+    buildings: Record<string, BuildingConfig>,
+    mode: 'replace' | 'merge',
+    itemDefs?: ItemDef[],
+  ) => {
+    if (Object.keys(buildings).length === 0 && mode === 'merge' && (!itemDefs || itemDefs.length === 0)) {
+      return;
+    }
+
+    // Apply synchronously so inventory/productionEnabled are visible immediately
+    // and not lost to a stale functional updater race with the economy tick.
+    const prev = localEconomyRef.current;
+    const nextBuildings: Record<string, BuildingConfig> =
+      mode === 'replace'
+        ? { ...buildings }
+        : { ...prev.buildings, ...buildings };
+
+    // Deep-clone each applied config so processAccum/inventory/production stay intact
+    Object.keys(buildings).forEach(k => {
+      nextBuildings[k] = cloneBuildingConfig(buildings[k], k);
+    });
+
+    let nextItemDefs = prev.itemDefs || [];
+    if (itemDefs && itemDefs.length > 0) {
+      const byId = new Map(nextItemDefs.map(d => [d.id, d]));
+      itemDefs.forEach(d => {
+        if (d?.id && !byId.has(d.id)) byId.set(d.id, d);
+      });
+      nextItemDefs = Array.from(byId.values());
+    }
+
+    const next = normalizeEconomy({
+      ...prev,
+      buildings: nextBuildings,
+      itemDefs: nextItemDefs,
+    });
+    localEconomyRef.current = next;
+    setEconomy(next);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: next });
+    }
+  }, [roomCode, setEconomy]);
 
   const addToHistory = useCallback((newGrid: GridData) => {
     setHistory(prev => {
@@ -4302,7 +7489,7 @@ export default function App() {
 
   const rotateClipboard = useCallback(() => {
     if (!clipboard) return;
-    setClipboard(rotateGridData(clipboard));
+    setClipboard(rotateLayoutSnapshot(clipboard));
   }, [clipboard]);
 
   const rotateSelection = useCallback(() => {
@@ -4312,38 +7499,42 @@ export default function App() {
     const x2 = Math.max(selectionStart.x, selectionEnd.x);
     const y2 = Math.max(selectionStart.y, selectionEnd.y);
 
-    const selectedData: GridData = {};
+    const snapshot = captureLayoutSnapshot(gridRef.current, getLiveEconomy(), { x1, y1, x2, y2 });
+    if (Object.keys(snapshot.grid).length === 0) return;
+
     const newGrid = { ...grid };
-    let hasTiles = false;
-    
     for (let x = x1; x <= x2; x++) {
       for (let y = y1; y <= y2; y++) {
-        const key = `${x},${y}`;
-        const tiles = getTile(x, y);
-        if (tiles) {
-          selectedData[`${x - x1},${y - y1}`] = [...tiles];
-          delete newGrid[key];
-          hasTiles = true;
-        }
+        delete newGrid[`${x},${y}`];
       }
     }
 
-    if (!hasTiles) return;
-
-    const rotated = rotateGridData(selectedData);
-    
-    (Object.entries(rotated) as [string, GridTile[]][]).forEach(([relKey, tiles]) => {
-      const [rx, ry] = relKey.split(',').map(Number);
-      newGrid[`${x1 + rx},${y1 + ry}`] = tiles;
-    });
+    const rotated = rotateLayoutSnapshot(snapshot);
+    const placed = materializeLayoutGrid(rotated, x1, y1);
+    Object.assign(newGrid, placed);
 
     setGrid(newGrid);
     addToHistory(newGrid);
+
+    // Move building configs to rotated anchor positions
+    const oldBuildingKeys = Object.keys(snapshot.buildings).map(rel => {
+      const p = parseCoordKey(rel)!;
+      return coordKey(p.x + x1, p.y + y1);
+    });
+    const newBuildings = materializeLayoutBuildings(rotated, x1, y1);
+    setEconomy(prev => {
+      const nextBuildings = { ...prev.buildings };
+      oldBuildingKeys.forEach(k => { delete nextBuildings[k]; });
+      Object.assign(nextBuildings, newBuildings);
+      const next = { ...prev, buildings: nextBuildings };
+      if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
+      return next;
+    });
     
     const width = x2 - x1;
     const height = y2 - y1;
     setSelectionEnd({ x: x1 + height, y: y1 + width });
-  }, [grid, selectionStart, selectionEnd]);
+  }, [grid, selectionStart, selectionEnd, roomCode, setEconomy, getLiveEconomy]);
 
   const undo = useCallback(() => {
     if (historyIndex > 0) {
@@ -4368,20 +7559,10 @@ export default function App() {
     const x2 = Math.max(selectionStart.x, selectionEnd.x);
     const y2 = Math.max(selectionStart.y, selectionEnd.y);
 
-    const newClipboard: GridData = {};
-    for (let x = x1; x <= x2; x++) {
-      for (let y = y1; y <= y2; y++) {
-        const key = `${x},${y}`;
-        const tiles = getTile(x, y);
-        if (tiles) {
-          newClipboard[`${x - x1},${y - y1}`] = [...tiles];
-        }
-      }
-    }
-    setClipboard(newClipboard);
+    setClipboard(captureLayoutSnapshot(gridRef.current, getLiveEconomy(), { x1, y1, x2, y2 }));
     setSelectionStart(null);
     setSelectionEnd(null);
-  }, [grid, selectionStart, selectionEnd]);
+  }, [selectionStart, selectionEnd, getLiveEconomy]);
 
   const cutSelection = useCallback(() => {
     if (!selectionStart || !selectionEnd) return;
@@ -4440,87 +7621,101 @@ export default function App() {
       
       if (e.repeat) return;
 
-      // Vehicle controls
+      // Vehicle controls (F/B step, L/R turn at intersections, arrows lane/speed)
+      // R rotates the palette tile while a tile is selected for placement.
+      const inTilePlacementMode = selectedTile !== null;
       if (selectedVehicles.size > 0) {
         const key = e.key.toLowerCase();
-        let anyUpdated = false;
-        const updatedVehicles = { ...vehicles };
+        const isArrowKey = e.key.startsWith('Arrow');
+        const isVehicleControlKey =
+          key === 'g' || key === 's' || key === 'f' || key === 'b' ||
+          key === 'l' || (key === 'r' && !inTilePlacementMode) || isArrowKey;
 
-        selectedVehicles.forEach(id => {
-          const myVehicle = updatedVehicles[id];
-          if (!myVehicle) return;
-          let updated = false;
-          let newVehicle = { ...myVehicle };
+        if (isVehicleControlKey) {
+          if (isArrowKey) e.preventDefault();
 
-          if (key === 'g') {
-            newVehicle.isMoving = !newVehicle.isMoving;
-            updated = true;
-          } else if (key === 's') {
-            if (newVehicle.isMoving !== false) {
+          let anyUpdated = false;
+          const updatedVehicles = { ...vehicles };
+
+          selectedVehicles.forEach(id => {
+            const myVehicle = updatedVehicles[id];
+            if (!myVehicle) return;
+            let updated = false;
+            let newVehicle = { ...myVehicle };
+
+            if (key === 'g') {
+              newVehicle.isMoving = !newVehicle.isMoving;
+              updated = true;
+            } else if (key === 's') {
+              if (newVehicle.isMoving !== false) {
+                newVehicle.isMoving = false;
+                updated = true;
+              }
+            } else if (key === 'f') {
               newVehicle.isMoving = false;
+              newVehicle.stepForward = true;
               updated = true;
-            }
-          } else if (key === 'f') {
-            newVehicle.isMoving = false;
-            newVehicle.stepForward = true;
-            updated = true;
-          } else if (key === 'b') {
-            newVehicle.isMoving = false;
-            newVehicle.stepBackward = true;
-            updated = true;
-          } else if (e.key === 'ArrowUp') {
-            const newSpeed = Math.min((newVehicle.speed || 1) + 0.5, 5);
-            if (newVehicle.speed !== newSpeed) {
-              newVehicle.speed = newSpeed;
+            } else if (key === 'b') {
+              newVehicle.isMoving = false;
+              newVehicle.stepBackward = true;
               updated = true;
-            }
-          } else if (e.key === 'ArrowDown') {
-            const newSpeed = Math.max((newVehicle.speed || 1) - 0.5, 0.5);
-            if (newVehicle.speed !== newSpeed) {
-              newVehicle.speed = newSpeed;
-              updated = true;
-            }
-          } else if (key === 'l' || key === 'r') {
-            if ((newVehicle.type || 'car') === 'train') return;
+            } else if (e.key === 'ArrowUp') {
+              const newSpeed = Math.min((newVehicle.speed || 1) + 0.5, 5);
+              if (newVehicle.speed !== newSpeed) {
+                newVehicle.speed = newSpeed;
+                updated = true;
+              }
+            } else if (e.key === 'ArrowDown') {
+              const newSpeed = Math.max((newVehicle.speed || 1) - 0.5, 0.5);
+              if (newVehicle.speed !== newSpeed) {
+                newVehicle.speed = newSpeed;
+                updated = true;
+              }
+            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+              if ((newVehicle.type || 'car') === 'train') return;
 
-            // Use gridRef for latest grid to avoid stale closure (grid not in effect deps)
-            const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
-            const currentTile = currentTiles?.find(t => {
-              const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
-              return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
-            });
+              const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
+              const currentTile = currentTiles?.find(t => {
+                const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
+                return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
+              });
 
-            if (!currentTile?.type.startsWith('road')) return;
+              if (!currentTile?.type.startsWith('road')) return;
 
-            const isIntersection = isIntersectionTile(currentTile.type);
-            const is4Lane = currentTile.type.includes('4lane');
+              const is4Lane = currentTile.type.includes('4lane');
+              const nextLane = e.key === 'ArrowRight'
+                ? shiftLaneRight(newVehicle.lane, is4Lane)
+                : shiftLaneLeft(newVehicle.lane, is4Lane);
+              if (nextLane !== null && nextLane !== newVehicle.lane) {
+                newVehicle.lane = nextLane;
+                updated = true;
+              }
+            } else if (key === 'l' || key === 'r') {
+              if ((newVehicle.type || 'car') === 'train') return;
 
-            if (isIntersection) {
+              const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
+              const currentTile = currentTiles?.find(t => {
+                const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
+                return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
+              });
+
+              if (!currentTile?.type.startsWith('road')) return;
+              if (!isIntersectionTile(currentTile.type)) return;
+
               const intent = key === 'r' ? 'right' : 'left';
               if (newVehicle.turnIntent !== intent) {
                 newVehicle.turnIntent = intent;
                 updated = true;
               }
-            } else {
-              const nextLane = key === 'r'
-                ? shiftLaneRight(newVehicle.lane, is4Lane)
-                : shiftLaneLeft(newVehicle.lane, is4Lane);
-              if (nextLane !== null && nextLane !== newVehicle.lane) {
-                newVehicle.lane = nextLane;
-                newVehicle.turnIntent = null;
-                updated = true;
-              }
             }
-          }
 
-          if (updated) {
-            updatedVehicles[id] = newVehicle;
-            anyUpdated = true;
-          }
-        });
+            if (updated) {
+              updatedVehicles[id] = newVehicle;
+              anyUpdated = true;
+            }
+          });
 
-        if (anyUpdated) {
-          setVehicles(updatedVehicles);
+          if (anyUpdated) setVehicles(updatedVehicles);
           return;
         }
       }
@@ -4558,11 +7753,16 @@ export default function App() {
         setIsPasting(false);
         setSelectionStart(null);
         setSelectionEnd(null);
+        setPendingHomeAssign(false);
+        setPendingFireStart(false);
+        setPendingEmployeeAssign(false);
+        setPendingRouteVehicleId(null);
+        setInspectHomeKey(null);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undo, redo, copySelection, cutSelection, deleteSelection, clipboard, rotateClipboard, rotateSelection, isPasting, selectionStart, selectionEnd, vehicles, user]);
+  }, [undo, redo, copySelection, cutSelection, deleteSelection, clipboard, rotateClipboard, rotateSelection, isPasting, selectionStart, selectionEnd, selectedTile, selectedVehicles, vehicles, user]);
 
   useEffect(() => {
     if (!isPanning && !isSelecting) return;
@@ -4585,6 +7785,11 @@ export default function App() {
     const worldX = Math.floor((e.clientX - rect.left - offset.x) / zoom / GRID_SIZE);
     const worldY = Math.floor((e.clientY - rect.top - offset.y) / zoom / GRID_SIZE);
 
+    if (e.button === 0) {
+      pointerDownRef.current = { x: e.clientX, y: e.clientY };
+      didDragPointerRef.current = false;
+    }
+
     if (e.button === 1 || (e.button === 0 && !selectedTile && !isPasting && !e.altKey)) {
       pulseOverview();
       setIsPanning(true);
@@ -4604,6 +7809,14 @@ export default function App() {
     const worldX = Math.floor((e.clientX - rect.left - offset.x) / zoom / GRID_SIZE);
     const worldY = Math.floor((e.clientY - rect.top - offset.y) / zoom / GRID_SIZE);
 
+    if (pointerDownRef.current) {
+      const dx = e.clientX - pointerDownRef.current.x;
+      const dy = e.clientY - pointerDownRef.current.y;
+      if (dx * dx + dy * dy > 16) {
+        didDragPointerRef.current = true;
+      }
+    }
+
     if (isPanning) {
       pulseOverview();
       setOffset(clampOffset({
@@ -4619,11 +7832,22 @@ export default function App() {
     } else {
       setPastePreviewPos(null);
     }
+
+    if (isWithinGridCanvas(worldX, worldY)) {
+      setHoveredGridKey(`${worldX},${worldY}`);
+    } else {
+      setHoveredGridKey(null);
+    }
+
+    if (roomCodeRef.current) {
+      scheduleCursorEmit(worldX, worldY, bufferedKeysRef.current.size > 0);
+    }
   };
 
   const handleMouseUp = () => {
     setIsPanning(false);
     setIsSelecting(false);
+    pointerDownRef.current = null;
   };
 
   const zoomRef = useRef(zoom);
@@ -4693,7 +7917,7 @@ export default function App() {
 
   const getClipboardOffset = useCallback(() => {
     if (!clipboard) return { x: 0, y: 0 };
-    const keys = Object.keys(clipboard);
+    const keys = Object.keys(clipboard.grid);
     if (keys.length === 0) return { x: 0, y: 0 };
     
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -4715,7 +7939,7 @@ export default function App() {
   }, [clipboard]);
 
   const handleGridClick = (e: React.MouseEvent) => {
-    if (isFromGridControl(e) || isPanning || isSelecting) return;
+    if (isFromGridControl(e) || isPanning || isSelecting || didDragPointerRef.current) return;
 
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -4730,6 +7954,200 @@ export default function App() {
     const gridY = Math.floor(worldY / GRID_SIZE);
 
     const key = `${gridX},${gridY}`;
+    const localX = worldX - gridX * GRID_SIZE;
+    const localY = worldY - gridY * GRID_SIZE;
+    const relX = localX / GRID_SIZE;
+    const relY = localY / GRID_SIZE;
+
+    // Traffic control placement / interaction
+    if (hasTile(gridX, gridY)) {
+      const tiles = getTile(gridX, gridY)!;
+      const roadTile = getTrafficRoadTile(tiles);
+      if (roadTile && isRoadTile(roadTile.type) && !roadTile.type.startsWith('parking-')) {
+        if (trafficTool === 'stop-sign' && canPlaceStopSignOnTile(roadTile.type)) {
+          const exitPort = detectStopSignPlacementClick(relX, relY, roadTile);
+          if (exitPort !== null) {
+            const existing = findStopSignAt(key, exitPort, traffic);
+            const nextControls = { ...traffic.controls };
+            if (existing) {
+              delete nextControls[trafficControlKey(existing)];
+            } else {
+              const newSign = createStopSign(key, exitPort, traffic.nextSignId);
+              nextControls[trafficControlKey(newSign)] = newSign;
+              emitTraffic({ ...traffic, controls: nextControls, nextSignId: traffic.nextSignId + 1 });
+              return;
+            }
+            emitTraffic({ ...traffic, controls: nextControls });
+          }
+          return;
+        }
+        if (trafficTool === 'stoplight') {
+          const slot = detectLightSlotClick(relX, relY, roadTile);
+          if (slot) {
+            const existing = getStoplightsAt(key, traffic).find(
+              l => l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
+            );
+            const nextControls = { ...traffic.controls };
+            if (existing) {
+              delete nextControls[String(existing.id)];
+            } else {
+              const slots = getAvailableLightSlots(roadTile);
+              const occupied = getStoplightsAt(key, traffic).length;
+              if (occupied < slots.length) {
+                const newLight = createStoplight(key, slot.heading, slot.lane, traffic.nextLightId);
+                nextControls[String(newLight.id)] = newLight;
+                emitTraffic({ ...traffic, controls: nextControls, nextLightId: traffic.nextLightId + 1 });
+                return;
+              }
+            }
+            if (existing) emitTraffic({ ...traffic, controls: nextControls });
+          }
+          return;
+        }
+        if (!trafficTool && !selectedTile && selectedTrafficIds.size === 1) {
+          const selKey = Array.from(selectedTrafficIds)[0];
+          const sel = traffic.controls[selKey];
+          if (sel) {
+            if (sel.kind === 'stop-sign' && canPlaceStopSignOnTile(roadTile.type)) {
+              const exitPort = detectStopSignPlacementClick(relX, relY, roadTile);
+              if (exitPort !== null) {
+                const conflict = findStopSignAt(key, exitPort, traffic);
+                const samePlace = sel.gridKey === key && sel.edgePort === exitPort;
+                if (!samePlace && !conflict) {
+                  const nextControls = {
+                    ...traffic.controls,
+                    [selKey]: { ...sel, gridKey: key, edgePort: exitPort },
+                  };
+                  emitTraffic({ ...traffic, controls: nextControls });
+                }
+                return;
+              }
+            }
+            if (sel.kind === 'stoplight') {
+              const slot = detectLightSlotClick(relX, relY, roadTile);
+              if (slot) {
+                const conflict = getStoplightsAt(key, traffic).find(
+                  l => l.id !== sel.id && l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
+                );
+                const samePlace = sel.gridKey === key && sel.heading === slot.heading && Math.abs(sel.lane - slot.lane) < 0.01;
+                if (!conflict && !samePlace) {
+                  const nextControls = {
+                    ...traffic.controls,
+                    [selKey]: { ...sel, gridKey: key, heading: slot.heading, lane: slot.lane },
+                  };
+                  emitTraffic({ ...traffic, controls: nextControls });
+                }
+                return;
+              }
+            }
+          }
+        }
+        if (!trafficTool && !selectedTile && selectedTrafficIds.size === 0) {
+          const slot = detectLightSlotClick(relX, relY, roadTile);
+          if (slot) {
+            const light = getStoplightsAt(key, traffic).find(
+              l => l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
+            );
+            if (light && light.kind === 'stoplight') {
+              const nextPhase = cycleLightPhase(light.phase);
+              const nextControls = {
+                ...traffic.controls,
+                [String(light.id)]: { ...light, phase: nextPhase, phaseStartedAt: Date.now() },
+              };
+              emitTraffic({ ...traffic, controls: nextControls });
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    // Start fire on a tree tile
+    if (pendingFireStart && hasTile(gridX, gridY)) {
+      const tiles = getTile(gridX, gridY) || [];
+      const treeIdx = tiles.findIndex(t => isTreeTileType(t.type) && !t.burningUntil);
+      if (treeIdx >= 0) {
+        const now = Date.now();
+        const newTiles = [...tiles];
+        newTiles[treeIdx] = {
+          ...newTiles[treeIdx],
+          burningUntil: now + TREE_FIRE_DURATION_MS,
+        };
+        const newGrid = { ...grid, [key]: newTiles };
+        setGrid(newGrid);
+        addToHistory(newGrid);
+        // Stay in fire mode so user can light multiple trees; Escape cancels
+        return;
+      }
+      // Non-tree click while in fire mode — keep mode active
+      return;
+    }
+
+    // Assign selected people as employees of a building
+    if (pendingEmployeeAssign && selectedPersonIds.size > 0 && hasTile(gridX, gridY)) {
+      const tiles = getTile(gridX, gridY) || [];
+      const building = tiles.find(t => t.type.startsWith('building-'));
+      if (building) {
+        const workplaceKey =
+          building.part === 'member' ? (building.anchorKey || key) : key;
+        // Ensure building config exists for economy buildings
+        let nextEco = economy;
+        if (isEconomyBuilding(building.type) && !economy.buildings[workplaceKey]) {
+          const initCfg = createBuildingConfig(workplaceKey, building.type);
+          nextEco = {
+            ...economy,
+            buildings: { ...economy.buildings, [workplaceKey]: initCfg },
+          };
+        }
+        const people = assignPeopleWorkplace(
+          nextEco.people || {},
+          selectedPersonIds,
+          workplaceKey,
+        );
+        nextEco = { ...nextEco, people };
+        setEconomy(nextEco);
+        if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+        setPendingEmployeeAssign(false);
+        setShowPeoplePanel(true);
+        return;
+      }
+      // Non-building click while assigning — keep mode active
+      return;
+    }
+
+    // Assign selected cars to a house as their owner home
+    if (pendingHomeAssign && selectedVehicles.size > 0 && hasTile(gridX, gridY)) {
+      const tiles = getTile(gridX, gridY) || [];
+      const house = tiles.find(t => t.type === 'building-home');
+      if (house) {
+        const homeKey = `${gridX},${gridY}`;
+        const updatedVehicles = { ...vehicles };
+        let anyAssigned = false;
+        selectedVehicles.forEach(id => {
+          const v = updatedVehicles[id];
+          if (!v) return;
+          const vType = v.type || 'car';
+          // Homes are for cars (and service vehicles); not trains/semis
+          if (vType === 'train' || vType === 'semi') return;
+          updatedVehicles[id] = {
+            ...v,
+            homeKey,
+            nextHomeReturnAt: Date.now() + randomHomeTourDelayMs(),
+          };
+          anyAssigned = true;
+        });
+        if (anyAssigned) {
+          setVehicles(updatedVehicles);
+          if (roomCode) {
+            socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+          }
+        }
+        setPendingHomeAssign(false);
+        return;
+      }
+      // Clicked non-house while assigning — ignore (keep mode active)
+      return;
+    }
 
     // Destination assignment — highest priority (works even with palette tile selected)
     if (pendingRouteVehicleId && selectedVehicles.size > 0 && hasTile(gridX, gridY)) {
@@ -4765,19 +8183,17 @@ export default function App() {
     
     if (isPasting && clipboard) {
       const pasteOffset = getClipboardOffset();
-      const newGrid = { ...grid };
-      (Object.entries(clipboard) as [string, GridTile[]][]).forEach(([relKey, tiles]) => {
-        const [rx, ry] = relKey.split(',').map(Number);
-        const tx = gridX + rx - pasteOffset.x;
-        const ty = gridY + ry - pasteOffset.y;
-        const targetKey = `${tx},${ty}`;
-        // Only apply if there are tiles in the clipboard cell (ignore empty cells)
-        if (tiles && tiles.length > 0 && isWithinGridCanvas(tx, ty)) {
-          newGrid[targetKey] = [...tiles];
-        }
-      });
+      const baseX = gridX - pasteOffset.x;
+      const baseY = gridY - pasteOffset.y;
+      const placed = materializeLayoutGrid(clipboard, baseX, baseY);
+      const newGrid = { ...grid, ...placed };
       setGrid(newGrid);
       addToHistory(newGrid);
+
+      // Restart buildings from layout with saved settings/inventory/state
+      const placedBuildings = materializeLayoutBuildings(clipboard, baseX, baseY);
+      applyLayoutBuildings(placedBuildings, 'merge', clipboard.itemDefs);
+
       setIsPasting(false);
       setPastePreviewPos(null);
       return;
@@ -4861,9 +8277,16 @@ export default function App() {
         return;
       }
 
-      // Click economy building (no palette selected) → open inspector
+      // Click house → open people / family details
       if (!selectedTile && hasTile(gridX, gridY)) {
-        const top = getTile(gridX, gridY)![getTile(gridX, gridY)!.length - 1];
+        const tilesHere = getTile(gridX, gridY)!;
+        const top = tilesHere[tilesHere.length - 1];
+        if (top.type === 'building-home') {
+          setInspectHomeKey(key);
+          setInspectBuildingKey(null);
+          return;
+        }
+        // Click economy building (no palette selected) → open inspector
         if (isEconomyBuilding(top.type)) {
           const anchorK = top.part === 'member' ? top.anchorKey : key;
           if (anchorK) {
@@ -4874,104 +8297,13 @@ export default function App() {
               if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
             }
             setInspectBuildingKey(anchorK);
+            setInspectHomeKey(null);
             setShowLogistics(true);
             return;
           }
         }
       }
 
-      // Spawn new single vehicle on alt-click
-      if (e.altKey && hasTile(gridX, gridY)) {
-        const localX = worldX - gridX * GRID_SIZE;
-        const localY = worldY - gridY * GRID_SIZE;
-        
-        // Determine if we clicked a bridge or ground tile
-        const existingTiles = getTile(gridX, gridY)!;
-        let targetTile = existingTiles[existingTiles.length - 1];
-        let zIndex = 0;
-        
-        // If there's a bridge, check if we clicked "high" or "low"
-        // For simplicity, we'll check the top tile first. 
-        // If it's a bridge, we're on zIndex 1.
-        if (targetTile.type.includes('bridge') || targetTile.type.includes('trestle')) {
-          zIndex = 1;
-        }
-
-        if (targetTile.type.startsWith('road') || targetTile.type.startsWith('rail') || targetTile.type.startsWith('parking-')) {
-          // Determine lane and direction based on click position
-          let lane = 1;
-          let heading = targetTile.rotation;
-          
-          const relX = localX / GRID_SIZE;
-          const relY = localY / GRID_SIZE;
-          
-          const is4Lane = targetTile.type.includes('4lane');
-          const isOneWay = targetTile.type.includes('oneway');
-          const isRail = targetTile.type.startsWith('rail');
-
-          if (isRail) {
-            lane = 0;
-            if (targetTile.rotation === 0 || targetTile.rotation === 180) {
-              heading = relY > 0.5 ? 0 : 180;
-            } else {
-              heading = relX < 0.5 ? 90 : 270;
-            }
-          } else if (isOneWay) {
-            heading = targetTile.rotation;
-            if (heading === 0 || heading === 180) {
-              lane = relX > 0.5 ? 1 : -1;
-              if (heading === 180) lane = -lane;
-            } else {
-              lane = relY > 0.5 ? -1 : 1;
-              if (heading === 270) lane = -lane;
-            }
-          } else {
-            if (targetTile.rotation === 0 || targetTile.rotation === 180 || targetTile.type.includes('cross') || targetTile.type.startsWith('parking-')) {
-              if (relX > 0.5) {
-                heading = 0;
-                lane = is4Lane ? (relX > 0.75 ? 2.5 : 1) : 1;
-              } else {
-                heading = 180;
-                lane = is4Lane ? (relX < 0.25 ? 2.5 : 1) : 1;
-              }
-            } else {
-              if (relY > 0.5) {
-                heading = 90;
-                lane = is4Lane ? (relY > 0.75 ? 2.5 : 1) : 1;
-              } else {
-                heading = 270;
-                lane = is4Lane ? (relY < 0.25 ? 2.5 : 1) : 1;
-              }
-            }
-          }
-
-          const newId = Math.random().toString(36).substring(2, 11);
-          const newType = isRail ? 'train' : 'car';
-          const newVehicle: Vehicle = {
-            id: newId,
-            type: newType,
-            x: gridX,
-            y: gridY,
-            heading: heading,
-            lane: lane,
-            progress: 0.5,
-            color: userColor,
-            zIndex: zIndex,
-            isMoving: false,
-            speed: 1,
-            turnAroundAtDeadEnd: true,
-            randomTurning: true,
-            turnIntent: ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any,
-            trailers: newType === 'semi' ? 1 : 0,
-          };
-          const updatedVehicles = { ...vehicles, [newId]: newVehicle };
-          setVehicles(updatedVehicles);
-          setSelectedVehicles(new Set([...selectedVehicles, newId]));
-          if (roomCode) {
-            socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
-          }
-        }
-      }
       return;
     }
 
@@ -4985,7 +8317,8 @@ export default function App() {
           topTile.type === 'building-apartment' || topTile.type === 'building-highschool' ||
           topTile.type === 'building-college' || topTile.type === 'building-university' ||
           topTile.type === 'building-large-park' || topTile.type === 'building-warehouse-large' ||
-          topTile.type === 'building-factory-large' || topTile.type === 'building-train-station-large';
+          topTile.type === 'building-factory-large' || topTile.type === 'building-train-station-large' ||
+          topTile.type === 'building-repair-shop' || topTile.type === 'building-hospital';
         if (isMulti) {
           const anchorKey = topTile.part === 'member' ? topTile.anchorKey : key;
           if (anchorKey) {
@@ -5023,7 +8356,8 @@ export default function App() {
         selectedTile === 'building-apartment' || selectedTile === 'building-highschool' ||
         selectedTile === 'building-college' || selectedTile === 'building-university' ||
         selectedTile === 'building-large-park' || selectedTile === 'building-warehouse-large' ||
-        selectedTile === 'building-factory-large' || selectedTile === 'building-train-station-large';
+        selectedTile === 'building-factory-large' || selectedTile === 'building-train-station-large' ||
+        selectedTile === 'building-repair-shop' || selectedTile === 'building-hospital';
       if (isMultiTile) {
         const { w, h } = getMultiTileDimensions(selectedTile);
         const cells = getMultiTileCells(selectedTile, rotation);
@@ -5048,7 +8382,40 @@ export default function App() {
           const ak = `${gridX},${gridY}`;
           if (!economy.buildings[ak]) {
             const initCfg = createBuildingConfig(ak, selectedTile);
-            const nextEco = { ...economy, buildings: { ...economy.buildings, [ak]: initCfg } };
+            let nextEco = { ...economy, buildings: { ...economy.buildings, [ak]: initCfg } };
+            // Seed common item defs when placing specialized economy buildings
+            if (selectedTile === 'building-repair-shop' || selectedTile === 'building-hospital') {
+              const existing = new Set((nextEco.itemDefs || []).map(d => d.id));
+              const seedDefs: ItemDef[] = (
+                selectedTile === 'building-repair-shop'
+                  ? [
+                      { id: 'motor-oil', name: 'Motor Oil', emoji: '🛢️' },
+                      { id: 'oil-filter', name: 'Oil Filter', emoji: '🔧' },
+                      { id: 'tire', name: 'Tire', emoji: '🛞' },
+                      { id: 'brake-pads', name: 'Brake Pads', emoji: '🛑' },
+                      { id: 'brake-fluid', name: 'Brake Fluid', emoji: '🧴' },
+                      { id: 'battery', name: 'Battery', emoji: '🔋' },
+                      { id: 'engine-parts', name: 'Engine Parts', emoji: '⚙️' },
+                      { id: 'body-panels', name: 'Body Panels', emoji: '🪟' },
+                      { id: 'paint', name: 'Paint', emoji: '🎨' },
+                      { id: 'tow-supplies', name: 'Tow Supplies', emoji: '🪝' },
+                    ]
+                  : [
+                      { id: 'medicine', name: 'Medicine', emoji: '💊' },
+                      { id: 'bandages', name: 'Bandages', emoji: '🩹' },
+                      { id: 'painkillers', name: 'Painkillers', emoji: '💉' },
+                      { id: 'blood-bags', name: 'Blood Bags', emoji: '🩸' },
+                      { id: 'iv-fluids', name: 'IV Fluids', emoji: '💧' },
+                      { id: 'antibiotics', name: 'Antibiotics', emoji: '🧴' },
+                      { id: 'defibrillator-pads', name: 'Defibrillator Pads', emoji: '⚡' },
+                      { id: 'epinephrine', name: 'Epinephrine', emoji: '🧪' },
+                      { id: 'medical-supplies', name: 'Medical Supplies', emoji: '🏥' },
+                    ]
+              ).filter(d => !existing.has(d.id));
+              if (seedDefs.length) {
+                nextEco = { ...nextEco, itemDefs: [...(nextEco.itemDefs || []), ...seedDefs] };
+              }
+            }
             setEconomy(nextEco);
             if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
           }
@@ -5098,6 +8465,8 @@ export default function App() {
         }
       }
 
+      setIsPlacingVehicles(false);
+      setPendingRouteVehicleId(null);
       setGrid(newGrid);
       addToHistory(newGrid);
     }
@@ -5109,7 +8478,8 @@ export default function App() {
   };
 
   const exportGrid = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(grid));
+    const snapshot = captureLayoutSnapshot(gridRef.current, getLiveEconomy(), null);
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(snapshot));
     const downloadAnchorNode = document.createElement('a');
     downloadAnchorNode.setAttribute("href", dataStr);
     downloadAnchorNode.setAttribute("download", "gridcity_layout.json");
@@ -5126,7 +8496,7 @@ export default function App() {
     reader.onload = (event) => {
       try {
         const data = JSON.parse(event.target?.result as string);
-        setClipboard(data);
+        setClipboard(normalizeLayoutSnapshot(data));
         setIsPasting(true);
         setSelectedTile(null);
       } catch (err) {
@@ -5657,30 +9027,348 @@ export default function App() {
   const carsFilteredSelection = filterSelectionByPanelType(selectedVehicles, vehicles, 'car');
   const semiFilteredSelection = filterSelectionByPanelType(selectedVehicles, vehicles, 'semi');
   const trainFilteredSelection = filterSelectionByPanelType(selectedVehicles, vehicles, 'train');
+  const serviceFilteredSelection = filterSelectionByPanelType(selectedVehicles, vehicles, 'service');
 
   const carsList = (Object.values(vehicles) as Vehicle[]).filter(v => vehicleMatchesPanelType(v, 'car'));
   const semisList = (Object.values(vehicles) as Vehicle[]).filter(v => vehicleMatchesPanelType(v, 'semi'));
   const trainsList = (Object.values(vehicles) as Vehicle[]).filter(v => vehicleMatchesPanelType(v, 'train'));
+  const serviceList = (Object.values(vehicles) as Vehicle[]).filter(v => vehicleMatchesPanelType(v, 'service'));
   const parkedTrailersList = Object.values(economy.parkedTrailers || {});
 
-  const toggleCarsPanel = () => {
-    setShowCarsPanel(p => !p);
+  const closeOtherVehiclePanels = () => {
+    setShowCarsPanel(false);
     setShowSemiTrailerPanel(false);
     setShowTrainPanel(false);
+    setShowServicePanel(false);
+    setShowTrafficPanel(false);
+    setShowPeoplePanel(false);
+  };
+
+  const toggleCarsPanel = () => {
+    const next = !showCarsPanel;
+    closeOtherVehiclePanels();
+    setShowCarsPanel(next);
   };
   const toggleSemiTrailerPanel = () => {
-    setShowSemiTrailerPanel(p => !p);
-    setShowCarsPanel(false);
-    setShowTrainPanel(false);
+    const next = !showSemiTrailerPanel;
+    closeOtherVehiclePanels();
+    setShowSemiTrailerPanel(next);
   };
   const toggleTrainPanel = () => {
-    setShowTrainPanel(p => !p);
-    setShowCarsPanel(false);
-    setShowSemiTrailerPanel(false);
+    const next = !showTrainPanel;
+    closeOtherVehiclePanels();
+    setShowTrainPanel(next);
+  };
+  const toggleServicePanel = () => {
+    const next = !showServicePanel;
+    closeOtherVehiclePanels();
+    setShowServicePanel(next);
+  };
+
+  const toggleTrafficPanel = () => {
+    const next = !showTrafficPanel;
+    closeOtherVehiclePanels();
+    setShowTrafficPanel(next);
+  };
+
+  const togglePeoplePanel = () => {
+    const next = !showPeoplePanel;
+    closeOtherVehiclePanels();
+    setShowPeoplePanel(next);
+  };
+
+  const peopleList = Object.values(economy.people || {}).sort((a, b) =>
+    personDisplayName(a).localeCompare(personDisplayName(b)),
+  );
+  const filteredPeople = peopleList.filter(p => {
+    if (!peopleFilter.trim()) return true;
+    const q = peopleFilter.toLowerCase();
+    return (
+      personDisplayName(p).toLowerCase().includes(q) ||
+      p.homeKey.includes(q) ||
+      (p.workplaceKey || '').includes(q) ||
+      (p.activity || '').includes(q)
+    );
+  });
+
+  const populatePeople = () => {
+    const next = populateHomes(gridRef.current, economy, Date.now());
+    setEconomy(next);
+    if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
+  };
+
+  const openCreatePersonForm = () => {
+    const homes = listHomeKeys(gridRef.current);
+    setPeopleForm({
+      firstName: randomFirstName('m'),
+      lastName: randomLastName(),
+      sex: 'm',
+      ageYears: 30,
+      homeKey: homes[0] || '',
+      workplaceKey: '',
+      money: 50,
+      health: 'healthy',
+    });
+    setPeopleFormMode('create');
+  };
+
+  const openEditPersonForm = (personId?: string) => {
+    const id = personId || Array.from(selectedPersonIds)[0];
+    const p = id ? economy.people?.[id] : undefined;
+    if (!p) return;
+    setSelectedPersonIds(new Set([p.id]));
+    setPeopleForm({
+      firstName: p.firstName,
+      lastName: p.lastName,
+      sex: p.sex,
+      ageYears: Math.floor(p.ageYears),
+      homeKey: p.homeKey,
+      workplaceKey: p.workplaceKey || '',
+      money: p.money ?? 0,
+      health: p.health,
+    });
+    setPeopleFormMode('edit');
+  };
+
+  const savePersonForm = () => {
+    if (!peopleForm.homeKey.trim()) return;
+    const now = Date.now();
+    const people = { ...(economy.people || {}) };
+    const families = { ...(economy.families || {}) };
+
+    if (peopleFormMode === 'create') {
+      const person = createPerson({
+        firstName: peopleForm.firstName,
+        lastName: peopleForm.lastName,
+        sex: peopleForm.sex,
+        ageYears: peopleForm.ageYears,
+        homeKey: peopleForm.homeKey.trim(),
+        workplaceKey: peopleForm.workplaceKey.trim() || undefined,
+        money: peopleForm.money,
+        health: peopleForm.health,
+        now,
+      });
+      // Attach to existing family at home if one shares last name, else new family
+      const existingFam = Object.values(families).find(
+        f => f.homeKey === person.homeKey && f.lastName === person.lastName,
+      );
+      if (existingFam) {
+        person.familyId = existingFam.id;
+        families[existingFam.id] = {
+          ...existingFam,
+          memberIds: [...existingFam.memberIds, person.id],
+        };
+      } else {
+        families[person.familyId] = {
+          id: person.familyId,
+          lastName: person.lastName,
+          homeKey: person.homeKey,
+          memberIds: [person.id],
+        };
+      }
+      people[person.id] = person;
+      setSelectedPersonIds(new Set([person.id]));
+    } else if (peopleFormMode === 'edit') {
+      const id = Array.from(selectedPersonIds)[0];
+      const prev = id ? people[id] : undefined;
+      if (!prev) return;
+      people[id] = {
+        ...prev,
+        firstName: peopleForm.firstName.trim() || prev.firstName,
+        lastName: peopleForm.lastName.trim() || prev.lastName,
+        sex: peopleForm.sex,
+        ageYears: Math.max(0, Math.min(100, peopleForm.ageYears)),
+        ageUpdatedAt: now,
+        homeKey: peopleForm.homeKey.trim() || prev.homeKey,
+        workplaceKey: peopleForm.workplaceKey.trim() || undefined,
+        money: peopleForm.money,
+        health: peopleForm.health,
+        location:
+          prev.location.kind === 'home'
+            ? { kind: 'home', homeKey: peopleForm.homeKey.trim() || prev.homeKey }
+            : prev.location,
+      };
+    }
+
+    const nextEco = { ...economy, people, families };
+    setEconomy(nextEco);
+    if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+    setPeopleFormMode('closed');
+  };
+
+  const deleteSelectedPeople = () => {
+    if (selectedPersonIds.size === 0) return;
+    const people = { ...(economy.people || {}) };
+    const families = { ...(economy.families || {}) };
+    for (const id of selectedPersonIds) {
+      const p = people[id];
+      if (!p) continue;
+      delete people[id];
+      const fam = families[p.familyId];
+      if (fam) {
+        const memberIds = fam.memberIds.filter(mid => mid !== id);
+        if (memberIds.length === 0) delete families[p.familyId];
+        else families[p.familyId] = { ...fam, memberIds };
+      }
+    }
+    // Clear vehicle occupancy for removed people
+    let nextVehicles = { ...vehicles };
+    Object.keys(nextVehicles).forEach(vid => {
+      nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+    });
+    const nextEco = { ...economy, people, families };
+    setEconomy(nextEco);
+    setVehicles(nextVehicles);
+    setSelectedPersonIds(new Set());
+    setPeopleFormMode('closed');
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  const clearSelectedWorkplaces = () => {
+    if (selectedPersonIds.size === 0) return;
+    const people = assignPeopleWorkplace(economy.people || {}, selectedPersonIds, undefined);
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+  };
+
+  const startAssignEmployees = () => {
+    if (selectedPersonIds.size === 0) return;
+    setPendingHomeAssign(false);
+    setPendingFireStart(false);
+    setPendingRouteVehicleId(null);
+    setPendingEmployeeAssign(true);
+  };
+
+  const boardSelectedPeople = (seat: 'driver' | 'passenger') => {
+    if (selectedPersonIds.size === 0 || selectedVehicles.size === 0) return;
+    const vehicleId = Array.from(selectedVehicles)[0];
+    const v = vehicles[vehicleId];
+    if (!v) return;
+    let people = { ...(economy.people || {}) };
+    for (const pid of selectedPersonIds) {
+      const person = people[pid];
+      if (!person) continue;
+      if (seat === 'driver') {
+        if (canBoardAsDriver(person, v, people)) continue;
+      } else {
+        if (canBoardAsPassenger(person, v, people)) continue;
+      }
+      people = boardPerson(people, pid, vehicleId, seat);
+    }
+    let nextVehicles = { ...vehicles };
+    nextVehicles[vehicleId] = syncVehicleOccupancy(v, people);
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  const alightSelectedPeople = (dest: 'home' | 'here') => {
+    if (selectedPersonIds.size === 0) return;
+    let people = { ...(economy.people || {}) };
+    const now = Date.now();
+    for (const pid of selectedPersonIds) {
+      const person = people[pid];
+      if (!person) continue;
+      if (dest === 'home') {
+        people = alightPerson(people, pid, { kind: 'home', homeKey: person.homeKey }, 'home', now + 15_000);
+      } else if (person.location.kind === 'vehicle') {
+        const v = vehicles[person.location.vehicleId];
+        if (v) {
+          // Prefer building under vehicle, else tile
+          const key = `${v.x},${v.y}`;
+          const tiles = gridRef.current[key];
+          const bld = tiles?.find(t => t.type.startsWith('building-'));
+          if (bld) {
+            const bkey = bld.part === 'member' ? bld.anchorKey || key : key;
+            people = alightPerson(people, pid, { kind: 'building', buildingKey: bkey }, 'idle', now + 10_000);
+          } else {
+            people = alightPerson(people, pid, { kind: 'tile', x: v.x, y: v.y }, 'idle', now + 10_000);
+          }
+        }
+      }
+    }
+    let nextVehicles = { ...vehicles };
+    Object.keys(nextVehicles).forEach(vid => {
+      nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+    });
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  const sendSelectedPeopleHome = () => {
+    if (selectedPersonIds.size === 0) return;
+    let people = { ...(economy.people || {}) };
+    const now = Date.now();
+    for (const pid of selectedPersonIds) {
+      const person = people[pid];
+      if (!person) continue;
+      people = alightPerson(people, pid, { kind: 'home', homeKey: person.homeKey }, 'home', now + 20_000);
+    }
+    let nextVehicles = { ...vehicles };
+    Object.keys(nextVehicles).forEach(vid => {
+      nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+    });
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  const enterSelectedBuildingWithPeople = () => {
+    // Use selected vehicle position building, or inspect building
+    if (selectedPersonIds.size === 0) return;
+    let buildingKey = inspectBuildingKey;
+    if (!buildingKey && selectedVehicles.size > 0) {
+      const v = vehicles[Array.from(selectedVehicles)[0]];
+      if (v) {
+        const key = `${v.x},${v.y}`;
+        const tiles = gridRef.current[key];
+        const bld = tiles?.find(t => t.type.startsWith('building-'));
+        if (bld) buildingKey = bld.part === 'member' ? bld.anchorKey || key : key;
+      }
+    }
+    if (!buildingKey) return;
+    let people = { ...(economy.people || {}) };
+    const now = Date.now();
+    for (const pid of selectedPersonIds) {
+      people = alightPerson(people, pid, { kind: 'building', buildingKey }, 'idle', now + 20_000);
+    }
+    let nextVehicles = { ...vehicles };
+    Object.keys(nextVehicles).forEach(vid => {
+      nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+    });
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
   };
 
   const renderVehicleListItem = (v: Vehicle) => {
     const cargoTotals = getVehicleCargoTotals(v);
+    const peopleMap = economy.people || {};
+    const driverId = v.driverId || getDriverId(peopleMap, v.id);
+    const passengers = v.passengerIds || getPassengerIds(peopleMap, v.id);
+    const maxPax = v.maxPassengers ?? getMaxPassengers(v.type);
+    const driver = driverId ? peopleMap[driverId] : null;
     return (
       <label key={v.id} className="flex items-center gap-3 p-3 hover:bg-slate-50 border-b border-slate-50 cursor-pointer">
         <input
@@ -5702,7 +9390,17 @@ export default function App() {
             {v.destination && (
               <span className="text-[9px] text-blue-500 shrink-0">→{v.destination.x},{v.destination.y}</span>
             )}
+            {v.homeKey && (
+              <span className="text-[9px] text-rose-500 shrink-0" title={`Home ${v.homeKey}`}>🏠{v.homeKey}</span>
+            )}
           </div>
+          {Object.keys(peopleMap).length > 0 && (
+            <div className="text-[9px] text-slate-400 pl-5 truncate">
+              🚗 {driver ? personDisplayName(driver) : 'No driver'}
+              {' · '}
+              👥 {passengers.length}/{maxPax}
+            </div>
+          )}
           {cargoTotals.length > 0 && (
             <div className="flex flex-wrap gap-1 pl-5">
               {cargoTotals.map(([itemId, qty]) => (
@@ -5926,7 +9624,7 @@ export default function App() {
             {PALETTE_TILES.filter(t => t.category === activeCategory).map((tile) => (
               <button
                 key={tile.type}
-                onClick={() => setSelectedTile(tile.type)}
+                onClick={() => selectPaletteTile(tile.type)}
                 className={`p-1 rounded-xl border-2 transition-all flex flex-col items-center gap-1 group ${
                   selectedTile === tile.type 
                   ? 'border-blue-500 bg-blue-50 shadow-sm' 
@@ -6084,7 +9782,7 @@ export default function App() {
               <RotateCcw className="w-3 h-3" />
               Rotate (R)
             </button>
-            <button onClick={() => { setSelectedTile(null); setIsPasting(false); }} className={`flex items-center justify-center gap-2 py-2 px-3 border rounded-lg text-xs font-medium transition-colors ${!selectedTile && !isPasting ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'}`}>
+            <button onClick={() => { setSelectedTile(null); setIsPasting(false); setIsPlacingVehicles(false); setPendingRouteVehicleId(null); }} className={`flex items-center justify-center gap-2 py-2 px-3 border rounded-lg text-xs font-medium transition-colors ${!selectedTile && !isPasting ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'}`}>
               <MousePointer2 className="w-3 h-3" />
               Select
             </button>
@@ -6117,7 +9815,7 @@ export default function App() {
       {/* Main Viewport */}
       <div 
         ref={containerRef}
-        className={`flex-1 relative overflow-hidden cursor-${isPanning ? 'grabbing' : pendingRouteVehicleId ? 'crosshair' : selectedTile ? 'crosshair' : 'grab'}`}
+        className={`flex-1 relative overflow-hidden cursor-${isPanning ? 'grabbing' : pendingRouteVehicleId || pendingHomeAssign || pendingFireStart || pendingEmployeeAssign || trafficTool ? 'crosshair' : selectedTile ? 'crosshair' : 'grab'}`}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
@@ -6127,11 +9825,14 @@ export default function App() {
         {!showSidebar && (
           <button
             type="button"
-            onClick={() => setShowSidebar(true)}
             className="absolute top-4 left-4 z-[60] p-3 bg-white rounded-xl shadow-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors"
             title="Show tile palette"
             data-grid-control
             {...blockGridPointerEvents}
+            onClick={(e) => {
+              stopGridPropagation(e);
+              setShowSidebar(true);
+            }}
           >
             <PanelLeftOpen className="w-5 h-5" />
           </button>
@@ -6139,6 +9840,21 @@ export default function App() {
         {pendingRouteVehicleId && (
           <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-red-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
             Click a road tile to set destination
+          </div>
+        )}
+        {pendingHomeAssign && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-rose-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click a Home tile to assign as owner house
+          </div>
+        )}
+        {pendingFireStart && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-orange-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click a tree to start a fire (burns 30s)
+          </div>
+        )}
+        {pendingEmployeeAssign && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-violet-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click a building to assign {selectedPersonIds.size} employee{selectedPersonIds.size === 1 ? '' : 's'} (Esc to cancel)
           </div>
         )}
         {/* Outside canvas backdrop */}
@@ -6167,6 +9883,9 @@ export default function App() {
               boxShadow: 'inset 0 0 0 2px rgba(148, 163, 184, 0.8)',
             }}
           />
+          {roomCode && remoteCursors.length > 0 && (
+            <RemoteCursors cursors={remoteCursors} gridSize={GRID_SIZE} />
+          )}
           {(Object.entries(grid) as [string, GridTile[]][]).map(([key, tiles]) => {
             const [x, y] = key.split(',').map(Number);
             return (
@@ -6192,6 +9911,8 @@ export default function App() {
                       w={tile.w}
                       h={tile.h}
                       growthProgress={tile.growthProgress}
+                      burningUntil={tile.burningUntil}
+                      burnNow={(() => { void burnUiTick; return Date.now(); })()}
                       coneStageRatio={
                         tile.type === 'tree-pine-seedling'
                           ? Math.min(
@@ -6204,6 +9925,63 @@ export default function App() {
                     />
                   </div>
                 ))}
+                {(() => {
+                  const roadTile = getTrafficRoadTile(tiles);
+                  if (!roadTile) return null;
+                  const cellControls = getAllTrafficControls(traffic).filter(c => c.gridKey === key);
+                  if (!cellControls.length) return null;
+                  return (
+                    <TrafficOverlay
+                      gridKey={key}
+                      tileRotation={roadTile.rotation}
+                      controls={cellControls}
+                      showIds={hoveredGridKey === key}
+                      stopSignScale={traffic.stopSignSizeScale}
+                      stoplightScale={traffic.stoplightSizeScale}
+                      selectedIds={selectedTrafficIds}
+                      onSignClick={!trafficTool ? (ctrl) => {
+                        if (ctrl.kind !== 'stop-sign') return;
+                        setSelectedTrafficIds(new Set([trafficControlKey(ctrl)]));
+                        setShowTrafficPanel(true);
+                      } : undefined}
+                      onLightClick={!trafficTool ? (ctrl) => {
+                        if (ctrl.kind !== 'stoplight') return;
+                        const nextControls = {
+                          ...traffic.controls,
+                          [String(ctrl.id)]: {
+                            ...ctrl,
+                            phase: cycleLightPhase(ctrl.phase),
+                            phaseStartedAt: Date.now(),
+                          },
+                        };
+                        emitTraffic({ ...traffic, controls: nextControls });
+                      } : undefined}
+                    />
+                  );
+                })()}
+              </div>
+            );
+          })}
+
+          {/* Home occupancy badges */}
+          {Object.entries(grid).map(([homeKey, homeTiles]) => {
+            if (!homeTiles?.length) return null;
+            const top = homeTiles[homeTiles.length - 1];
+            if (top.type !== 'building-home') return null;
+            const residents = peopleResidingAt(economy.people, homeKey);
+            const atHome = peopleAtHome(economy.people || {}, homeKey);
+            if (residents.length === 0 && atHome.length === 0) return null;
+            const [hx, hy] = homeKey.split(',').map(Number);
+            return (
+              <div
+                key={`home-badge-${homeKey}`}
+                className="absolute"
+                style={{ left: hx * GRID_SIZE, top: hy * GRID_SIZE }}
+              >
+                <HomeOccupancyBadge
+                  atHomeCount={atHome.length}
+                  residentCount={residents.length}
+                />
               </div>
             );
           })}
@@ -6234,9 +10012,11 @@ export default function App() {
                   buildingH={buildingH}
                   itemDefs={economy.itemDefs || []}
                   showInventoryLabels={economy.showInventoryLabels}
-                  cycleRemaining={getCycleRemainingForBuilding(cfg)}
+                  cycleRemaining={getCycleRemainingForBuilding(cfg, anchorKey)}
                   economyPaused={economy.economyPaused}
                   canControlProduction={!!roomCode}
+                  staffCount={countEmployeesAtBuilding(economy.people, anchorKey)}
+                  requiredStaff={isProcessBuilding(cfg) ? getRequiredEmployees(cfg) : 0}
                   onToggleProduction={
                     isProcessBuilding(cfg)
                       ? () => toggleBuildingProduction(anchorKey)
@@ -6272,8 +10052,8 @@ export default function App() {
                   let exitPort = otherPorts[0];
                   if (otherPorts.length > 1) {
                     const straightPort = (entryPort + 2) % 4;
-                    const leftPort = (entryPort + 3) % 4;
-                    const rightPort = (entryPort + 1) % 4;
+                    const leftPort = (entryPort + 1) % 4;
+                    const rightPort = (entryPort + 3) % 4;
 
                     if (v.turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
                     else if (v.turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
@@ -6382,7 +10162,7 @@ export default function App() {
           {/* Paste Preview */}
           {isPasting && clipboard && pastePreviewPos && (
             <div className="pointer-events-none opacity-60">
-              {(Object.entries(clipboard) as [string, GridTile[]][]).map(([relKey, tiles]) => {
+              {(Object.entries(clipboard.grid) as [string, GridTile[]][]).map(([relKey, tiles]) => {
                 const [rx, ry] = relKey.split(',').map(Number);
                 return (
                   <div 
@@ -6477,7 +10257,7 @@ export default function App() {
               transformOrigin: 'top left'
             }}
           >
-            {(Object.entries(clipboard) as [string, GridTile[]][]).map(([relKey, tiles]) => {
+            {(Object.entries(clipboard.grid) as [string, GridTile[]][]).map(([relKey, tiles]) => {
               const [rx, ry] = relKey.split(',').map(Number);
               return (
                 <div 
@@ -6527,37 +10307,20 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* Floating Controls */}
+        {/* Floating Controls — two-column button grid */}
         <div 
           className="absolute bottom-8 right-8 flex flex-col gap-2"
           data-grid-control
           {...blockGridPointerEvents}
         >
-          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 p-2 flex flex-col gap-1">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 p-2 grid grid-cols-2 gap-1">
             <button 
               onClick={() => setShowGridLines(!showGridLines)}
               className={`p-3 rounded-xl transition-colors ${showGridLines ? 'text-blue-600 bg-blue-50' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Toggle Grid Lines"
             >
-              <Grid className="w-5 h-5" />
+              <Grid className="w-5 h-5 mx-auto" />
             </button>
-            <div className="h-px bg-slate-100 mx-2" />
-            <button 
-              onClick={() => { pulseOverview(); setZoom(z => Math.min(MAX_ZOOM, z * 1.2)); }}
-              className="p-3 hover:bg-slate-50 rounded-xl transition-colors text-slate-600"
-              title="Zoom In"
-            >
-              <ZoomIn className="w-5 h-5" />
-            </button>
-            <div className="h-px bg-slate-100 mx-2" />
-            <button 
-              onClick={() => { pulseOverview(); setZoom(z => Math.max(MIN_ZOOM, z / 1.2)); }}
-              className="p-3 hover:bg-slate-50 rounded-xl transition-colors text-slate-600"
-              title="Zoom Out"
-            >
-              <ZoomOut className="w-5 h-5" />
-            </button>
-            <div className="h-px bg-slate-100 mx-2" />
             <button 
               onClick={() => {
                 pulseOverview();
@@ -6567,45 +10330,77 @@ export default function App() {
               className="p-3 hover:bg-slate-50 rounded-xl transition-colors text-slate-600"
               title="Reset View"
             >
-              <Hand className="w-5 h-5" />
+              <Hand className="w-5 h-5 mx-auto" />
             </button>
-            <div className="h-px bg-slate-100 mx-2" />
+            <button 
+              onClick={() => { pulseOverview(); setZoom(z => Math.min(MAX_ZOOM, z * 1.2)); }}
+              className="p-3 hover:bg-slate-50 rounded-xl transition-colors text-slate-600"
+              title="Zoom In"
+            >
+              <ZoomIn className="w-5 h-5 mx-auto" />
+            </button>
+            <button 
+              onClick={() => { pulseOverview(); setZoom(z => Math.max(MIN_ZOOM, z / 1.2)); }}
+              className="p-3 hover:bg-slate-50 rounded-xl transition-colors text-slate-600"
+              title="Zoom Out"
+            >
+              <ZoomOut className="w-5 h-5 mx-auto" />
+            </button>
             <button
               onClick={toggleCarsPanel}
               className={`p-3 rounded-xl transition-colors ${showCarsPanel ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Cars"
             >
-              <Car className="w-5 h-5" />
+              <Car className="w-5 h-5 mx-auto" />
             </button>
             <button
               onClick={toggleSemiTrailerPanel}
               className={`p-3 rounded-xl transition-colors ${showSemiTrailerPanel ? 'text-amber-600 bg-amber-50' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Semis & Trailers"
             >
-              <Truck className="w-5 h-5" />
+              <Truck className="w-5 h-5 mx-auto" />
             </button>
             <button
               onClick={toggleTrainPanel}
               className={`p-3 rounded-xl transition-colors ${showTrainPanel ? 'text-emerald-600 bg-emerald-50' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Trains & Railcars"
             >
-              <Train className="w-5 h-5" />
+              <Train className="w-5 h-5 mx-auto" />
             </button>
-            <div className="h-px bg-slate-100 mx-2" />
+            <button
+              onClick={toggleServicePanel}
+              className={`p-3 rounded-xl transition-colors ${showServicePanel ? 'text-orange-600 bg-orange-50' : 'text-slate-400 hover:bg-slate-50'}`}
+              title="Service Vehicles"
+            >
+              <Siren className="w-5 h-5 mx-auto" />
+            </button>
+            <button
+              onClick={togglePeoplePanel}
+              className={`p-3 rounded-xl transition-colors ${showPeoplePanel ? 'text-violet-600 bg-violet-50' : 'text-slate-400 hover:bg-slate-50'}`}
+              title="People & Families"
+            >
+              <Users className="w-5 h-5 mx-auto" />
+            </button>
+            <button
+              onClick={toggleTrafficPanel}
+              className={`p-3 rounded-xl transition-colors ${showTrafficPanel ? 'text-red-600 bg-red-50' : 'text-slate-400 hover:bg-slate-50'}`}
+              title="Traffic Control"
+            >
+              <Timer className="w-5 h-5 mx-auto" />
+            </button>
             <button 
               onClick={() => setShowLogistics(!showLogistics)}
               className={`p-3 rounded-xl transition-colors ${showLogistics ? 'text-emerald-600 bg-emerald-50' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Logistics & Economy"
             >
-              <Database className="w-5 h-5" />
+              <Database className="w-5 h-5 mx-auto" />
             </button>
-            <div className="h-px bg-slate-100 mx-2" />
             <button 
               onClick={() => setShowPlantGrowth(!showPlantGrowth)}
               className={`p-3 rounded-xl transition-colors ${showPlantGrowth ? 'text-lime-600 bg-lime-50' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Plant Growth"
             >
-              <Sprout className="w-5 h-5" />
+              <Sprout className="w-5 h-5 mx-auto" />
             </button>
 
             {/* Destination Floater */}
@@ -6666,6 +10461,10 @@ export default function App() {
               <div className="p-4 overflow-auto overscroll-contain flex-1 text-sm space-y-4">
                 <div>
                   <div className="font-semibold mb-1">Items (create/destroy)</div>
+                  <p className="text-[10px] text-slate-500 mb-1">
+                    Items used by buildings (recipes, inventory, consumption) are added here automatically.
+                    Deleting an item removes it from every building that references it.
+                  </p>
                   <div className="flex gap-2">
                     <input
                       value={newItemName}
@@ -6721,20 +10520,18 @@ export default function App() {
                           </button>
                           {def.name}
                           <button
+                            title="Delete item from Logistics and remove from all buildings"
                             onClick={() => {
-                              const nextDefs = (economy.itemDefs || []).filter(d => d.id !== def.id);
-                              const nextBld: Record<string, BuildingConfig> = {};
-                              Object.keys(economy.buildings).forEach(k => {
-                                const b = { ...economy.buildings[k] };
-                                if (b.inventory) delete b.inventory[def.id];
-                                if (b.inventoryCapacity) delete b.inventoryCapacity[def.id];
-                                if (b.consumptionRates) delete b.consumptionRates[def.id];
-                                if (b.recipeInputs) b.recipeInputs = b.recipeInputs.filter(r => r.item !== def.id);
-                                if (b.recipeOutputs) b.recipeOutputs = b.recipeOutputs.filter(r => r.item !== def.id);
-                                nextBld[k] = b;
-                              });
-                              const next = { ...economy, itemDefs: nextDefs, buildings: nextBld };
+                              const next = removeItemFromEconomy(economy, def.id);
                               setEconomy(next);
+                              // Also clear vehicle trailer/railcar cargo of this item
+                              const nextVehicles = stripItemFromVehicles(vehicles, def.id);
+                              if (nextVehicles !== vehicles) {
+                                setVehicles(nextVehicles);
+                                if (roomCode) {
+                                  socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+                                }
+                              }
                               if (editingItemEmoji === def.id) setEditingItemEmoji(null);
                               if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
                             }}
@@ -6805,7 +10602,9 @@ export default function App() {
                     <div className="space-y-1">
                       {Object.entries(economy.buildings).map(([bkey, bcfg]) => {
                         const invCount = Object.values(bcfg.inventory || {}).reduce((sum, qty) => sum + qty, 0);
-                        const cycleRemaining = getCycleRemainingForBuilding(bcfg);
+                        const cycleRemaining = getCycleRemainingForBuilding(bcfg, bkey);
+                        const staff = countEmployeesAtBuilding(economy.people, bkey);
+                        const need = isProcessBuilding(bcfg) ? getRequiredEmployees(bcfg) : 0;
                         return (
                           <div
                             key={bkey}
@@ -6816,10 +10615,14 @@ export default function App() {
                               <div className="text-[10px] text-slate-400 truncate">
                                 {bcfg.role} • {bkey}
                                 {invCount > 0 ? ` • ${invCount} in stock` : ''}
+                                {need > 0 ? ` • 👷${staff}/${need}` : ''}
                               </div>
                             </div>
                             <div className="flex items-center gap-1 shrink-0">
-                              {cycleRemaining !== null && <CycleCountdownBadge remaining={cycleRemaining} />}
+                              {cycleRemaining !== null && staff >= need && <CycleCountdownBadge remaining={cycleRemaining} />}
+                              {need > 0 && staff < need && (
+                                <span className="text-[9px] font-bold text-rose-600">Need staff</span>
+                              )}
                               <button
                                 onClick={() => setInspectBuildingKey(bkey)}
                                 className="text-[10px] px-1.5 py-0.5 bg-white border rounded hover:bg-slate-100"
@@ -6882,9 +10685,14 @@ export default function App() {
                             {(bcfg.recipeOutputs || []).length === 0 && <span className="text-slate-400 ml-1">none</span>}
                           </div>
                           <div className="flex items-center justify-between gap-2 text-[9px] text-amber-700">
-                            <span>Cycle: {bcfg.cycleTimeSec || 30}s</span>
+                            <span>
+                              Cycle: {bcfg.cycleTimeSec || 30}s
+                              {' · '}👷{countEmployeesAtBuilding(economy.people, bkey)}/{getRequiredEmployees(bcfg)}
+                            </span>
                             {(() => {
-                              const remaining = getCycleRemainingForBuilding(bcfg);
+                              const remaining = getCycleRemainingForBuilding(bcfg, bkey);
+                              const staffed = isStaffedForProduction(bcfg, bkey, economy.people);
+                              if (!staffed) return <span className="text-rose-600 font-bold">Need staff</span>;
                               if (remaining !== null) return <CycleCountdownBadge remaining={remaining} />;
                               if (economy.economyPaused && isRecipeBuilding(bcfg)) {
                                 return <span className="text-slate-400">Paused</span>;
@@ -7031,6 +10839,84 @@ export default function App() {
           )}
         </AnimatePresence>
 
+        {/* Traffic Control Panel */}
+        <AnimatePresence>
+          {showTrafficPanel && (
+            <motion.div
+              initial={{ x: 400, opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: 400, opacity: 0 }}
+              className="absolute right-0 top-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              data-grid-control
+              {...blockGridPointerEvents}
+            >
+              <div className="p-6 border-b border-slate-100 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-red-50 text-red-600 rounded-xl">
+                    <Timer className="w-5 h-5" />
+                  </div>
+                  <h2 className="font-bold text-slate-800">Traffic Control</h2>
+                </div>
+                <button onClick={() => { setShowTrafficPanel(false); setTrafficTool(null); }} className="p-2 hover:bg-slate-50 text-slate-400 rounded-xl transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4">
+                <TrafficPanel
+                  traffic={traffic}
+                  selectedIds={selectedTrafficIds}
+                  trafficTool={trafficTool}
+                  roomCode={roomCode}
+                  onSelectIds={setSelectedTrafficIds}
+                  onSetTool={setTrafficTool}
+                  onUpdateTraffic={emitTraffic}
+                  onDeleteByKind={(kind) => {
+                    const nextControls = { ...traffic.controls };
+                    const nextSelected = new Set(selectedTrafficIds);
+                    Object.values(traffic.controls).forEach(c => {
+                      if (c.kind === kind && selectedTrafficIds.has(trafficControlKey(c))) {
+                        delete nextControls[trafficControlKey(c)];
+                        nextSelected.delete(trafficControlKey(c));
+                      }
+                    });
+                    emitTraffic({ ...traffic, controls: nextControls });
+                    setSelectedTrafficIds(nextSelected);
+                  }}
+                  onLinkSelected={() => {
+                    const groupId = `grp-${Date.now()}`;
+                    const nextControls = { ...traffic.controls };
+                    selectedTrafficIds.forEach(id => {
+                      const c = nextControls[id];
+                      if (c?.kind === 'stoplight') nextControls[id] = { ...c, groupId };
+                    });
+                    const coordinated = coordinateLightGroup(Object.values(nextControls), groupId);
+                    emitTraffic({
+                      ...traffic,
+                      controls: Object.fromEntries(coordinated.map(c => [trafficControlKey(c), c])),
+                    });
+                  }}
+                  onUnlinkSelected={() => {
+                    emitTraffic({
+                      ...traffic,
+                      controls: unlinkStoplights(traffic.controls, selectedTrafficIds),
+                    });
+                  }}
+                  onToggleManual={(manual) => {
+                    const nextControls = { ...traffic.controls };
+                    selectedTrafficIds.forEach(id => {
+                      const c = nextControls[id];
+                      if (c?.kind === 'stoplight') {
+                        nextControls[id] = { ...c, manualOnly: manual };
+                      }
+                    });
+                    emitTraffic({ ...traffic, controls: nextControls });
+                  }}
+                />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Cars Panel */}
         <AnimatePresence>
           {showCarsPanel && (
@@ -7104,6 +10990,56 @@ export default function App() {
                   {carsList.map(renderVehicleListItem)}
                   {carsList.length === 0 && (
                     <div className="flex-1 flex items-center justify-center text-sm text-slate-400 p-4">No cars active</div>
+                  )}
+                </div>
+
+                <div className="bg-white border border-rose-100 rounded-xl p-3 space-y-2 shrink-0">
+                  <div className="text-xs font-semibold text-rose-800 flex items-center gap-1">
+                    <span>🏠</span> Owner house
+                  </div>
+                  <p className="text-[10px] text-slate-500">
+                    Assign selected cars to a house. They tour town, then return home to park for 10s.
+                  </p>
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      disabled={carsFilteredSelection.size === 0 || !roomCode}
+                      onClick={() => toggleHomeAssignMode(carsFilteredSelection)}
+                      className={`flex-1 py-1.5 rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-40 ${
+                        pendingHomeAssign
+                          ? 'bg-rose-600 text-white animate-pulse'
+                          : 'bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200'
+                      }`}
+                    >
+                      {pendingHomeAssign ? 'Click a house…' : 'Assign home'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={carsFilteredSelection.size === 0 || !roomCode}
+                      onClick={() => assignSelectedCarsToRandomHomes(carsFilteredSelection)}
+                      className="flex-1 py-1.5 rounded-lg text-[11px] font-semibold bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 disabled:opacity-40"
+                      title="Assign each selected car to a random house on the map"
+                    >
+                      Random homes
+                    </button>
+                    <button
+                      type="button"
+                      disabled={
+                        carsFilteredSelection.size === 0 ||
+                        !roomCode ||
+                        !Array.from(carsFilteredSelection).some(id => vehicles[id]?.homeKey)
+                      }
+                      onClick={() => clearSelectedHomes(carsFilteredSelection)}
+                      className="px-2 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-40"
+                      title="Clear home assignment"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  {pendingHomeAssign && (
+                    <div className="text-[10px] text-rose-600 font-medium">
+                      Click a Home tile on the map to set ownership.
+                    </div>
                   )}
                 </div>
               </div>
@@ -7484,6 +11420,550 @@ export default function App() {
           )}
         </AnimatePresence>
 
+        {/* Service Vehicles Panel */}
+        <AnimatePresence>
+          {showServicePanel && (
+            <motion.div
+              initial={{ x: 400, opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: 400, opacity: 0 }}
+              className="absolute right-0 top-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              data-grid-control
+              {...blockGridPointerEvents}
+            >
+              <div className="p-6 border-b border-slate-100 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-orange-50 text-orange-600 rounded-xl">
+                    <Siren className="w-5 h-5" />
+                  </div>
+                  <h2 className="font-bold text-slate-800">Service Vehicles</h2>
+                </div>
+                <button onClick={() => setShowServicePanel(false)} className="p-2 hover:bg-slate-50 text-slate-400 rounded-xl transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 flex flex-col gap-4">
+                <div className="bg-slate-50 rounded-xl px-2 py-2 border border-slate-100 shrink-0 space-y-2">
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      ref={addCarsCountRef}
+                      defaultValue={1}
+                      min={1}
+                      max={50}
+                      title="Spawn count"
+                      aria-label="Spawn count"
+                      className="w-11 shrink-0 px-1.5 py-1.5 text-xs text-center border border-slate-200 rounded-lg outline-none focus:border-orange-500 bg-white"
+                    />
+                    <span className="text-[10px] text-slate-500">spawn count</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {(Object.keys(SERVICE_VEHICLE_META) as ServiceVehicleType[]).map(svcType => {
+                      const meta = SERVICE_VEHICLE_META[svcType];
+                      return (
+                        <button
+                          key={svcType}
+                          type="button"
+                          onClick={() => addRandomCars(svcType)}
+                          disabled={!roomCode}
+                          className="flex items-center justify-center gap-1 min-w-0 py-1.5 px-1 rounded-lg text-white text-[11px] font-semibold transition-colors disabled:opacity-50"
+                          style={{ backgroundColor: meta.color === '#f8fafc' ? '#64748b' : meta.color }}
+                          title={`Add ${meta.label}(s)`}
+                        >
+                          <Plus className="w-3 h-3 shrink-0" aria-hidden />
+                          <span className="truncate">{meta.emoji} {meta.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between px-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={serviceList.length > 0 && serviceFilteredSelection.size === serviceList.length}
+                      onChange={() => toggleAllVehiclesOfType('service')}
+                      className="rounded border-slate-300 text-orange-600 focus:ring-orange-600"
+                    />
+                    Select All ({serviceFilteredSelection.size}/{serviceList.length})
+                  </label>
+                  <button
+                    onClick={() => removeSelectedCars(serviceFilteredSelection)}
+                    disabled={serviceFilteredSelection.size === 0 || !roomCode}
+                    className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
+                    title="Remove Selected"
+                  >
+                    <Trash2 className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="bg-white border border-slate-100 rounded-2xl overflow-y-auto overscroll-contain shadow-inner flex flex-col min-h-[120px] max-h-[280px] shrink-0">
+                  {serviceList.map(renderVehicleListItem)}
+                  {serviceList.length === 0 && (
+                    <div className="flex-1 flex items-center justify-center text-sm text-slate-400 p-4">
+                      No service vehicles active
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-[10px] text-slate-500 bg-orange-50 border border-orange-100 rounded-lg p-2 space-y-1">
+                  <p>Park service vehicles in a <strong>Vehicle Repair Shop</strong> bay for repairs, or ambulances in a <strong>Hospital</strong> EMS bay to admit patients.</p>
+                  <p>Open the building to run repair jobs or illness treatments from inventory recipes.</p>
+                </div>
+
+                <div className="bg-white border border-orange-200 rounded-xl p-3 space-y-2 shrink-0">
+                  <div className="text-xs font-semibold text-orange-800 flex items-center gap-1">
+                    <Flame className="w-3.5 h-3.5" /> Start fire
+                  </div>
+                  <p className="text-[10px] text-slate-500">
+                    Click a tree (pine, oak, or seedling) to set it on fire. It burns for 30 seconds, then is removed.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPendingFireStart(p => !p);
+                      setPendingHomeAssign(false);
+                      setPendingEmployeeAssign(false);
+                      setPendingRouteVehicleId(null);
+                      setSelectedTile(null);
+                      setIsPlacingVehicles(false);
+                    }}
+                    className={`w-full py-2 rounded-lg text-xs font-bold transition-colors ${
+                      pendingFireStart
+                        ? 'bg-orange-600 text-white animate-pulse'
+                        : 'bg-orange-50 text-orange-800 hover:bg-orange-100 border border-orange-200'
+                    }`}
+                  >
+                    {pendingFireStart ? 'Click a tree… (Esc to cancel)' : 'Start fire on tree'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="shrink-0 p-4 border-t border-slate-200 bg-slate-50/50 max-h-[45vh] overflow-y-auto overscroll-contain">
+                <VehicleMotionControls
+                  panelType="service"
+                  filteredSelection={serviceFilteredSelection}
+                  vehicles={vehicles}
+                  roomCode={roomCode}
+                  pendingRouteVehicleId={pendingRouteVehicleId}
+                  isPlacingVehicles={isPlacingVehicles}
+                  onSpeedChange={(s) => changeSelectedCarsSpeed(s, serviceFilteredSelection)}
+                  onToggleAttribute={(a) => toggleSelectedCarsAttribute(a, serviceFilteredSelection)}
+                  onDistribute={() => distributeSelectedCars(serviceFilteredSelection)}
+                  onToggleDestination={() => toggleDestinationMode(serviceFilteredSelection)}
+                  onPark={() => parkSelectedVehicles(serviceFilteredSelection)}
+                  onUnpark={() => unparkSelectedVehicles(serviceFilteredSelection)}
+                  onToggleEmergencyLights={() => toggleSelectedEmergencyLights(serviceFilteredSelection)}
+                  showLightsToggle
+                  onTogglePlacing={() => {
+                    const next = !isPlacingVehicles;
+                    setIsPlacingVehicles(next);
+                    if (next) setPendingRouteVehicleId(null);
+                  }}
+                />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* People & Families Panel */}
+        <AnimatePresence>
+          {showPeoplePanel && (
+            <motion.div
+              initial={{ x: 400, opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: 400, opacity: 0 }}
+              className="absolute right-0 top-0 bottom-0 w-[26rem] bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              data-grid-control
+              {...blockGridPointerEvents}
+            >
+              <div className="p-5 border-b border-slate-100 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-violet-50 text-violet-600 rounded-xl">
+                    <Users className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="font-bold text-slate-800">People</h2>
+                    <p className="text-[10px] text-slate-400">
+                      {peopleList.length} citizens · {Object.keys(economy.families || {}).length} families
+                      {' · '}1yr = 1hr
+                    </p>
+                  </div>
+                </div>
+                <button onClick={() => setShowPeoplePanel(false)} className="p-2 hover:bg-slate-50 text-slate-400 rounded-xl">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 flex flex-col gap-3">
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    disabled={!roomCode}
+                    onClick={populatePeople}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-violet-600 text-white text-xs font-bold hover:bg-violet-700 disabled:opacity-40"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    Populate houses
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!roomCode}
+                    onClick={() => {
+                      const next = { ...economy, peoplePaused: !economy.peoplePaused };
+                      setEconomy(next);
+                      if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
+                    }}
+                    className={`px-3 py-2 rounded-xl text-xs font-bold border ${
+                      economy.peoplePaused
+                        ? 'bg-amber-50 text-amber-700 border-amber-200'
+                        : 'bg-slate-50 text-slate-600 border-slate-200'
+                    }`}
+                  >
+                    {economy.peoplePaused ? 'Paused' : 'Running'}
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  Create and manage citizens. Assign employees to recipe buildings (factories / lumbermills)
+                  so production can run. 1 year of age = 1 hour real time.
+                </p>
+
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    disabled={!roomCode}
+                    onClick={openCreatePersonForm}
+                    className="flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold bg-violet-100 text-violet-800 border border-violet-200 hover:bg-violet-200 disabled:opacity-40"
+                  >
+                    <UserPlus className="w-3 h-3" />
+                    New person
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!roomCode || selectedPersonIds.size !== 1}
+                    onClick={() => openEditPersonForm()}
+                    className="flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200 disabled:opacity-40"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    Edit selected
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!roomCode || selectedPersonIds.size === 0}
+                    onClick={deleteSelectedPeople}
+                    className="flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-40"
+                  >
+                    <UserMinus className="w-3 h-3" />
+                    Delete selected
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!roomCode || selectedPersonIds.size === 0}
+                    onClick={startAssignEmployees}
+                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold border disabled:opacity-40 ${
+                      pendingEmployeeAssign
+                        ? 'bg-violet-600 text-white border-violet-700 animate-pulse'
+                        : 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                    }`}
+                  >
+                    <Briefcase className="w-3 h-3" />
+                    {pendingEmployeeAssign ? 'Click building…' : 'Assign workplace'}
+                  </button>
+                </div>
+
+                {peopleFormMode !== 'closed' && (
+                  <div className="bg-white border border-violet-200 rounded-xl p-3 space-y-2 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs font-bold text-violet-900">
+                        {peopleFormMode === 'create' ? 'Create person' : 'Edit person'}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setPeopleFormMode('closed')}
+                        className="text-slate-400 hover:text-slate-600"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <label className="text-[10px] text-slate-500 col-span-1">
+                        First name
+                        <input
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
+                          value={peopleForm.firstName}
+                          onChange={e => setPeopleForm(f => ({ ...f, firstName: e.target.value }))}
+                        />
+                      </label>
+                      <label className="text-[10px] text-slate-500 col-span-1">
+                        Last name
+                        <input
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
+                          value={peopleForm.lastName}
+                          onChange={e => setPeopleForm(f => ({ ...f, lastName: e.target.value }))}
+                        />
+                      </label>
+                      <label className="text-[10px] text-slate-500">
+                        Sex
+                        <select
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
+                          value={peopleForm.sex}
+                          onChange={e => setPeopleForm(f => ({ ...f, sex: e.target.value as 'm' | 'f' }))}
+                        >
+                          <option value="m">Male</option>
+                          <option value="f">Female</option>
+                        </select>
+                      </label>
+                      <label className="text-[10px] text-slate-500">
+                        Age (years)
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
+                          value={peopleForm.ageYears}
+                          onChange={e => setPeopleForm(f => ({ ...f, ageYears: Math.max(0, parseInt(e.target.value) || 0) }))}
+                        />
+                      </label>
+                      <label className="text-[10px] text-slate-500 col-span-2">
+                        Home key (tile)
+                        <select
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
+                          value={peopleForm.homeKey}
+                          onChange={e => setPeopleForm(f => ({ ...f, homeKey: e.target.value }))}
+                        >
+                          <option value="">Select home…</option>
+                          {listHomeKeys(grid).map(hk => (
+                            <option key={hk} value={hk}>{hk}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-[10px] text-slate-500">
+                        Workplace key
+                        <input
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs font-mono"
+                          placeholder="e.g. 12,5 (optional)"
+                          value={peopleForm.workplaceKey}
+                          onChange={e => setPeopleForm(f => ({ ...f, workplaceKey: e.target.value }))}
+                        />
+                      </label>
+                      <label className="text-[10px] text-slate-500">
+                        Money
+                        <input
+                          type="number"
+                          min={0}
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
+                          value={peopleForm.money}
+                          onChange={e => setPeopleForm(f => ({ ...f, money: Math.max(0, parseInt(e.target.value) || 0) }))}
+                        />
+                      </label>
+                      <label className="text-[10px] text-slate-500 col-span-2">
+                        Health
+                        <select
+                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
+                          value={peopleForm.health}
+                          onChange={e => setPeopleForm(f => ({ ...f, health: e.target.value as Person['health'] }))}
+                        >
+                          <option value="healthy">Healthy</option>
+                          <option value="sick">Sick</option>
+                          <option value="injured">Injured</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        disabled={!roomCode || !peopleForm.homeKey}
+                        onClick={savePersonForm}
+                        className="flex-1 py-1.5 rounded-lg text-[11px] font-bold bg-violet-600 text-white disabled:opacity-40"
+                      >
+                        {peopleFormMode === 'create' ? 'Create' : 'Save'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPeopleFormMode('closed')}
+                        className="px-3 py-1.5 rounded-lg text-[11px] font-bold border border-slate-200 text-slate-600"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <input
+                  type="text"
+                  value={peopleFilter}
+                  onChange={e => setPeopleFilter(e.target.value)}
+                  placeholder="Filter by name, home, workplace, activity…"
+                  className="w-full border border-slate-200 rounded-lg px-3 py-1.5 text-xs"
+                />
+
+                <div className="flex items-center justify-between text-[10px] text-slate-500 px-1">
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={filteredPeople.length > 0 && filteredPeople.every(p => selectedPersonIds.has(p.id))}
+                      onChange={() => {
+                        if (filteredPeople.every(p => selectedPersonIds.has(p.id))) {
+                          setSelectedPersonIds(new Set());
+                        } else {
+                          setSelectedPersonIds(new Set(filteredPeople.map(p => p.id)));
+                        }
+                      }}
+                    />
+                    Select all shown ({selectedPersonIds.size})
+                  </label>
+                </div>
+
+                <div className="bg-white border border-slate-100 rounded-2xl overflow-y-auto max-h-[32vh] shadow-inner">
+                  {filteredPeople.length === 0 && (
+                    <div className="p-6 text-center text-sm text-slate-400">
+                      No people yet. Place homes, then Populate houses or create a person.
+                    </div>
+                  )}
+                  {filteredPeople.map(p => {
+                    const fam = economy.families?.[p.familyId];
+                    const healthEmoji = p.health === 'healthy' ? '💚' : p.health === 'sick' ? '🤒' : '🩹';
+                    return (
+                      <div
+                        key={p.id}
+                        className={`flex gap-2 p-2.5 border-b border-slate-50 hover:bg-violet-50/50 ${
+                          selectedPersonIds.has(p.id) ? 'bg-violet-50' : ''
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          className="mt-1"
+                          checked={selectedPersonIds.has(p.id)}
+                          onChange={e => {
+                            const next = new Set(selectedPersonIds);
+                            if (e.target.checked) next.add(p.id);
+                            else next.delete(p.id);
+                            setSelectedPersonIds(next);
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="min-w-0 flex-1 text-left"
+                          onClick={() => {
+                            setSelectedPersonIds(new Set([p.id]));
+                            openEditPersonForm(p.id);
+                          }}
+                        >
+                          <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800">
+                            <span>{p.sex === 'm' ? '♂' : '♀'}</span>
+                            <span className="truncate">{personDisplayName(p)}</span>
+                            <span className="text-slate-400 font-normal">{formatAge(p.ageYears)}</span>
+                            <span>{healthEmoji}</span>
+                          </div>
+                          <div className="text-[10px] text-slate-500 truncate">
+                            {fam ? `${fam.lastName} family` : p.familyId} · 🏠 {p.homeKey}
+                            {p.workplaceKey ? ` · 👷 ${p.workplaceKey}` : ' · no job'}
+                          </div>
+                          <div className="text-[10px] text-violet-600 truncate">
+                            {locationLabel(p.location)} · {p.activity || 'idle'}
+                            {typeof p.money === 'number' ? ` · $${p.money}` : ''}
+                          </div>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="bg-violet-50 border border-violet-100 rounded-xl p-3 space-y-2">
+                  <div className="text-xs font-semibold text-violet-900">Control selected people</div>
+                  <p className="text-[10px] text-slate-500">
+                    Assign workplace by clicking a building tile. Factories need enough employees to produce.
+                    Board vehicles from Cars/Service selection.
+                  </p>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      disabled={selectedPersonIds.size === 0 || !roomCode}
+                      onClick={startAssignEmployees}
+                      className={`py-1.5 rounded-lg text-[11px] font-bold disabled:opacity-40 ${
+                        pendingEmployeeAssign
+                          ? 'bg-violet-700 text-white animate-pulse'
+                          : 'bg-emerald-600 text-white'
+                      }`}
+                    >
+                      <Briefcase className="w-3 h-3 inline mr-0.5" />
+                      {pendingEmployeeAssign ? 'Click building…' : 'Assign workplace'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={selectedPersonIds.size === 0 || !roomCode}
+                      onClick={clearSelectedWorkplaces}
+                      className="py-1.5 rounded-lg text-[11px] font-bold bg-slate-200 text-slate-700 disabled:opacity-40"
+                    >
+                      Clear workplace
+                    </button>
+                    <button
+                      type="button"
+                      disabled={selectedPersonIds.size === 0 || selectedVehicles.size === 0 || !roomCode}
+                      onClick={() => boardSelectedPeople('driver')}
+                      className="py-1.5 rounded-lg text-[11px] font-bold bg-indigo-600 text-white disabled:opacity-40"
+                    >
+                      Board as driver
+                    </button>
+                    <button
+                      type="button"
+                      disabled={selectedPersonIds.size === 0 || selectedVehicles.size === 0 || !roomCode}
+                      onClick={() => boardSelectedPeople('passenger')}
+                      className="py-1.5 rounded-lg text-[11px] font-bold bg-sky-600 text-white disabled:opacity-40"
+                    >
+                      Board as passenger
+                    </button>
+                    <button
+                      type="button"
+                      disabled={selectedPersonIds.size === 0 || !roomCode}
+                      onClick={() => alightSelectedPeople('here')}
+                      className="py-1.5 rounded-lg text-[11px] font-bold bg-slate-700 text-white disabled:opacity-40"
+                    >
+                      Leave vehicle here
+                    </button>
+                    <button
+                      type="button"
+                      disabled={selectedPersonIds.size === 0 || !roomCode}
+                      onClick={sendSelectedPeopleHome}
+                      className="py-1.5 rounded-lg text-[11px] font-bold bg-rose-600 text-white disabled:opacity-40"
+                    >
+                      <Home className="w-3 h-3 inline mr-0.5" />
+                      Send home
+                    </button>
+                    <button
+                      type="button"
+                      disabled={selectedPersonIds.size === 0 || !roomCode}
+                      onClick={enterSelectedBuildingWithPeople}
+                      className="col-span-2 py-1.5 rounded-lg text-[11px] font-bold bg-emerald-700 text-white disabled:opacity-40"
+                    >
+                      Enter building (at vehicle / open inspector)
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+          {/* Home people / family inspector */}
+          <AnimatePresence>
+            {inspectHomeKey && (
+              <HomeInspectorModal
+                homeKey={inspectHomeKey}
+                economy={economy}
+                vehicles={vehicles}
+                onClose={() => setInspectHomeKey(null)}
+                onSelectPerson={(personId) => {
+                  setSelectedPersonIds(new Set([personId]));
+                  setShowPeoplePanel(true);
+                  setInspectHomeKey(null);
+                }}
+              />
+            )}
+          </AnimatePresence>
+
           {/* Building Economy Inspector Modal (new) */}
           <AnimatePresence>
             {inspectBuildingKey && economy.buildings[inspectBuildingKey] && (
@@ -7731,8 +12211,13 @@ export default function App() {
                   <div className="flex flex-col gap-3">
                     <button 
                       onClick={() => {
-                        setGrid(pendingLayout);
-                        addToHistory(pendingLayout);
+                        const layout = pendingLayout;
+                        const nextGrid = layout.grid;
+                        setGrid(nextGrid);
+                        addToHistory(nextGrid);
+                        // Restart all buildings from the layout snapshot (inventory + settings)
+                        const buildings = materializeLayoutBuildings(layout, 0, 0);
+                        applyLayoutBuildings(buildings, 'replace', layout.itemDefs);
                         setShowLoadConfirm(false);
                         setPendingLayout(null);
                       }}
