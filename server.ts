@@ -80,9 +80,6 @@ const roomSimLeaders = new Map<string, string>();
 const CELL_LOCK_TTL_MS = 450;
 const roomCellLocks = new Map<string, Map<string, { socketId: string; expiresAt: number }>>();
 
-type RoomPresence = { userId: string; userColor: string };
-const roomPresence = new Map<string, Map<string, RoomPresence>>();
-
 function getRoomLocks(roomCode: string): Map<string, { socketId: string; expiresAt: number }> {
   let locks = roomCellLocks.get(roomCode);
   if (!locks) {
@@ -98,22 +95,9 @@ function pruneExpiredLocks(locks: Map<string, { socketId: string; expiresAt: num
   }
 }
 
-function getRoomPresence(roomCode: string): Map<string, RoomPresence> {
-  let presence = roomPresence.get(roomCode);
-  if (!presence) {
-    presence = new Map();
-    roomPresence.set(roomCode, presence);
-  }
-  return presence;
-}
-
-function removeSocketPresence(socket: Socket) {
+function removeSocketLocks(socket: Socket) {
   for (const roomCode of socket.rooms) {
     if (roomCode === socket.id) continue;
-    const presence = roomPresence.get(roomCode);
-    if (presence?.delete(socket.id)) {
-      socket.to(roomCode).emit('presence-left', { socketId: socket.id });
-    }
     const locks = roomCellLocks.get(roomCode);
     if (locks) {
       for (const [key, lock] of locks) {
@@ -158,10 +142,6 @@ io.on('connection', (socket) => {
 
   socket.on('leave-room', (roomCode) => {
     const wasLeader = roomSimLeaders.get(roomCode) === socket.id;
-    const presence = roomPresence.get(roomCode);
-    if (presence?.delete(socket.id)) {
-      socket.to(roomCode).emit('presence-left', { socketId: socket.id });
-    }
     const locks = roomCellLocks.get(roomCode);
     if (locks) {
       for (const [key, lock] of locks) {
@@ -218,34 +198,6 @@ io.on('connection', (socket) => {
   
   const sims = db.prepare('SELECT id, name, data FROM simulations').all();
   socket.emit('simulations-updated', sims.map((s: any) => ({ ...s, data: JSON.parse(s.data) })));
-
-  socket.on('presence-hello', ({ roomCode, userId, userColor }) => {
-    if (!roomCode || !userId) return;
-    const presence = getRoomPresence(roomCode);
-    presence.set(socket.id, { userId, userColor: userColor || '#3b82f6' });
-
-    for (const [id, info] of presence) {
-      if (id === socket.id) continue;
-      socket.emit('presence-joined', { socketId: id, ...info });
-    }
-    socket.to(roomCode).emit('presence-joined', {
-      socketId: socket.id,
-      userId,
-      userColor: userColor || '#3b82f6',
-    });
-  });
-
-  socket.on('cursor-move', ({ roomCode, gridX, gridY, userId, userColor, isBuffered }) => {
-    if (!roomCode) return;
-    socket.to(roomCode).emit('cursor-moved', {
-      socketId: socket.id,
-      gridX,
-      gridY,
-      userId,
-      userColor,
-      isBuffered: !!isBuffered,
-    });
-  });
 
   socket.on('update-grid', ({ roomCode, updates }) => {
     if (!roomCode || !updates || typeof updates !== 'object') return;
@@ -344,7 +296,7 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', (reason) => {
     console.log(`User disconnected: ${socket.id}, reason: ${reason}`);
-    removeSocketPresence(socket);
+    removeSocketLocks(socket);
     for (const roomCode of socket.rooms) {
       if (roomCode === socket.id) continue;
       if (roomSimLeaders.get(roomCode) === socket.id) {

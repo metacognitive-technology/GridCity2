@@ -46,7 +46,12 @@ interface VehicleProps {
   trailerCargos?: Record<string, number>[];
   railcarCargos?: Record<string, number>[];
   selectedRailcarIndex?: number;
+  /** Trailer cargo badges (semis) */
   showCargoLabels?: boolean;
+  /** Railcar cargo badges (trains); falls back to showCargoLabels when omitted */
+  showRailcarCargoLabels?: boolean;
+  /** Parking / traffic stop countdown badge */
+  showStopTimerBadge?: boolean;
   itemEmojiResolver?: (itemId: string) => string;
 }
 
@@ -445,8 +450,10 @@ export const Vehicle: React.FC<VehicleProps> = ({
   parkingStopUntil, trafficStopUntil, trafficStopReason, parkingStallIndex = 0, lastParkingKey,
   emergencyLightsOn,
   onSelect, onTrailerSelect, onRailcarSelect,
-  trailerCargos, railcarCargos, selectedRailcarIndex, showCargoLabels, itemEmojiResolver
+  trailerCargos, railcarCargos, selectedRailcarIndex, showCargoLabels,
+  showRailcarCargoLabels, showStopTimerBadge = true, itemEmojiResolver
 }) => {
+  const showRailCargo = showRailcarCargoLabels ?? showCargoLabels;
   const targetHeading = exitHeading !== undefined ? exitHeading : heading;
   
   const stopUntil = parkingStopUntil || trafficStopUntil;
@@ -811,7 +818,7 @@ export const Vehicle: React.FC<VehicleProps> = ({
         }
 
         const cargo = railcarCargos?.[i];
-        const cargoLabels = showCargoLabels && cargo && itemEmojiResolver
+        const cargoLabels = showRailCargo && cargo && itemEmojiResolver
           ? Object.entries(cargo)
               .filter(([, qty]) => qty > 0)
               .map(([itemId, qty]) => ({ emoji: itemEmojiResolver(itemId), qty }))
@@ -832,7 +839,7 @@ export const Vehicle: React.FC<VehicleProps> = ({
         );
       })}
 
-      {timeLeft !== null && timeLeft > 0 && (
+      {showStopTimerBadge && timeLeft !== null && timeLeft > 0 && (
         <motion.div
           style={{
             position: 'absolute',

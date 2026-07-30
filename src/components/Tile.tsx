@@ -1091,6 +1091,43 @@ export const Tile: React.FC<TileProps> = ({
           </>
         );
       }
+      case 'building-taxi-station': {
+        // 4×2: office (localY 0) + 4 taxi bays (localY 1)
+        const bay = (localY ?? 0) >= 1;
+        const bayNum = (localX ?? 0) + 1;
+        return (
+          <>
+            {bay ? (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#ca8a04" />
+                <rect x="3" y="2" width="58" height="60" fill="#a16207" />
+                <line x1="32" y1="4" x2="32" y2="60" stroke="#fef08a" strokeWidth="1.5" strokeDasharray="4 3" />
+                <rect x="8" y="8" width="48" height="10" fill="#422006" opacity="0.45" />
+                <text x="32" y="34" fill="#fef9c3" fontSize="9" textAnchor="middle" fontWeight="bold">
+                  BAY {bayNum}
+                </text>
+                <text x="32" y="46" fill="#fde68a" fontSize="5" textAnchor="middle">TAXI</text>
+              </>
+            ) : (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#fef9c3" />
+                <rect x="4" y="8" width="56" height="42" fill="#facc15" stroke="#a16207" strokeWidth="2" />
+                <rect x="10" y="14" width="16" height="12" fill="#fef08a" />
+                <rect x="38" y="14" width="16" height="12" fill="#fef08a" />
+                <rect x="24" y="32" width="16" height="14" fill="#713f12" />
+                {(localX ?? 0) === 0 && (localY ?? 0) === 0 && (
+                  <text x="32" y="7" fill="#713f12" fontSize="6" textAnchor="middle" fontWeight="bold">
+                    TAXI
+                  </text>
+                )}
+                <text x="32" y="28" fill="#422006" fontSize="7" textAnchor="middle" fontWeight="bold">
+                  {(localX ?? 0) === 1 || (localX ?? 0) === 2 ? 'DISPATCH' : 'STAND'}
+                </text>
+              </>
+            )}
+          </>
+        );
+      }
       case 'building-factory-large':
         // 3x2 industrial + chimneys + 2 docks
         return (

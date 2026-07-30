@@ -45,6 +45,7 @@ export type TileType =
   | 'building-train-station-large'
   | 'building-repair-shop'
   | 'building-hospital'
+  | 'building-taxi-station'
   | 'grass-plain'
   | 'grass-tall'
   | 'grass-flowers'
@@ -79,16 +80,6 @@ export type GridData = Record<string, GridTile[]>;
 export interface Point {
   x: number;
   y: number;
-}
-
-export interface RemoteCursor {
-  socketId: string;
-  userId: string;
-  userColor: string;
-  gridX: number;
-  gridY: number;
-  isBuffered: boolean;
-  lastSeen: number;
 }
 
 export type RailcarType = 'passenger' | 'flatbed' | 'boxcar' | 'container' | 'closed-hopper' | 'open-hopper' | 'tank';
@@ -178,6 +169,19 @@ export interface Vehicle {
   passengerIds?: string[];
   /** Max passengers excluding driver (defaults by vehicle type) */
   maxPassengers?: number;
+  /**
+   * When true, only the controlling user's direct actions may operate this vehicle.
+   * Home AI, auto park/resume, stop signs, people routing, etc. are skipped.
+   * Stoplights still apply (only emergency vehicles with lights on may run them).
+   */
+  manualOverride?: boolean;
+  /** Anonymous user uid holding manual override (required when manualOverride is true). */
+  manualOverrideByUid?: string;
+  /**
+   * Robotaxi ownership: unique taxi-station owner id that owns this taxi.
+   * Only that station's fleet may dispatch it.
+   */
+  taxiOwnerId?: string;
 }
 
 export type PersonSex = 'm' | 'f';
@@ -191,7 +195,16 @@ export type PersonActivity =
   | 'working'
   | 'shopping'
   | 'seeking_care'
-  | 'in_care';
+  | 'in_care'
+  | 'waiting_taxi';
+
+export type TravelPurpose = 'work' | 'shop' | 'home' | 'care';
+
+/** Planned destination for vehicle-based travel (no teleport). */
+export interface PersonTravelIntent {
+  purpose: TravelPurpose;
+  destinationKey: string;
+}
 
 /** Where a person currently is */
 export type PersonLocation =
@@ -220,6 +233,24 @@ export interface Person {
   money?: number;
   activity?: PersonActivity;
   activityUntil?: number;
+  /** Active trip target while commuting / waiting for taxi */
+  travelIntent?: PersonTravelIntent;
+  /** Active taxi ride id (on a taxi-station building) */
+  taxiRideId?: string;
+}
+
+/** In-progress taxi job tracked on a taxi station */
+export interface ActiveTaxiRide {
+  id: string;
+  taxiId: string;
+  passengerId: string;
+  passengerLabel?: string;
+  /** to_pickup: empty taxi → passenger; to_dropoff: passenger aboard → dest */
+  phase: 'to_pickup' | 'to_dropoff';
+  pickupKey: string;
+  destinationKey: string;
+  purpose: TravelPurpose;
+  startedAt: number;
 }
 
 export interface Family {
@@ -300,7 +331,7 @@ export interface ActivePatient {
 export interface BuildingConfig {
   anchorKey: string;
   name?: string;
-  role: 'warehouse' | 'factory' | 'store' | 'lumbermill' | 'repair-shop' | 'hospital' | 'none';
+  role: 'warehouse' | 'factory' | 'store' | 'lumbermill' | 'repair-shop' | 'hospital' | 'taxi-station' | 'none';
   inventory: Record<ItemId, number>;
   /** Max stored quantity per item type */
   inventoryCapacity?: Record<ItemId, number>;
@@ -323,6 +354,16 @@ export interface BuildingConfig {
   activePatients?: ActivePatient[];
   /** Running total of patients successfully treated */
   patientsHealed?: number;
+  // Taxi station
+  /**
+   * Unique owner id for this station's fleet (stable; not the map anchor key).
+   * All taxis owned by this station carry the same taxiOwnerId.
+   */
+  taxiStationOwnerId?: string;
+  /** Vehicle ids owned by this station (starts empty for new stations) */
+  taxiFleetIds?: string[];
+  /** Live rides currently served by this station */
+  activeTaxiRides?: ActiveTaxiRide[];
 }
 
 export interface PlantGrowthSettings {
@@ -367,14 +408,30 @@ export interface TrafficState {
   nextLightId: number;
   nextSignId: number;
   controls: Record<string, TrafficControl>;
+  /** When false, stop signs / stoplights are hidden on the map */
+  showControls?: boolean;
 }
 
 export interface EconomyState {
   itemDefs: ItemDef[];
   buildings: Record<string, BuildingConfig>; // key = anchorKey
   parkedTrailers?: Record<string, ParkedTrailer>;
+  /** Building inventory / production / staffing badges (Logistics) */
   showInventoryLabels: boolean;
+  /** Legacy combined cargo labels; kept for older rooms */
   showCargoLabels: boolean;
+  /** Trailer cargo badges on semis & parked trailers (Semis panel) */
+  showTrailerCargoLabels?: boolean;
+  /** Railcar cargo badges on trains (Trains panel) */
+  showRailcarCargoLabels?: boolean;
+  /** Home occupancy badges on houses (People panel) */
+  showHomeBadges?: boolean;
+  /** Destination bullseye markers for routed vehicles (Cars / Service) */
+  showDestinationMarkers?: boolean;
+  /** Parking / traffic stop countdown badges on vehicles */
+  showVehicleStopBadges?: boolean;
+  /** Growth % badges on pine seedlings (Plant Growth panel) */
+  showSeedlingBadges?: boolean;
   economyPaused: boolean;
   plantGrowth?: PlantGrowthSettings;
   /** Citizens simulation */

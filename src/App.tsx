@@ -66,19 +66,21 @@ import {
   UserMinus,
   Pencil,
   Briefcase,
+  Joystick,
+  GripHorizontal,
+  ShipWheel,
 } from 'lucide-react';
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent, ParkedTrailerVisual } from './components/Vehicle';
 import { TrafficOverlay, getAllTrafficControls, trafficControlKey } from './components/TrafficOverlay';
-import { RemoteCursors } from './components/RemoteCursors';
 import { diffGrid, mergeAcceptedIntoBaseline } from './gridSync';
 import {
   TileType, GridData, Point, GridTile, Vehicle, VehicleType, RailcarType, EconomyState, BuildingConfig,
   ItemDef, Cargo, ItemId, PlantGrowthSettings, ParkedTrailer, TrafficState, TrafficControl, TrafficLightPhase,
-  RemoteCursor, LayoutSnapshot, ServiceVehicleType, SERVICE_VEHICLE_TYPES, isServiceVehicleType,
+  LayoutSnapshot, ServiceVehicleType, SERVICE_VEHICLE_TYPES, isServiceVehicleType,
   hasEmergencyLights,
   RepairRecipe, ActiveRepair, IllnessRecipe, ActivePatient,
-  Person, Family,
+  Person, Family, ActiveTaxiRide,
 } from './types';
 import {
   populateHomes,
@@ -128,14 +130,20 @@ import {
   shouldStopForSign,
   findStopSignForVehicle,
   shouldStopForLight,
+  clampProgressForRedLight,
   hasConflictingTraffic,
   getAvailableLightSlots,
   getStoplightsAt,
   edgePortLabel,
+  isEmergencyMode,
+  getEmergencyHomeLane,
+  getEmergencyPassLane,
 } from './traffic';
 import {
   canResumeAfterVehicleStop,
   findMaxSafeProgress,
+  hasVehicleBlockingAhead,
+  isLaneClearForEmergency,
 } from './vehicleCollision';
 import socket from './socket';
 
@@ -254,6 +262,7 @@ const TILE_CONNECTIONS: Record<string, number[]> = {
   // Service bays driveable from any adjacent road / bay cell
   'building-repair-shop': [0, 1, 2, 3],
   'building-hospital': [0, 1, 2, 3],
+  'building-taxi-station': [0, 1, 2, 3],
   // Houses are approachable driveway-style parking for assigned cars
   'building-home': [0, 1, 2, 3],
 };
@@ -337,6 +346,8 @@ export function getMultiTileDimensions(type: string): { w: number; h: number } {
   if (type === 'building-repair-shop') return { w: 4, h: 6 };
   // 4×4 hospital: wards + ambulance parking strip
   if (type === 'building-hospital') return { w: 4, h: 4 };
+  // 4×2 taxi station: office row + 4 taxi bays
+  if (type === 'building-taxi-station') return { w: 4, h: 2 };
   return { w: 1, h: 1 };
 }
 
@@ -346,7 +357,7 @@ export function isEconomyBuilding(type: string): boolean {
     type.includes('warehouse') || type.includes('factory') || type === 'building-store' ||
     type === 'building-strip-mall' || type === 'building-lumbermill' || type === 'building-station' ||
     type === 'building-train-station-large' || type === 'building-repair-shop' ||
-    type === 'building-hospital'
+    type === 'building-hospital' || type === 'building-taxi-station'
   );
 }
 
@@ -357,6 +368,7 @@ export function getBuildingRole(type: string): BuildingConfig['role'] {
   if (type === 'building-store' || type === 'building-strip-mall') return 'store';
   if (type === 'building-repair-shop') return 'repair-shop';
   if (type === 'building-hospital') return 'hospital';
+  if (type === 'building-taxi-station') return 'taxi-station';
   return 'none';
 }
 
@@ -380,13 +392,24 @@ export function getHospitalBayIndex(tile: GridTile): number {
   return Math.max(0, Math.min(3, tile.localX ?? 0));
 }
 
-/** Any building cell that vehicles can park in (repair bays or hospital ambulance bays). */
+/** Taxi station: bottom row of the 4×2 building (4 bays). */
+export function isTaxiStationBay(tile: GridTile | undefined | null): boolean {
+  if (!tile || tile.type !== 'building-taxi-station') return false;
+  return (tile.localY ?? 0) >= 1;
+}
+
+export function getTaxiStationBayIndex(tile: GridTile): number {
+  return Math.max(0, Math.min(3, tile.localX ?? 0));
+}
+
+/** Any building cell that vehicles can park in (repair / hospital / taxi bays). */
 export function isBuildingParkingBay(tile: GridTile | undefined | null): boolean {
-  return isRepairShopServiceBay(tile) || isHospitalAmbulanceBay(tile);
+  return isRepairShopServiceBay(tile) || isHospitalAmbulanceBay(tile) || isTaxiStationBay(tile);
 }
 
 export function getBuildingParkingBayIndex(tile: GridTile): number {
   if (isHospitalAmbulanceBay(tile)) return getHospitalBayIndex(tile);
+  if (isTaxiStationBay(tile)) return getTaxiStationBayIndex(tile);
   return getRepairShopBayIndex(tile);
 }
 
@@ -451,7 +474,7 @@ export const SERVICE_VEHICLE_META: Record<
   police: { label: 'Police Car', color: '#1e3a8a', emoji: '🚓' },
   ambulance: { label: 'Ambulance', color: '#f8fafc', emoji: '🚑' },
   'tow-truck': { label: 'Tow Truck', color: '#ca8a04', emoji: '🚛' },
-  taxi: { label: 'Taxi', color: '#facc15', emoji: '🚕' },
+  taxi: { label: 'Robotaxi', color: '#facc15', emoji: '🚕' },
   bus: { label: 'Bus', color: '#2563eb', emoji: '🚌' },
 };
 
@@ -923,12 +946,23 @@ function buildDefaultInventoryCapacities(cfg: BuildingConfig): Record<string, nu
 
 function normalizeBuildingConfig(cfg: BuildingConfig): BuildingConfig {
   const inventoryCapacity = buildDefaultInventoryCapacities(cfg);
-  const withCaps = { ...cfg, inventoryCapacity };
-  const inventory = { ...(cfg.inventory || {}) };
+  let next: BuildingConfig = { ...cfg, inventoryCapacity };
+  // Ensure taxi stations always have a stable unique owner id; fleet defaults to empty
+  if (next.role === 'taxi-station') {
+    if (!next.taxiStationOwnerId) {
+      next = {
+        ...next,
+        taxiStationOwnerId: `tso-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      };
+    }
+    if (!next.taxiFleetIds) next = { ...next, taxiFleetIds: [] };
+    if (!next.activeTaxiRides) next = { ...next, activeTaxiRides: [] };
+  }
+  const inventory = { ...(next.inventory || {}) };
   Object.keys(inventory).forEach(itemId => {
-    inventory[itemId] = Math.min(inventory[itemId], getItemCapacity(withCaps, itemId));
+    inventory[itemId] = Math.min(inventory[itemId], getItemCapacity(next, itemId));
   });
-  return { ...withCaps, inventory };
+  return { ...next, inventory };
 }
 
 function getItemCapacity(cfg: BuildingConfig, itemId: string): number {
@@ -1663,109 +1697,26 @@ function HomeInspectorModal({
     v => v.homeKey === homeKey || `${v.x},${v.y}` === homeKey,
   );
 
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const dragOffsetRef = useRef({ x: 0, y: 0 });
-  const [position, setPosition] = useState<Point | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
-
-  const centerPanel = useCallback(() => {
-    const overlay = overlayRef.current;
-    const panel = panelRef.current;
-    if (!overlay || !panel) return;
-    const x = Math.max(0, (overlay.clientWidth - panel.offsetWidth) / 2);
-    const y = Math.max(0, (overlay.clientHeight - panel.offsetHeight) / 2);
-    setPosition({ x, y });
-  }, []);
-
-  useLayoutEffect(() => {
-    centerPanel();
-  }, [homeKey, centerPanel]);
-
-  useEffect(() => {
-    if (!isDragging) return;
-    const onMove = (e: MouseEvent) => {
-      e.preventDefault();
-      const overlay = overlayRef.current;
-      const panel = panelRef.current;
-      if (!overlay || !panel) return;
-      const rect = overlay.getBoundingClientRect();
-      const maxX = Math.max(0, overlay.clientWidth - panel.offsetWidth);
-      const maxY = Math.max(0, overlay.clientHeight - panel.offsetHeight);
-      const x = Math.max(0, Math.min(maxX, e.clientX - rect.left - dragOffsetRef.current.x));
-      const y = Math.max(0, Math.min(maxY, e.clientY - rect.top - dragOffsetRef.current.y));
-      setPosition({ x, y });
-    };
-    const onUp = () => setIsDragging(false);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [isDragging]);
-
-  const handleHeaderMouseDown = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    e.preventDefault();
-    if (!position || !overlayRef.current) return;
-    const rect = overlayRef.current.getBoundingClientRect();
-    dragOffsetRef.current = {
-      x: e.clientX - rect.left - position.x,
-      y: e.clientY - rect.top - position.y,
-    };
-    setIsDragging(true);
-  };
-
   const activityLabel = (p: Person) => {
     if (atHomeIds.has(p.id)) return 'At home';
     return p.activity || locationLabel(p.location);
   };
 
   return (
-    <div
-      ref={overlayRef}
-      className="absolute inset-0 z-[120] pointer-events-none"
-      data-grid-control
-      {...blockGridPointerEvents}
+    <FloatingWindow
+      title={
+        <span className="flex items-center gap-1.5">
+          <Home className="w-3.5 h-3.5" />
+          Home {homeKey}
+        </span>
+      }
+      subtitle={`${atHome.length} at home · ${residents.length} resident${residents.length === 1 ? '' : 's'} · ${families.length} famil${families.length === 1 ? 'y' : 'ies'}`}
+      headerClassName="bg-violet-600 text-white"
+      borderClassName="border-violet-300"
+      widthClassName="w-[22rem]"
+      onClose={onClose}
     >
-      <div
-        ref={panelRef}
-        className="absolute pointer-events-auto bg-white rounded-2xl shadow-2xl border border-violet-200 w-[22rem] max-h-[min(80vh,560px)] flex flex-col overflow-hidden"
-        style={
-          position
-            ? { left: position.x, top: position.y }
-            : { left: '50%', top: '20%', transform: 'translateX(-50%)' }
-        }
-        onMouseDown={e => e.stopPropagation()}
-        onClick={e => e.stopPropagation()}
-      >
-        <div
-          className="shrink-0 px-4 py-3 bg-violet-50 border-b border-violet-100 flex items-center justify-between cursor-move select-none"
-          onMouseDown={handleHeaderMouseDown}
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <div className="p-1.5 bg-violet-100 text-violet-700 rounded-lg">
-              <Home className="w-4 h-4" />
-            </div>
-            <div className="min-w-0">
-              <div className="font-bold text-slate-800 text-sm truncate">Home {homeKey}</div>
-              <div className="text-[10px] text-violet-700">
-                {atHome.length} at home · {residents.length} resident{residents.length === 1 ? '' : 's'} ·{' '}
-                {families.length} famil{families.length === 1 ? 'y' : 'ies'}
-              </div>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-1.5 hover:bg-violet-100 rounded-lg text-slate-500"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-3 space-y-3 text-xs">
+        <div className="p-3 space-y-3 text-xs">
           {families.length === 0 && residents.length === 0 && (
             <div className="text-center text-slate-400 py-6">
               No one lives here yet. Open People → Populate houses, or create a person with this home.
@@ -1889,18 +1840,7 @@ function HomeInspectorModal({
             </div>
           )}
         </div>
-
-        <div className="shrink-0 p-2 border-t border-slate-100 bg-slate-50/80">
-          <button
-            type="button"
-            onClick={onClose}
-            className="w-full py-1.5 rounded-lg bg-slate-800 text-white text-xs font-bold hover:bg-slate-900"
-          >
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
+    </FloatingWindow>
   );
 }
 
@@ -1989,6 +1929,10 @@ function getDestinationArrivalPatch(vehicle: Vehicle, tileX: number, tileY: numb
   if (vehicle.destination.x === tileX && vehicle.destination.y === tileY) {
     const key = `${tileX},${tileY}`;
     const isHomeArrival = !!vehicle.homeKey && vehicle.homeKey === key;
+    // Manual override: stop on arrival only — no auto parking dwell or home-tour schedule
+    if (vehicle.manualOverride) {
+      return { destination: null, isMoving: false, turnIntent: null, progress: 0.5 };
+    }
     if (isHomeArrival) {
       const now = Date.now();
       return {
@@ -2516,6 +2460,193 @@ const blockGridPointerEvents: Pick<
   onContextMenu: stopGridPropagation,
 };
 
+/** Stack order for floating inspectors / drive-style windows */
+let floatingWindowZ = 160;
+let floatingWindowSpawnN = 0;
+
+/**
+ * Persistent floating window (same interaction model as vehicle drive panels):
+ * fixed to the viewport, draggable title bar, no modal backdrop — map stays usable.
+ */
+function FloatingWindow({
+  title,
+  subtitle,
+  headerClassName = 'bg-slate-800 text-white',
+  borderClassName = 'border-slate-200',
+  widthClassName = 'w-[22rem]',
+  maxHeightClassName = 'max-h-[min(80vh,560px)]',
+  children,
+  onClose,
+  initialOffset,
+}: {
+  title: React.ReactNode;
+  subtitle?: React.ReactNode;
+  headerClassName?: string;
+  borderClassName?: string;
+  widthClassName?: string;
+  maxHeightClassName?: string;
+  children: React.ReactNode;
+  onClose: () => void;
+  /** Optional spawn cascade offset so multiple windows don't stack perfectly */
+  initialOffset?: Point;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const spawn = useRef({
+    x: 48 + (floatingWindowSpawnN % 6) * 28 + (initialOffset?.x ?? 0),
+    y: 72 + (floatingWindowSpawnN % 6) * 24 + (initialOffset?.y ?? 0),
+    z: ++floatingWindowZ,
+  });
+  floatingWindowSpawnN += 1;
+
+  const [localPos, setLocalPos] = useState<Point>({ x: spawn.current.x, y: spawn.current.y });
+  const localPosRef = useRef(localPos);
+  const [zIndex, setZIndex] = useState(spawn.current.z);
+  const [isDragging, setIsDragging] = useState(false);
+  const dragSessionRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    originX: number;
+    originY: number;
+    moved: boolean;
+  } | null>(null);
+
+  const clampPos = useCallback((x: number, y: number): Point => {
+    const w = panelRef.current?.offsetWidth ?? 320;
+    const h = panelRef.current?.offsetHeight ?? 240;
+    const maxX = Math.max(0, window.innerWidth - w);
+    const maxY = Math.max(0, window.innerHeight - h);
+    return {
+      x: Math.max(0, Math.min(maxX, x)),
+      y: Math.max(0, Math.min(maxY, y)),
+    };
+  }, []);
+
+  const endDragSession = useCallback((el?: HTMLElement | null, pointerId?: number) => {
+    const session = dragSessionRef.current;
+    if (!session) return;
+    if (pointerId !== undefined && session.pointerId !== pointerId) return;
+    dragSessionRef.current = null;
+    setIsDragging(false);
+    if (el && pointerId !== undefined) {
+      try {
+        if (el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  const handleHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    setZIndex(++floatingWindowZ);
+    dragSessionRef.current = {
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      originX: localPosRef.current.x,
+      originY: localPosRef.current.y,
+      moved: false,
+    };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleHeaderPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const session = dragSessionRef.current;
+    if (!session || e.pointerId !== session.pointerId) return;
+    const dx = e.clientX - session.startClientX;
+    const dy = e.clientY - session.startClientY;
+    if (!session.moved && dx * dx + dy * dy < 16) return;
+    if (!session.moved) {
+      session.moved = true;
+      setIsDragging(true);
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const next = clampPos(session.originX + dx, session.originY + dy);
+    localPosRef.current = next;
+    setLocalPos(next);
+  };
+
+  const handleHeaderPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragSessionRef.current || dragSessionRef.current.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    endDragSession(e.currentTarget, e.pointerId);
+  };
+
+  return (
+    <div
+      ref={panelRef}
+      className={`fixed ${widthClassName} ${maxHeightClassName} bg-white/98 backdrop-blur-md rounded-2xl shadow-2xl border-2 ${borderClassName} flex flex-col overflow-hidden pointer-events-auto`}
+      style={{ left: localPos.x, top: localPos.y, zIndex }}
+      data-grid-control
+      onWheel={stopGridWheel}
+      onContextMenu={stopGridPropagation}
+      onClick={stopGridPropagation}
+      onDoubleClick={stopGridPropagation}
+      onMouseDown={(e) => {
+        stopGridPropagation(e);
+        setZIndex(++floatingWindowZ);
+      }}
+      onPointerDown={(e) => {
+        if ((e.target as HTMLElement).closest('[data-float-title]')) return;
+        stopGridPropagation(e);
+        setZIndex(++floatingWindowZ);
+      }}
+      onPointerUp={stopGridPropagation}
+      onPointerMove={stopGridPropagation}
+    >
+      <div
+        ref={headerRef}
+        data-float-title
+        className={`shrink-0 px-3 py-2 ${headerClassName} flex items-center gap-2 select-none touch-none ${
+          isDragging ? 'cursor-grabbing' : 'cursor-grab'
+        }`}
+        onPointerDown={handleHeaderPointerDown}
+        onPointerMove={handleHeaderPointerMove}
+        onPointerUp={handleHeaderPointerUp}
+        onPointerCancel={handleHeaderPointerUp}
+        onLostPointerCapture={(e) => endDragSession(null, e.pointerId)}
+      >
+        <GripHorizontal className="w-4 h-4 opacity-80 shrink-0 pointer-events-none" />
+        <div className="min-w-0 flex-1 pointer-events-none">
+          <div className="text-xs font-bold truncate">{title}</div>
+          {subtitle != null && subtitle !== false && (
+            <div className="text-[10px] opacity-80 truncate">{subtitle}</div>
+          )}
+        </div>
+        <button
+          type="button"
+          title="Close"
+          onPointerDown={e => {
+            e.stopPropagation();
+            if (dragSessionRef.current) {
+              endDragSession(headerRef.current, dragSessionRef.current.pointerId);
+            }
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onClose();
+          }}
+          className="p-1 rounded-lg hover:bg-white/20 transition-colors shrink-0"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
+        {children}
+      </div>
+    </div>
+  );
+}
+
 const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' | 'building' | 'landscape' }[] = [
   { type: 'road-straight', label: 'Straight Road', category: 'road' },
   { type: 'road-curve', label: 'Curve Road', category: 'road' },
@@ -2575,6 +2706,7 @@ const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' 
   { type: 'building-train-station-large', label: 'Train Station Large (2x2)', category: 'building' },
   { type: 'building-repair-shop', label: 'Vehicle Repair Shop (4×6, 4 bays)', category: 'building' },
   { type: 'building-hospital', label: 'Hospital (4×4, ambulance bays)', category: 'building' },
+  { type: 'building-taxi-station', label: 'Taxi Station (4×2, 4 bays)', category: 'building' },
 ];
 
 function getDefaultBuildingName(type: string): string {
@@ -2769,7 +2901,9 @@ function VehicleMotionControls({
   const activeCountRandomTurn = selectedList.filter(id => vehicles[id]?.randomTurning).length;
   const isRandomTurnActive = filteredSelection.size > 0 && activeCountRandomTurn >= filteredSelection.size / 2;
   const selectedHaveDestination = selectedList.some(id => vehicles[id]?.destination);
-  const isDestinationToggleActive = !!pendingRouteVehicleId || selectedHaveDestination;
+  const isThisPendingRoute =
+    !!pendingRouteVehicleId && selectedList.includes(pendingRouteVehicleId);
+  const isDestinationToggleActive = isThisPendingRoute || selectedHaveDestination;
   const isParkNextActive = selectedList.some(id => vehicles[id]?.parkOnNextLot);
   const firstSpeed = selectedList.length > 0 ? (vehicles[selectedList[0]]?.speed || 1) : 1;
   // Lights default ON when undefined (emergency vehicles only)
@@ -2893,7 +3027,7 @@ function VehicleMotionControls({
           <button
             type="button"
             title={
-              pendingRouteVehicleId
+              isThisPendingRoute
                 ? 'Click a road tile to set destination (toggle off to clear)'
                 : selectedHaveDestination
                   ? 'Clear destinations for selected vehicles'
@@ -2903,7 +3037,7 @@ function VehicleMotionControls({
             onClick={onToggleDestination}
             className={`flex-1 p-2 rounded-lg transition-colors flex items-center justify-center ${
               isDestinationToggleActive
-                ? pendingRouteVehicleId
+                ? isThisPendingRoute
                   ? 'bg-red-600 text-white shadow-sm animate-pulse'
                   : 'bg-blue-600 text-white shadow-sm'
                 : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
@@ -2952,6 +3086,630 @@ function VehicleMotionControls({
   );
 }
 
+export type FloatingDrivePanelState = {
+  vehicleId: string;
+  x: number;
+  y: number;
+  zIndex: number;
+};
+
+function formatControllerLabel(uid: string | undefined): string {
+  if (!uid) return '???';
+  return uid.length > 10 ? uid.slice(0, 10) : uid;
+}
+
+function FloatingVehicleDrivePanel({
+  vehicleId,
+  vehicle,
+  people,
+  localUserUid,
+  position,
+  zIndex,
+  isActive,
+  roomCode,
+  controlsLockedByOther,
+  pendingRouteVehicleId,
+  isPlacingVehicles,
+  pendingHomeAssign,
+  onActivate,
+  onClose,
+  onMove,
+  onSpeedChange,
+  onToggleAttribute,
+  onDistribute,
+  onToggleDestination,
+  onPark,
+  onUnpark,
+  onTogglePlacing,
+  onToggleEmergencyLights,
+  onToggleHomeAssign,
+  onAssignRandomHomes,
+  onClearHomes,
+  onChangeTrailers,
+  onToggleManualOverride,
+}: {
+  vehicleId: string;
+  vehicle: Vehicle | undefined;
+  people?: Record<string, Person>;
+  /** Local anonymous user uid — used to show who holds manual override */
+  localUserUid?: string | null;
+  position: Point;
+  zIndex: number;
+  isActive: boolean;
+  roomCode: string | null;
+  /** True when another multiplayer user holds manual override on this vehicle */
+  controlsLockedByOther?: boolean;
+  pendingRouteVehicleId: string | null;
+  isPlacingVehicles: boolean;
+  pendingHomeAssign: boolean;
+  onActivate: () => void;
+  onClose: () => void;
+  onMove: (pos: Point) => void;
+  onSpeedChange: (speed: number) => void;
+  onToggleAttribute: (attr: 'isMoving' | 'turnAroundAtDeadEnd' | 'randomTurning') => void;
+  onDistribute: () => void;
+  onToggleDestination: () => void;
+  onPark: () => void;
+  onUnpark: () => void;
+  onTogglePlacing: () => void;
+  onToggleEmergencyLights?: () => void;
+  onToggleHomeAssign?: () => void;
+  onAssignRandomHomes?: () => void;
+  onClearHomes?: () => void;
+  onChangeTrailers?: (delta: number) => void;
+  onToggleManualOverride: (enabled: boolean) => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  /** Local window position — only committed to parent on drag end (desktop-style). */
+  const [localPos, setLocalPos] = useState<Point>(position);
+  const localPosRef = useRef(position);
+  const onMoveRef = useRef(onMove);
+  const onActivateRef = useRef(onActivate);
+  const dragSessionRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    originX: number;
+    originY: number;
+    moved: boolean;
+  } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Sync from parent only when not actively dragging (spawn / external layout).
+  useEffect(() => {
+    if (dragSessionRef.current) return;
+    localPosRef.current = position;
+    setLocalPos(position);
+  }, [position.x, position.y]);
+
+  useEffect(() => {
+    onMoveRef.current = onMove;
+  }, [onMove]);
+  useEffect(() => {
+    onActivateRef.current = onActivate;
+  }, [onActivate]);
+
+  const vType = vehicle?.type || 'car';
+  const panelType: VehiclePanelType =
+    vType === 'train' ? 'train'
+      : vType === 'semi' ? 'semi'
+        : isServiceVehicleType(vType) ? 'service'
+          : 'car';
+  const isCarLike = panelType === 'car' || panelType === 'service';
+  const showLights = panelType === 'service' && hasEmergencyLights(vType);
+  const selection = React.useMemo(() => new Set([vehicleId]), [vehicleId]);
+
+  const peopleMap = people || {};
+  const hasPeople = Object.keys(peopleMap).length > 0;
+  const driverId = vehicle
+    ? vehicle.driverId || getDriverId(peopleMap, vehicleId)
+    : null;
+  const passengerIds = vehicle
+    ? (vehicle.passengerIds && vehicle.passengerIds.length > 0
+        ? vehicle.passengerIds
+        : getPassengerIds(peopleMap, vehicleId))
+    : [];
+  const driver = driverId ? peopleMap[driverId] : undefined;
+  const passengers = passengerIds
+    .map(id => peopleMap[id])
+    .filter((p): p is Person => !!p);
+  const owners = vehicle?.homeKey
+    ? peopleResidingAt(peopleMap, vehicle.homeKey).sort((a, b) =>
+        personDisplayName(a).localeCompare(personDisplayName(b)),
+      )
+    : [];
+  const maxPax = vehicle
+    ? vehicle.maxPassengers ?? getMaxPassengers(vehicle.type)
+    : 0;
+
+  const [houseMenuOpen, setHouseMenuOpen] = useState(false);
+  const houseMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!houseMenuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (houseMenuRef.current && !houseMenuRef.current.contains(e.target as Node)) {
+        setHouseMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [houseMenuOpen]);
+
+  const controllerUid = vehicle?.manualOverride
+    ? vehicle.manualOverrideByUid
+    : undefined;
+  const isControlledByOther =
+    !!controlsLockedByOther ||
+    (!!vehicle?.manualOverride &&
+      !!controllerUid &&
+      !!localUserUid &&
+      controllerUid !== localUserUid);
+  const isControlledByMe =
+    !!vehicle?.manualOverride &&
+    !!controllerUid &&
+    !!localUserUid &&
+    controllerUid === localUserUid;
+  const canToggleOverride =
+    !!roomCode &&
+    !isControlledByOther &&
+    (!vehicle?.manualOverride || isControlledByMe || !controllerUid);
+  // Disable motion / placement controls when another user holds override
+  const effectiveRoomCode = isControlledByOther ? null : roomCode;
+
+  const clampPos = useCallback((x: number, y: number): Point => {
+    const w = panelRef.current?.offsetWidth ?? 280;
+    const h = panelRef.current?.offsetHeight ?? 200;
+    const maxX = Math.max(0, window.innerWidth - w);
+    const maxY = Math.max(0, window.innerHeight - h);
+    return {
+      x: Math.max(0, Math.min(maxX, x)),
+      y: Math.max(0, Math.min(maxY, y)),
+    };
+  }, []);
+
+  const endDragSession = useCallback((el?: HTMLElement | null, pointerId?: number) => {
+    const session = dragSessionRef.current;
+    if (!session) return;
+    if (pointerId !== undefined && session.pointerId !== pointerId) return;
+    dragSessionRef.current = null;
+    setIsDragging(false);
+    if (el && pointerId !== undefined) {
+      try {
+        if (el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+    }
+    // Commit final position to parent once
+    onMoveRef.current(localPosRef.current);
+  }, []);
+
+  /**
+   * Drag is handled entirely on the title bar with setPointerCapture.
+   * Window listeners are unreliable here because the panel uses stopPropagation
+   * on pointer events (to block the grid), which prevents mouseup from reaching window.
+   */
+  const handleHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    // Close button stops propagation before reaching here
+    e.stopPropagation();
+    e.preventDefault();
+    onActivateRef.current();
+    dragSessionRef.current = {
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      originX: localPosRef.current.x,
+      originY: localPosRef.current.y,
+      moved: false,
+    };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // still handle move/up on this element
+    }
+  };
+
+  const handleHeaderPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const session = dragSessionRef.current;
+    if (!session || e.pointerId !== session.pointerId) return;
+    // Only drag while we own the pointer (or session is active)
+    const dx = e.clientX - session.startClientX;
+    const dy = e.clientY - session.startClientY;
+    // Click threshold: select without moving until the pointer travels a few px
+    if (!session.moved && dx * dx + dy * dy < 16) return;
+    if (!session.moved) {
+      session.moved = true;
+      setIsDragging(true);
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const next = clampPos(session.originX + dx, session.originY + dy);
+    localPosRef.current = next;
+    setLocalPos(next);
+  };
+
+  const handleHeaderPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragSessionRef.current || dragSessionRef.current.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    endDragSession(e.currentTarget, e.pointerId);
+  };
+
+  const handleHeaderPointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragSessionRef.current || dragSessionRef.current.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    endDragSession(e.currentTarget, e.pointerId);
+  };
+
+  const handleHeaderLostPointerCapture = (e: React.PointerEvent<HTMLDivElement>) => {
+    // Browser / OS can revoke capture; always end cleanly
+    if (!dragSessionRef.current || dragSessionRef.current.pointerId !== e.pointerId) return;
+    endDragSession(null, e.pointerId);
+  };
+
+  const accent =
+    panelType === 'train' ? 'emerald'
+      : panelType === 'semi' ? 'amber'
+        : panelType === 'service' ? 'orange'
+          : 'indigo';
+
+  const accentBorder = {
+    indigo: 'border-indigo-400 ring-indigo-300',
+    amber: 'border-amber-400 ring-amber-300',
+    emerald: 'border-emerald-400 ring-emerald-300',
+    orange: 'border-orange-400 ring-orange-300',
+  }[accent];
+
+  const accentHeader = {
+    indigo: 'bg-indigo-600',
+    amber: 'bg-amber-600',
+    emerald: 'bg-emerald-600',
+    orange: 'bg-orange-600',
+  }[accent];
+
+  if (!vehicle) return null;
+
+  return (
+    <div
+      ref={panelRef}
+      className={`fixed w-[17.5rem] bg-white/98 backdrop-blur-md rounded-2xl shadow-2xl border-2 flex flex-col overflow-hidden pointer-events-auto transition-shadow ${
+        isActive
+          ? `${accentBorder} ring-2 shadow-xl`
+          : 'border-slate-200 opacity-95'
+      }`}
+      style={{
+        left: localPos.x,
+        top: localPos.y,
+        zIndex: isActive ? Math.max(zIndex, 160) : zIndex,
+      }}
+      data-grid-control
+      onWheel={stopGridWheel}
+      onContextMenu={stopGridPropagation}
+      onClick={stopGridPropagation}
+      onDoubleClick={stopGridPropagation}
+      onMouseDown={(e) => {
+        stopGridPropagation(e);
+        onActivateRef.current();
+      }}
+      onMouseUp={stopGridPropagation}
+      onMouseMove={stopGridPropagation}
+      onPointerDown={(e) => {
+        // Title bar manages its own pointerdown + capture drag
+        if ((e.target as HTMLElement).closest('[data-drive-panel-title]')) return;
+        stopGridPropagation(e);
+        onActivateRef.current();
+      }}
+      // stop bubble to grid; title-bar handlers still run first (event target)
+      onPointerUp={stopGridPropagation}
+      onPointerMove={stopGridPropagation}
+    >
+      <div
+        ref={headerRef}
+        data-drive-panel-title
+        className={`shrink-0 px-3 py-2 ${accentHeader} text-white flex items-center gap-2 select-none touch-none ${
+          isDragging ? 'cursor-grabbing' : 'cursor-grab'
+        }`}
+        onPointerDown={handleHeaderPointerDown}
+        onPointerMove={handleHeaderPointerMove}
+        onPointerUp={handleHeaderPointerUp}
+        onPointerCancel={handleHeaderPointerCancel}
+        onLostPointerCapture={handleHeaderLostPointerCapture}
+      >
+        <GripHorizontal className="w-4 h-4 opacity-80 shrink-0 pointer-events-none" />
+        <div className="min-w-0 flex-1 pointer-events-none">
+          <div className="flex items-center gap-1.5">
+            <span
+              className="w-2.5 h-2.5 rounded-full border border-white/70 shrink-0"
+              style={{ backgroundColor: vehicle.color }}
+            />
+            <span className="text-xs font-bold truncate">
+              Drive · {vehicleId.slice(0, 8)}
+            </span>
+          </div>
+          <div className="text-[10px] text-white/80 capitalize truncate flex items-center gap-1">
+            <VehicleTypeIcon type={vehicle.type} />
+            {(vehicle.type || 'car').replace(/-/g, ' ')}
+            {vehicle.destination ? ` · →${vehicle.destination.x},${vehicle.destination.y}` : ''}
+          </div>
+        </div>
+        {vehicle.manualOverride && (
+          <span
+            className="text-[9px] font-bold uppercase tracking-wide bg-violet-900/50 text-violet-100 px-1.5 py-0.5 rounded shrink-0 pointer-events-none"
+            title={
+              controllerUid
+                ? `Manual override — USER: ${formatControllerLabel(controllerUid)}`
+                : 'Manual override on'
+            }
+          >
+            Manual
+          </span>
+        )}
+        {isActive && (
+          <span className="text-[9px] font-bold uppercase tracking-wide bg-white/20 px-1.5 py-0.5 rounded shrink-0 pointer-events-none">
+            Active
+          </span>
+        )}
+        <button
+          type="button"
+          title="Close drive panel"
+          onPointerDown={e => {
+            e.stopPropagation();
+            // Abort any pending drag if user hits close mid-gesture
+            if (dragSessionRef.current) {
+              endDragSession(headerRef.current, dragSessionRef.current.pointerId);
+            }
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onClose();
+          }}
+          className="p-1 rounded-lg hover:bg-white/20 transition-colors shrink-0"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {vehicle.manualOverride && controllerUid && (
+        <div
+          className={`px-3 py-1.5 text-[10px] font-semibold border-b ${
+            isControlledByOther
+              ? 'bg-amber-500 text-amber-950 border-amber-600'
+              : 'bg-violet-700 text-violet-50 border-violet-800'
+          }`}
+        >
+          {isControlledByOther
+            ? `USER: ${formatControllerLabel(controllerUid)} is controlling this vehicle`
+            : isControlledByMe
+              ? `You are controlling this vehicle (USER: ${formatControllerLabel(controllerUid)})`
+              : `USER: ${formatControllerLabel(controllerUid)} is controlling this vehicle`}
+        </div>
+      )}
+
+      {isActive && !isControlledByOther && (
+        <div className="px-3 py-1 bg-slate-900/90 text-[9px] text-slate-200 font-medium tracking-wide border-b border-slate-700/50">
+          Keys → this vehicle: G go · S stop · F/B step · L/R turn · ↑↓ speed · ←→ lane
+        </div>
+      )}
+      {isActive && isControlledByOther && (
+        <div className="px-3 py-1 bg-slate-800/90 text-[9px] text-amber-200 font-medium tracking-wide border-b border-slate-700/50">
+          Keys disabled — another user has manual override
+        </div>
+      )}
+
+      <div className="p-3 flex flex-col gap-2 max-h-[min(70vh,420px)] overflow-y-auto overscroll-contain">
+        {/* Occupancy & ownership */}
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-2 space-y-1.5">
+          <div className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
+            People
+          </div>
+          <div className="grid grid-cols-[3.25rem_1fr] gap-x-1.5 gap-y-1 text-[10px] leading-snug">
+            <span className="text-slate-500 font-semibold">Driver</span>
+            <span className={`truncate ${driver ? 'text-slate-800 font-medium' : 'text-slate-400 italic'}`}>
+              {hasPeople
+                ? driver
+                  ? `${personDisplayName(driver)}${driver.ageYears != null ? ` · ${formatAge(driver.ageYears)}` : ''}`
+                  : 'None'
+                : vehicle?.driverId
+                  ? vehicle.driverId.slice(0, 8)
+                  : '—'}
+            </span>
+            <span className="text-slate-500 font-semibold">Riding</span>
+            <span className={`truncate ${passengers.length ? 'text-slate-800' : 'text-slate-400 italic'}`}>
+              {hasPeople
+                ? passengers.length > 0
+                  ? `${passengers.map(p => personDisplayName(p)).join(', ')} (${passengers.length}/${maxPax})`
+                  : `None (0/${maxPax})`
+                : (vehicle?.passengerIds?.length
+                    ? `${vehicle.passengerIds.length} passenger(s)`
+                    : '—')}
+            </span>
+            <span className="text-slate-500 font-semibold">Owner</span>
+            <span className={`min-w-0 ${owners.length || vehicle?.homeKey ? 'text-slate-800' : 'text-slate-400 italic'}`}>
+              {vehicle?.homeKey ? (
+                <span className="flex flex-col gap-0.5">
+                  <span className="font-mono text-rose-600 text-[9px]" title={vehicle.homeKey}>
+                    🏠 {vehicle.homeKey}
+                  </span>
+                  {hasPeople && (
+                    <span className="truncate" title={owners.map(p => personDisplayName(p)).join(', ')}>
+                      {owners.length > 0
+                        ? owners.map(p => personDisplayName(p)).join(', ')
+                        : 'No residents at this house'}
+                    </span>
+                  )}
+                </span>
+              ) : (
+                'Unassigned'
+              )}
+            </span>
+          </div>
+          {hasPeople && !driver && (
+            <div className="text-[9px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-1.5 py-1">
+              No driver — board someone from the People panel (Board as driver)
+            </div>
+          )}
+        </div>
+
+        {/* Compact: manual override + owner house */}
+        <div className="flex items-center gap-2">
+          <label
+            className={`flex items-center gap-1.5 rounded-xl border px-2 py-1.5 select-none transition-colors ${
+              vehicle.manualOverride
+                ? isControlledByOther
+                  ? 'bg-amber-50 border-amber-300'
+                  : 'bg-violet-50 border-violet-300'
+                : 'bg-slate-50 border-slate-200 hover:bg-slate-100'
+            } ${!canToggleOverride ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
+            title={
+              isControlledByOther
+                ? `USER: ${formatControllerLabel(controllerUid)} holds manual override`
+                : isControlledByMe
+                  ? 'Manual override on — you control this vehicle'
+                  : 'Manual override — only your direct controls'
+            }
+          >
+            <ShipWheel
+              className={`w-4 h-4 shrink-0 ${
+                vehicle.manualOverride
+                  ? isControlledByOther
+                    ? 'text-amber-700'
+                    : 'text-violet-700'
+                  : 'text-slate-500'
+              }`}
+            />
+            <input
+              type="checkbox"
+              className="rounded border-slate-300 text-violet-600 focus:ring-violet-500"
+              checked={!!vehicle.manualOverride}
+              disabled={!canToggleOverride}
+              onChange={(e) => {
+                if (!canToggleOverride) return;
+                onToggleManualOverride(e.target.checked);
+              }}
+            />
+          </label>
+
+          {isCarLike && onToggleHomeAssign && onClearHomes && (
+            <div className="relative flex-1 min-w-0" ref={houseMenuRef}>
+              <button
+                type="button"
+                disabled={!effectiveRoomCode}
+                onClick={() => setHouseMenuOpen(o => !o)}
+                className={`w-full flex items-center gap-1.5 rounded-xl border px-2 py-1.5 text-left transition-colors disabled:opacity-40 ${
+                  pendingHomeAssign && isActive
+                    ? 'bg-rose-600 border-rose-600 text-white animate-pulse'
+                    : vehicle.homeKey
+                      ? 'bg-rose-50 border-rose-200 text-rose-800 hover:bg-rose-100'
+                      : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'
+                }`}
+                title={
+                  pendingHomeAssign && isActive
+                    ? 'Click a Home tile on the map…'
+                    : vehicle.homeKey
+                      ? `Owner house ${vehicle.homeKey}`
+                      : 'No owner house assigned'
+                }
+              >
+                <Home className="w-4 h-4 shrink-0" />
+                <span className="font-mono text-[10px] font-semibold truncate">
+                  {pendingHomeAssign && isActive
+                    ? 'Click house…'
+                    : vehicle.homeKey || '—'}
+                </span>
+              </button>
+              {houseMenuOpen && (
+                <div className="absolute left-0 right-0 top-full mt-1 z-20 rounded-xl border border-slate-200 bg-white shadow-lg overflow-hidden py-0.5">
+                  <button
+                    type="button"
+                    className="w-full px-3 py-1.5 text-left text-[11px] font-semibold text-rose-700 hover:bg-rose-50"
+                    onClick={() => {
+                      setHouseMenuOpen(false);
+                      onToggleHomeAssign();
+                    }}
+                  >
+                    {pendingHomeAssign && isActive ? 'Cancel assign' : 'Assign house…'}
+                  </button>
+                  {onAssignRandomHomes && (
+                    <button
+                      type="button"
+                      className="w-full px-3 py-1.5 text-left text-[11px] font-semibold text-indigo-700 hover:bg-indigo-50"
+                      onClick={() => {
+                        setHouseMenuOpen(false);
+                        onAssignRandomHomes();
+                      }}
+                    >
+                      Random house
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={!vehicle.homeKey}
+                    className="w-full px-3 py-1.5 text-left text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                    onClick={() => {
+                      setHouseMenuOpen(false);
+                      onClearHomes();
+                    }}
+                  >
+                    Clear house
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {panelType === 'semi' && onChangeTrailers && (
+          <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-100 rounded-xl px-2 py-1.5">
+            <span className="text-[10px] font-semibold text-amber-800">
+              Trailers ({getSemiTrailerCount(vehicle)}/2)
+            </span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                disabled={!effectiveRoomCode}
+                onClick={() => onChangeTrailers(-1)}
+                className="w-7 h-7 flex justify-center items-center rounded-lg bg-white border border-amber-200 text-slate-700 font-bold hover:bg-amber-100 disabled:opacity-40"
+              >
+                −
+              </button>
+              <button
+                type="button"
+                disabled={!effectiveRoomCode}
+                onClick={() => onChangeTrailers(1)}
+                className="w-7 h-7 flex justify-center items-center rounded-lg bg-white border border-amber-200 text-slate-700 font-bold hover:bg-amber-100 disabled:opacity-40"
+              >
+                +
+              </button>
+            </div>
+          </div>
+        )}
+
+        <VehicleMotionControls
+          panelType={panelType}
+          filteredSelection={selection}
+          vehicles={vehicle ? { [vehicleId]: vehicle } : {}}
+          roomCode={effectiveRoomCode}
+          pendingRouteVehicleId={isActive ? pendingRouteVehicleId : null}
+          isPlacingVehicles={isActive && isPlacingVehicles}
+          onSpeedChange={onSpeedChange}
+          onToggleAttribute={onToggleAttribute}
+          onDistribute={onDistribute}
+          onToggleDestination={onToggleDestination}
+          onPark={onPark}
+          onUnpark={onUnpark}
+          onTogglePlacing={onTogglePlacing}
+          onToggleEmergencyLights={showLights ? onToggleEmergencyLights : undefined}
+          showLightsToggle={showLights}
+          showParkControls={panelType !== 'train'}
+          showTurnControls
+        />
+      </div>
+    </div>
+  );
+}
+
 type TrafficTool = 'stop-sign' | 'stoplight' | null;
 
 function TrafficPanel({
@@ -2973,7 +3731,7 @@ function TrafficPanel({
   roomCode: string | null;
   onSelectIds: (ids: Set<string>) => void;
   onSetTool: (tool: TrafficTool) => void;
-  onUpdateTraffic: (next: TrafficState) => void;
+  onUpdateTraffic: (next: TrafficState | ((prev: TrafficState) => TrafficState)) => void;
   onDeleteByKind: (kind: 'stop-sign' | 'stoplight') => void;
   onLinkSelected: () => void;
   onUnlinkSelected: () => void;
@@ -2990,30 +3748,32 @@ function TrafficPanel({
   const canUnlink = selectedLights.some(l => l.groupId);
 
   const patchSelectedLights = (patch: Partial<Extract<TrafficControl, { kind: 'stoplight' }>>) => {
-    const nextControls = { ...traffic.controls };
-    selectedIds.forEach(id => {
-      const c = nextControls[id];
-      if (c?.kind === 'stoplight') {
-        nextControls[id] = { ...c, ...patch };
-      }
+    onUpdateTraffic(prev => {
+      const nextControls = { ...prev.controls };
+      selectedIds.forEach(id => {
+        const c = nextControls[id];
+        if (c?.kind === 'stoplight') {
+          nextControls[id] = { ...c, ...patch };
+        }
+      });
+      return { ...prev, controls: nextControls };
     });
-    onUpdateTraffic({ ...traffic, controls: nextControls });
   };
 
   const toggleLightPhase = (light: Extract<TrafficControl, { kind: 'stoplight' }>) => {
     if (!roomCode) return;
     const ctrlKey = trafficControlKey(light);
-    onUpdateTraffic({
-      ...traffic,
+    onUpdateTraffic(prev => ({
+      ...prev,
       controls: {
-        ...traffic.controls,
+        ...prev.controls,
         [ctrlKey]: {
           ...light,
           phase: cycleLightPhase(light.phase),
           phaseStartedAt: Date.now(),
         },
       },
-    });
+    }));
   };
 
   const phaseFields = [
@@ -3072,7 +3832,10 @@ function TrafficPanel({
           step={0.5}
           disabled={!roomCode}
           value={traffic.stopSignMinDurationSec}
-          onChange={e => onUpdateTraffic({ ...traffic, stopSignMinDurationSec: parseFloat(e.target.value) })}
+          onChange={e => {
+            const v = parseFloat(e.target.value);
+            onUpdateTraffic(prev => ({ ...prev, stopSignMinDurationSec: v }));
+          }}
           className="w-full"
         />
       </div>
@@ -3280,11 +4043,6 @@ function TrailerInspectorModal({
   onPickup?: (trailerId: string, vehicleId: string) => void;
   onDrop?: (vehicleId: string, trailerIndex: number) => void;
 }) {
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const dragOffsetRef = useRef({ x: 0, y: 0 });
-  const [position, setPosition] = useState<Point | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
   const [localCargo, setLocalCargo] = useState<Cargo>(() => getTrailerCargo(trailerRef, vehicles, economy));
   const [addItemId, setAddItemId] = useState('');
   const [addQty, setAddQty] = useState(1);
@@ -3319,44 +4077,9 @@ function TrailerInspectorModal({
     ? Object.values(economy.parkedTrailers || {}).filter(t => canPickupParkedTrailer(attachedVehicle, t))
     : [];
 
-  const centerPanel = useCallback(() => {
-    const overlay = overlayRef.current;
-    const panel = panelRef.current;
-    if (!overlay || !panel) return;
-    setPosition({
-      x: Math.max(0, (overlay.clientWidth - panel.offsetWidth) / 2),
-      y: Math.max(0, (overlay.clientHeight - panel.offsetHeight) / 2),
-    });
-  }, []);
-
-  useLayoutEffect(() => {
-    setLocalCargo(getTrailerCargo(trailerRef, vehicles, economy));
-    centerPanel();
-  }, [trailerRef, vehicles, economy, centerPanel]);
-
   useEffect(() => {
-    if (!isDragging) return;
-    const onMove = (e: MouseEvent) => {
-      e.preventDefault();
-      const overlay = overlayRef.current;
-      const panel = panelRef.current;
-      if (!overlay || !panel) return;
-      const rect = overlay.getBoundingClientRect();
-      const maxX = Math.max(0, overlay.clientWidth - panel.offsetWidth);
-      const maxY = Math.max(0, overlay.clientHeight - panel.offsetHeight);
-      setPosition({
-        x: Math.max(0, Math.min(maxX, e.clientX - rect.left - dragOffsetRef.current.x)),
-        y: Math.max(0, Math.min(maxY, e.clientY - rect.top - dragOffsetRef.current.y)),
-      });
-    };
-    const onUp = () => setIsDragging(false);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [isDragging]);
+    setLocalCargo(getTrailerCargo(trailerRef, vehicles, economy));
+  }, [trailerRef, vehicles, economy]);
 
   const persistCargo = (cargo: Cargo) => {
     const cleaned = { ...cargo };
@@ -3389,36 +4112,15 @@ function TrailerInspectorModal({
   };
 
   return (
-    <div
-      ref={overlayRef}
-      className="absolute inset-0 bg-black/30 z-[120]"
-      data-grid-control
-      {...blockGridPointerEvents}
-      onClick={(e) => { e.stopPropagation(); if (e.target === e.currentTarget) onClose(); }}
+    <FloatingWindow
+      title={<>🚛 {title}</>}
+      headerClassName="bg-slate-800 text-white"
+      borderClassName="border-slate-300"
+      widthClassName="w-[min(32rem,calc(100vw-2rem))]"
+      maxHeightClassName="max-h-[min(85vh,640px)]"
+      onClose={onClose}
     >
-      <div
-        ref={panelRef}
-        className="absolute bg-white rounded-2xl shadow-2xl w-[min(32rem,calc(100%-2rem))] max-h-[85vh] flex flex-col overflow-hidden"
-        style={{ left: position?.x ?? 0, top: position?.y ?? 0 }}
-        data-grid-control
-        {...stopGridPropagation}
-      >
-        <div
-          className="px-4 py-3 bg-slate-800 text-white font-bold text-sm cursor-move select-none flex justify-between items-center"
-          onMouseDown={(e) => {
-            e.stopPropagation();
-            e.preventDefault();
-            if (!position || !overlayRef.current) return;
-            const rect = overlayRef.current.getBoundingClientRect();
-            dragOffsetRef.current = { x: e.clientX - rect.left - position.x, y: e.clientY - rect.top - position.y };
-            setIsDragging(true);
-          }}
-        >
-          <span>🚛 {title}</span>
-          <button onClick={onClose} className="text-white/70 hover:text-white text-lg leading-none">×</button>
-        </div>
-
-        <div className="p-4 overflow-y-auto flex-1">
+        <div className="p-4 space-y-3">
           {trailerRef.kind === 'vehicle' && onDrop && (
             <div className="mb-3 p-3 rounded-lg border border-amber-200 bg-amber-50">
               <div className="font-semibold text-sm text-amber-900 mb-2">Trailer Actions</div>
@@ -3570,8 +4272,7 @@ function TrailerInspectorModal({
             <div className="text-[10px] text-slate-500">No configured buildings within range for transfers.</div>
           )}
         </div>
-      </div>
-    </div>
+    </FloatingWindow>
   );
 }
 
@@ -3594,11 +4295,6 @@ function RailcarInspectorModal({
   roomCode: string | null;
   onClose: () => void;
 }) {
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const dragOffsetRef = useRef({ x: 0, y: 0 });
-  const [position, setPosition] = useState<Point | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
   const [localCargo, setLocalCargo] = useState<Cargo>(() => getRailcarCargo(railcarRef, vehicles));
   const [addItemId, setAddItemId] = useState('');
   const [addQty, setAddQty] = useState(1);
@@ -3616,44 +4312,9 @@ function RailcarInspectorModal({
     ? findNearbyEconomyBuildings(railcarPoint.x, railcarPoint.y, grid, economy, 3)
     : [];
 
-  const centerPanel = useCallback(() => {
-    const overlay = overlayRef.current;
-    const panel = panelRef.current;
-    if (!overlay || !panel) return;
-    setPosition({
-      x: Math.max(0, (overlay.clientWidth - panel.offsetWidth) / 2),
-      y: Math.max(0, (overlay.clientHeight - panel.offsetHeight) / 2),
-    });
-  }, []);
-
-  useLayoutEffect(() => {
-    setLocalCargo(getRailcarCargo(railcarRef, vehicles));
-    centerPanel();
-  }, [railcarRef, vehicles, centerPanel]);
-
   useEffect(() => {
-    if (!isDragging) return;
-    const onMove = (e: MouseEvent) => {
-      e.preventDefault();
-      const overlay = overlayRef.current;
-      const panel = panelRef.current;
-      if (!overlay || !panel) return;
-      const rect = overlay.getBoundingClientRect();
-      const maxX = Math.max(0, overlay.clientWidth - panel.offsetWidth);
-      const maxY = Math.max(0, overlay.clientHeight - panel.offsetHeight);
-      setPosition({
-        x: Math.max(0, Math.min(maxX, e.clientX - rect.left - dragOffsetRef.current.x)),
-        y: Math.max(0, Math.min(maxY, e.clientY - rect.top - dragOffsetRef.current.y)),
-      });
-    };
-    const onUp = () => setIsDragging(false);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [isDragging]);
+    setLocalCargo(getRailcarCargo(railcarRef, vehicles));
+  }, [railcarRef, vehicles]);
 
   const persistCargo = (cargo: Cargo) => {
     if (!holdsCargo) return;
@@ -3684,36 +4345,15 @@ function RailcarInspectorModal({
   };
 
   return (
-    <div
-      ref={overlayRef}
-      className="absolute inset-0 bg-black/30 z-[120]"
-      data-grid-control
-      {...blockGridPointerEvents}
-      onClick={(e) => { e.stopPropagation(); if (e.target === e.currentTarget) onClose(); }}
+    <FloatingWindow
+      title={<>🚂 {title}</>}
+      headerClassName="bg-slate-800 text-white"
+      borderClassName="border-slate-300"
+      widthClassName="w-[min(32rem,calc(100vw-2rem))]"
+      maxHeightClassName="max-h-[min(85vh,640px)]"
+      onClose={onClose}
     >
-      <div
-        ref={panelRef}
-        className="absolute bg-white rounded-2xl shadow-2xl w-[min(32rem,calc(100%-2rem))] max-h-[85vh] flex flex-col overflow-hidden"
-        style={{ left: position?.x ?? 0, top: position?.y ?? 0 }}
-        data-grid-control
-        {...stopGridPropagation}
-      >
-        <div
-          className="px-4 py-3 bg-slate-800 text-white font-bold text-sm cursor-move select-none flex justify-between items-center"
-          onMouseDown={(e) => {
-            e.stopPropagation();
-            e.preventDefault();
-            if (!position || !overlayRef.current) return;
-            const rect = overlayRef.current.getBoundingClientRect();
-            dragOffsetRef.current = { x: e.clientX - rect.left - position.x, y: e.clientY - rect.top - position.y };
-            setIsDragging(true);
-          }}
-        >
-          <span>🚂 {title}</span>
-          <button onClick={onClose} className="text-white/70 hover:text-white text-lg leading-none">×</button>
-        </div>
-
-        <div className="p-4 overflow-y-auto flex-1">
+        <div className="p-4 space-y-3">
           {train && (
             <div className="text-[10px] text-slate-500 mb-3">
               Attached to train <span className="font-mono">{train.id}</span>
@@ -3816,8 +4456,7 @@ function RailcarInspectorModal({
             </>
           )}
         </div>
-      </div>
-    </div>
+    </FloatingWindow>
   );
 }
 
@@ -3870,6 +4509,13 @@ function createBuildingConfig(anchorKey: string, type: string): BuildingConfig {
     illnessRecipes: role === 'hospital' ? DEFAULT_ILLNESS_RECIPES.map(r => ({ ...r, inputs: r.inputs.map(i => ({ ...i })) })) : undefined,
     activePatients: role === 'hospital' ? [] : undefined,
     patientsHealed: role === 'hospital' ? 0 : undefined,
+    // New taxi stations start with a unique owner id and an empty fleet
+    taxiStationOwnerId:
+      role === 'taxi-station'
+        ? `tso-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+        : undefined,
+    taxiFleetIds: role === 'taxi-station' ? [] : undefined,
+    activeTaxiRides: role === 'taxi-station' ? [] : undefined,
   };
   return normalizeBuildingConfig(base);
 }
@@ -3919,7 +4565,7 @@ function findVehiclesInBuildingBays(
   anchorKey: string,
   grid: GridData,
   vehicles: Record<string, Vehicle>,
-  buildingType: 'building-repair-shop' | 'building-hospital',
+  buildingType: 'building-repair-shop' | 'building-hospital' | 'building-taxi-station',
 ): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
   const result: Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> = [];
   const seen = new Set<string>();
@@ -3959,6 +4605,343 @@ function findVehiclesInHospitalBays(
   return findVehiclesInBuildingBays(anchorKey, grid, vehicles, 'building-hospital');
 }
 
+function findVehiclesInTaxiStationBays(
+  anchorKey: string,
+  grid: GridData,
+  vehicles: Record<string, Vehicle>,
+): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
+  return findVehiclesInBuildingBays(anchorKey, grid, vehicles, 'building-taxi-station');
+}
+
+function findTaxiBayCells(
+  anchorKey: string,
+  grid: GridData,
+): Array<{ key: string; bayIndex: number; x: number; y: number }> {
+  const cells: Array<{ key: string; bayIndex: number; x: number; y: number }> = [];
+  for (const [key, tiles] of Object.entries(grid)) {
+    for (const t of tiles) {
+      if (t.type !== 'building-taxi-station') continue;
+      const isAnchor = t.part !== 'member' && key === anchorKey;
+      const isMember = t.part === 'member' && t.anchorKey === anchorKey;
+      if (!isAnchor && !isMember) continue;
+      if (!isTaxiStationBay(t)) continue;
+      const [x, y] = key.split(',').map(Number);
+      cells.push({ key, bayIndex: getTaxiStationBayIndex(t), x, y });
+    }
+  }
+  return cells.sort((a, b) => a.bayIndex - b.bayIndex);
+}
+
+function TaxiStationInspectorModal({
+  bkey,
+  cfg,
+  economy,
+  grid,
+  vehicles,
+  setEconomy,
+  setVehicles,
+  roomCode,
+  onClose,
+}: {
+  bkey: string;
+  cfg: BuildingConfig;
+  economy: EconomyState;
+  grid: GridData;
+  vehicles: Record<string, Vehicle>;
+  setEconomy: (eco: EconomyState | ((prev: EconomyState) => EconomyState)) => void;
+  setVehicles: (vs: Record<string, Vehicle> | ((prev: Record<string, Vehicle>) => Record<string, Vehicle>)) => void;
+  roomCode: string | null;
+  onClose: () => void;
+}) {
+  // Ensure this station has a unique owner id (legacy configs)
+  const ownerId =
+    cfg.taxiStationOwnerId ||
+    `tso-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const fleetIds = cfg.taxiFleetIds || [];
+  const rides = cfg.activeTaxiRides || [];
+  const bayVehicles = findVehiclesInTaxiStationBays(bkey, grid, vehicles);
+  // Unowned robotaxis only (not in another station's fleet)
+  const unassignedTaxis = Object.values(vehicles).filter(
+    v => v.type === 'taxi' && !v.taxiOwnerId && !fleetIds.includes(v.id),
+  );
+
+  const saveCfg = (nextCfg: BuildingConfig, nextVehicles?: Record<string, Vehicle>) => {
+    const withOwner: BuildingConfig = {
+      ...nextCfg,
+      taxiStationOwnerId: nextCfg.taxiStationOwnerId || ownerId,
+      taxiFleetIds: nextCfg.taxiFleetIds ?? [],
+    };
+    const eco = {
+      ...economy,
+      buildings: { ...economy.buildings, [bkey]: withOwner },
+    };
+    setEconomy(eco);
+    if (nextVehicles) setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: eco });
+      if (nextVehicles) socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  // Persist owner id if missing on first open
+  useEffect(() => {
+    if (!cfg.taxiStationOwnerId && roomCode) {
+      saveCfg({ ...cfg, taxiStationOwnerId: ownerId, taxiFleetIds: fleetIds });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bkey]);
+
+  const addTaxiToFleet = () => {
+    const bays = findTaxiBayCells(bkey, grid);
+    const occupied = new Set(bayVehicles.map(b => b.bayIndex));
+    const freeBay = bays.find(b => !occupied.has(b.bayIndex));
+    const spawn = freeBay || bays[0];
+    if (!spawn) return;
+    const id = `taxi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const taxi: Vehicle = {
+      id,
+      x: spawn.x,
+      y: spawn.y,
+      heading: 0,
+      lane: 1,
+      progress: 0.5,
+      color: SERVICE_VEHICLE_META.taxi.color,
+      zIndex: 0,
+      type: 'taxi',
+      isMoving: false,
+      speed: 1.2,
+      turnAroundAtDeadEnd: true,
+      randomTurning: false,
+      parkingStallIndex: spawn.bayIndex,
+      lastParkingKey: bkey,
+      taxiOwnerId: ownerId,
+    };
+    const nextVehicles = { ...vehicles, [id]: taxi };
+    const nextCfg: BuildingConfig = {
+      ...cfg,
+      taxiStationOwnerId: ownerId,
+      taxiFleetIds: [...fleetIds, id],
+      activeTaxiRides: rides,
+    };
+    saveCfg(nextCfg, nextVehicles);
+  };
+
+  const assignTaxi = (taxiId: string) => {
+    if (fleetIds.includes(taxiId)) return;
+    const v = vehicles[taxiId];
+    if (!v || v.type !== 'taxi') return;
+    // Cannot steal a taxi already owned by another station
+    if (v.taxiOwnerId && v.taxiOwnerId !== ownerId) return;
+    const nextVehicles = {
+      ...vehicles,
+      [taxiId]: { ...v, taxiOwnerId: ownerId },
+    };
+    saveCfg(
+      {
+        ...cfg,
+        taxiStationOwnerId: ownerId,
+        taxiFleetIds: [...fleetIds, taxiId],
+      },
+      nextVehicles,
+    );
+  };
+
+  const removeTaxiFromFleet = (taxiId: string, deleteVehicle: boolean) => {
+    const nextFleet = fleetIds.filter(id => id !== taxiId);
+    const nextRides = rides.filter(r => r.taxiId !== taxiId);
+    const nextCfg: BuildingConfig = {
+      ...cfg,
+      taxiStationOwnerId: ownerId,
+      taxiFleetIds: nextFleet,
+      activeTaxiRides: nextRides,
+    };
+    if (deleteVehicle) {
+      const nextVehicles = { ...vehicles };
+      delete nextVehicles[taxiId];
+      saveCfg(nextCfg, nextVehicles);
+      return;
+    }
+    const v = vehicles[taxiId];
+    if (v) {
+      const cleared = { ...v };
+      delete cleared.taxiOwnerId;
+      saveCfg(nextCfg, { ...vehicles, [taxiId]: cleared });
+    } else {
+      saveCfg(nextCfg);
+    }
+  };
+
+  const purposeLabel = (p: ActiveTaxiRide['purpose']) => {
+    if (p === 'work') return 'Work';
+    if (p === 'shop') return 'Shop';
+    if (p === 'care') return 'Care';
+    return 'Home';
+  };
+
+  return (
+    <FloatingWindow
+      title={
+        <span className="flex items-center gap-1.5">
+          <CarTaxiFront className="w-3.5 h-3.5" />
+          {cfg.name || 'Taxi Station'}
+        </span>
+      }
+      subtitle={`${bkey} · 4 bays · owner ${ownerId.slice(0, 14)}`}
+      headerClassName="bg-yellow-500 text-yellow-950"
+      borderClassName="border-yellow-300"
+      widthClassName="w-[min(32rem,calc(100vw-2rem))]"
+      maxHeightClassName="max-h-[min(85vh,640px)]"
+      onClose={onClose}
+    >
+        <div className="p-4 space-y-4 text-xs">
+          <div className="rounded-xl border border-yellow-100 bg-yellow-50/80 px-2.5 py-2 space-y-0.5">
+            <div className="text-[10px] font-semibold text-yellow-900 uppercase tracking-wide">
+              Station owner
+            </div>
+            <div className="font-mono text-[11px] text-slate-800 break-all" title={ownerId}>
+              {ownerId}
+            </div>
+            <div className="text-[9px] text-slate-500">
+              This station owns its fleet. New stations start with zero taxis.
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-semibold text-slate-800">Fleet ({fleetIds.length})</div>
+            <button
+              type="button"
+              disabled={!roomCode}
+              onClick={addTaxiToFleet}
+              className="px-2.5 py-1.5 rounded-lg bg-yellow-500 hover:bg-yellow-600 text-yellow-950 font-bold disabled:opacity-40"
+            >
+              + Add taxi
+            </button>
+          </div>
+
+          {fleetIds.length === 0 ? (
+            <div className="text-slate-400 text-center py-3 border border-dashed border-slate-200 rounded-xl">
+              No taxis yet. New stations start empty — add taxis to build the fleet.
+            </div>
+          ) : (
+            <ul className="space-y-1.5">
+              {fleetIds.map(tid => {
+                const v = vehicles[tid];
+                const ride = rides.find(r => r.taxiId === tid);
+                return (
+                  <li
+                    key={tid}
+                    className="flex items-center gap-2 p-2 rounded-xl border border-slate-100 bg-slate-50"
+                  >
+                    <span
+                      className="w-3 h-3 rounded-full shrink-0"
+                      style={{ backgroundColor: v?.color || '#facc15' }}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-mono text-[11px] text-slate-700 truncate">{tid}</div>
+                      <div className="text-[10px] text-slate-500">
+                        {v
+                          ? `@ ${v.x},${v.y}${v.destination ? ` → ${v.destination.x},${v.destination.y}` : ''}`
+                          : 'Missing vehicle'}
+                        {ride
+                          ? ` · ${ride.phase === 'to_pickup' ? 'Pickup' : 'Dropoff'} ${ride.passengerLabel || ride.passengerId.slice(0, 8)}`
+                          : ' · Idle'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={!roomCode}
+                      title="Unassign from station"
+                      onClick={() => removeTaxiFromFleet(tid, false)}
+                      className="text-[10px] px-1.5 py-1 rounded bg-white border border-slate-200 text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+                    >
+                      Unassign
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!roomCode}
+                      title="Remove taxi from world"
+                      onClick={() => removeTaxiFromFleet(tid, true)}
+                      className="text-[10px] px-1.5 py-1 rounded bg-red-50 border border-red-100 text-red-600 hover:bg-red-100 disabled:opacity-40"
+                    >
+                      Delete
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {unassignedTaxis.length > 0 && (
+            <div>
+              <div className="font-semibold text-slate-700 mb-1.5">Assign existing taxi</div>
+              <div className="flex flex-wrap gap-1.5">
+                {unassignedTaxis.map(t => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    disabled={!roomCode}
+                    onClick={() => assignTaxi(t.id)}
+                    className="px-2 py-1 rounded-lg bg-white border border-yellow-200 text-[10px] font-mono text-slate-700 hover:bg-yellow-50 disabled:opacity-40"
+                  >
+                    {t.id.slice(0, 12)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <div className="font-semibold text-slate-800 mb-1.5">
+              Active rides ({rides.length})
+            </div>
+            {rides.length === 0 ? (
+              <div className="text-slate-400 text-center py-3 border border-dashed border-slate-200 rounded-xl">
+                No rides in progress
+              </div>
+            ) : (
+              <div className="overflow-x-auto border border-slate-100 rounded-xl">
+                <table className="w-full text-left text-[10px]">
+                  <thead className="bg-slate-50 text-slate-500">
+                    <tr>
+                      <th className="px-2 py-1.5 font-semibold">Passenger</th>
+                      <th className="px-2 py-1.5 font-semibold">Taxi</th>
+                      <th className="px-2 py-1.5 font-semibold">Phase</th>
+                      <th className="px-2 py-1.5 font-semibold">Destination</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rides.map(r => (
+                      <tr key={r.id} className="border-t border-slate-50">
+                        <td className="px-2 py-1.5 font-medium text-slate-800">
+                          {r.passengerLabel || r.passengerId.slice(0, 10)}
+                          <div className="text-slate-400 font-normal">{purposeLabel(r.purpose)}</div>
+                        </td>
+                        <td className="px-2 py-1.5 font-mono text-slate-600">{r.taxiId.slice(0, 10)}</td>
+                        <td className="px-2 py-1.5">
+                          {r.phase === 'to_pickup' ? (
+                            <span className="text-amber-700">→ Pickup {r.pickupKey}</span>
+                          ) : (
+                            <span className="text-emerald-700">→ Dropoff</span>
+                          )}
+                        </td>
+                        <td className="px-2 py-1.5 font-mono text-slate-700">{r.destinationKey}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="text-[10px] text-slate-500 leading-snug bg-yellow-50 border border-yellow-100 rounded-xl p-2">
+            Stations own their robotaxis (unique owner id). Taxis obey traffic lights and stop signs,
+            leave bays onto adjacent roads, serve rides, then return here.
+          </div>
+        </div>
+    </FloatingWindow>
+  );
+}
+
 function BuildingInspectorModal({
   bkey,
   cfg,
@@ -3983,11 +4966,6 @@ function BuildingInspectorModal({
   onOpenTrailer?: (ref: TrailerRef) => void;
 }) {
   const role = cfg.role;
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const dragOffsetRef = useRef({ x: 0, y: 0 });
-  const [position, setPosition] = useState<Point | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
   const [localName, setLocalName] = useState(cfg.name || '');
   const [localInv, setLocalInv] = useState<Record<string, number>>({ ...(cfg.inventory || {}) });
   const [localCaps, setLocalCaps] = useState<Record<string, number>>({ ...(cfg.inventoryCapacity || {}) });
@@ -4023,18 +5001,7 @@ function BuildingInspectorModal({
   const pickDefaultItem = (used: string[] = []) =>
     itemDefs.find(d => !used.includes(d.id))?.id || itemDefs[0]?.id || '';
 
-  const stopPanelEvent = stopGridPropagation;
-
-  const centerPanel = useCallback(() => {
-    const overlay = overlayRef.current;
-    const panel = panelRef.current;
-    if (!overlay || !panel) return;
-    const x = Math.max(0, (overlay.clientWidth - panel.offsetWidth) / 2);
-    const y = Math.max(0, (overlay.clientHeight - panel.offsetHeight) / 2);
-    setPosition({ x, y });
-  }, []);
-
-  // Only re-init when opening a different building — cfg updates every economy tick and must not reset the panel
+    // Only re-init when opening a different building — cfg updates every economy tick and must not reset the panel
   useLayoutEffect(() => {
     setLocalName(cfg.name || '');
     setLocalInv({ ...(cfg.inventory || {}) });
@@ -4047,8 +5014,7 @@ function BuildingInspectorModal({
     setLocalRepairRecipes((cfg.repairRecipes || []).map(r => ({ ...r, inputs: (r.inputs || []).map(i => ({ ...i })) })));
     setLocalIllnessRecipes((cfg.illnessRecipes || []).map(r => ({ ...r, inputs: (r.inputs || []).map(i => ({ ...i })) })));
     cfgSyncRef.current = Date.now();
-    centerPanel();
-  }, [bkey, centerPanel]);
+  }, [bkey]);
 
   useEffect(() => {
     cfgSyncRef.current = Date.now();
@@ -4059,41 +5025,6 @@ function BuildingInspectorModal({
     const iv = setInterval(() => setEditorTick(t => t + 1), 100);
     return () => clearInterval(iv);
   }, [bkey, economy.economyPaused, role]);
-
-  useEffect(() => {
-    if (!isDragging) return;
-    const onMove = (e: MouseEvent) => {
-      e.preventDefault();
-      const overlay = overlayRef.current;
-      const panel = panelRef.current;
-      if (!overlay || !panel) return;
-      const rect = overlay.getBoundingClientRect();
-      const maxX = Math.max(0, overlay.clientWidth - panel.offsetWidth);
-      const maxY = Math.max(0, overlay.clientHeight - panel.offsetHeight);
-      const x = Math.max(0, Math.min(maxX, e.clientX - rect.left - dragOffsetRef.current.x));
-      const y = Math.max(0, Math.min(maxY, e.clientY - rect.top - dragOffsetRef.current.y));
-      setPosition({ x, y });
-    };
-    const onUp = () => setIsDragging(false);
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-  }, [isDragging]);
-
-  const handleHeaderMouseDown = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    e.preventDefault();
-    if (!position || !overlayRef.current) return;
-    const rect = overlayRef.current.getBoundingClientRect();
-    dragOffsetRef.current = {
-      x: e.clientX - rect.left - position.x,
-      y: e.clientY - rect.top - position.y,
-    };
-    setIsDragging(true);
-  };
 
   const saveConfig = (invOverride?: Record<string, number>) => {
     const invSource = invOverride ?? localInv;
@@ -4154,45 +5085,16 @@ function BuildingInspectorModal({
   };
 
   return (
-    <div
-      ref={overlayRef}
-      className="absolute inset-0 bg-black/30 z-[120]"
-      data-grid-control
-      {...blockGridPointerEvents}
-      onClick={(e) => {
-        e.stopPropagation();
-        if (e.target === e.currentTarget) onClose();
-      }}
+    <FloatingWindow
+      title="Building Config"
+      subtitle={`Role: ${role} • ${bkey}`}
+      headerClassName="bg-slate-700 text-white"
+      borderClassName="border-slate-300"
+      widthClassName="w-[min(32rem,calc(100vw-2rem))]"
+      maxHeightClassName="max-h-[min(85vh,720px)]"
+      onClose={onClose}
     >
-      <div
-        ref={panelRef}
-        className="absolute bg-white rounded-2xl shadow-2xl w-[min(32rem,calc(100%-2rem))] max-h-[85vh] flex flex-col overflow-hidden"
-        style={{
-          left: position?.x ?? 0,
-          top: position?.y ?? 0,
-        }}
-        data-grid-control
-        {...blockGridPointerEvents}
-      >
-        <div
-          className={`flex justify-between items-center px-5 py-3 border-b border-slate-100 bg-slate-50 rounded-t-2xl shrink-0 ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
-          onMouseDown={handleHeaderMouseDown}
-        >
-          <div className="pointer-events-none min-w-0 flex-1">
-            <div className="font-bold text-lg truncate">Building Config</div>
-            <div className="text-xs text-slate-500">Role: {role} • {bkey}</div>
-          </div>
-          <button
-            type="button"
-            onMouseDown={e => e.stopPropagation()}
-            onClick={onClose}
-            className="p-1 rounded-lg hover:bg-slate-200 transition-colors"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        <div className="p-5 overflow-auto overscroll-contain">
+        <div className="p-5 space-y-3">
         <div className="mb-4">
           <div className="font-semibold text-sm mb-1">Building Name</div>
           <input
@@ -5094,8 +5996,7 @@ function BuildingInspectorModal({
         </div>
         <div className="text-[10px] text-emerald-600 mt-2">Tip: Click trailers on the map to edit cargo. Transfer with nearby buildings here or in the Semis &amp; Trailers panel.</div>
         </div>
-      </div>
-    </div>
+    </FloatingWindow>
   );
 }
 
@@ -5146,6 +6047,12 @@ export default function App() {
       parkedTrailers,
       showInventoryLabels: eco?.showInventoryLabels ?? true,
       showCargoLabels: eco?.showCargoLabels ?? true,
+      showTrailerCargoLabels: eco?.showTrailerCargoLabels ?? eco?.showCargoLabels ?? true,
+      showRailcarCargoLabels: eco?.showRailcarCargoLabels ?? eco?.showCargoLabels ?? true,
+      showHomeBadges: eco?.showHomeBadges ?? true,
+      showDestinationMarkers: eco?.showDestinationMarkers ?? true,
+      showVehicleStopBadges: eco?.showVehicleStopBadges ?? true,
+      showSeedlingBadges: eco?.showSeedlingBadges ?? true,
       economyPaused: eco?.economyPaused ?? false,
       plantGrowth: {
         growthDurationSec: eco?.plantGrowth?.growthDurationSec ?? DEFAULT_PLANT_GROWTH.growthDurationSec,
@@ -5211,19 +6118,70 @@ export default function App() {
   const [vehicles, _setVehicles] = useState<Record<string, Vehicle>>({});
   const vehiclesRef = useRef<Record<string, Vehicle>>({});
   const lastSyncedVehicles = useRef<Record<string, Vehicle>>({});
+  /**
+   * Durable per-vehicle manual-override state (flag + controlling user).
+   * Full vehicle map replaces (sim tick, socket sync, stale React snapshots) often omit these
+   * fields and would otherwise flip the checkbox off — re-stamp from this ref on every write.
+   */
+  const manualOverrideByIdRef = useRef<
+    Record<string, { enabled: boolean; byUid?: string }>
+  >({});
+  const stampManualOverrideFlags = useCallback((map: Record<string, Vehicle>): Record<string, Vehicle> => {
+    const durable = manualOverrideByIdRef.current;
+    const next: Record<string, Vehicle> = {};
+    for (const [id, v] of Object.entries(map)) {
+      // Learn explicit values from the incoming map (user toggle or multiplayer peer)
+      if (v.manualOverride === true) {
+        durable[id] = {
+          enabled: true,
+          byUid: v.manualOverrideByUid || durable[id]?.byUid,
+        };
+      } else if (v.manualOverride === false) {
+        durable[id] = { enabled: false };
+      } else if (v.manualOverrideByUid && durable[id]?.enabled) {
+        // Peer sent controller uid while flag was only held durably
+        durable[id] = { enabled: true, byUid: v.manualOverrideByUid };
+      }
+
+      if (id in durable) {
+        const d = durable[id];
+        let stamped = v;
+        if (v.manualOverride !== d.enabled) {
+          stamped = { ...stamped, manualOverride: d.enabled };
+        }
+        if (d.enabled) {
+          if (d.byUid && stamped.manualOverrideByUid !== d.byUid) {
+            stamped = { ...stamped, manualOverrideByUid: d.byUid };
+          }
+        } else if (stamped.manualOverrideByUid) {
+          const cleared = { ...stamped };
+          delete cleared.manualOverrideByUid;
+          stamped = cleared;
+        }
+        next[id] = stamped;
+      } else {
+        next[id] = v;
+      }
+    }
+    // Drop flags for vehicles that no longer exist
+    for (const id of Object.keys(durable)) {
+      if (!(id in next)) delete durable[id];
+    }
+    return next;
+  }, []);
   const setVehicles = useCallback((next: Record<string, Vehicle> | ((prev: Record<string, Vehicle>) => Record<string, Vehicle>)) => {
     if (typeof next === 'function') {
       _setVehicles(prev => {
-        const normalized = normalizeVehicles(next(prev));
+        const normalized = stampManualOverrideFlags(normalizeVehicles(next(prev)));
         vehiclesRef.current = normalized;
         return normalized;
       });
     } else {
-      const normalized = normalizeVehicles(next);
+      const normalized = stampManualOverrideFlags(normalizeVehicles(next));
       vehiclesRef.current = normalized;
       _setVehicles(normalized);
     }
-  }, []);
+  }, [stampManualOverrideFlags]);
   const [selectedVehicles, setSelectedVehicles] = useState<Set<string>>(new Set());
   const [isPlacingVehicles, setIsPlacingVehicles] = useState(false);
   const [showCarsPanel, setShowCarsPanel] = useState(false);
@@ -5231,16 +6189,15 @@ export default function App() {
   const [showTrainPanel, setShowTrainPanel] = useState(false);
   const [showServicePanel, setShowServicePanel] = useState(false);
   const addCarsCountRef = useRef<HTMLInputElement>(null);
-  const [userColor, setUserColor] = useState<string>('#ef4444');
   const userRef = useRef<{ uid: string } | null>(null);
-  const userColorRef = useRef<string>('#ef4444');
-  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
-  const remoteCursorsRef = useRef<Map<string, RemoteCursor>>(new Map());
   const bufferedKeysRef = useRef<Set<string>>(new Set());
   const [hasBufferedEdits, setHasBufferedEdits] = useState(false);
   const gridSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const cursorEmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const localCursorGridRef = useRef<{ gridX: number; gridY: number }>({ gridX: 0, gridY: 0 });
+  const [drivePanels, setDrivePanels] = useState<FloatingDrivePanelState[]>([]);
+  const [activeDrivePanelId, setActiveDrivePanelId] = useState<string | null>(null);
+  const drivePanelZRef = useRef(140);
+  /** Vehicle ids with an open floating drive panel (manual control — skip home AI). */
+  const drivePanelIdsRef = useRef<Set<string>>(new Set());
 
   const [simulations, setSimulations] = useState<any[]>([]);
   const [libraryTab, setLibraryTab] = useState<'layouts' | 'simulations'>('layouts');
@@ -5249,41 +6206,28 @@ export default function App() {
   const [showDeleteSimulationConfirm, setShowDeleteSimulationConfirm] = useState<{ id: string; name: string } | null>(null);
 
   // Economy / Logistics system (new)
-  const [economy, _setEconomy] = useState<EconomyState>({
+  const emptyEconomy = (): EconomyState => ({
     itemDefs: [],
     buildings: {},
     parkedTrailers: {},
     showInventoryLabels: true,
     showCargoLabels: true,
+    showTrailerCargoLabels: true,
+    showRailcarCargoLabels: true,
+    showHomeBadges: true,
+    showDestinationMarkers: true,
+    showVehicleStopBadges: true,
+    showSeedlingBadges: true,
     economyPaused: false,
     people: {},
     families: {},
     peoplePaused: false,
   });
-  const localEconomyRef = useRef<EconomyState>({
-    itemDefs: [],
-    buildings: {},
-    parkedTrailers: {},
-    showInventoryLabels: true,
-    showCargoLabels: true,
-    economyPaused: false,
-    people: {},
-    families: {},
-    peoplePaused: false,
-  });
+  const [economy, _setEconomy] = useState<EconomyState>(() => emptyEconomy());
+  const localEconomyRef = useRef<EconomyState>(emptyEconomy());
   const economyTimerSyncRef = useRef(Date.now());
   const [cycleUiTick, setCycleUiTick] = useState(0);
-  const lastSyncedEconomy = useRef<EconomyState>({
-    itemDefs: [],
-    buildings: {},
-    parkedTrailers: {},
-    showInventoryLabels: true,
-    showCargoLabels: true,
-    economyPaused: false,
-    people: {},
-    families: {},
-    peoplePaused: false,
-  });
+  const lastSyncedEconomy = useRef<EconomyState>(emptyEconomy());
   const [showLogistics, setShowLogistics] = useState(false);
   const [newItemName, setNewItemName] = useState('');
   const [newItemEmoji, setNewItemEmoji] = useState('📦');
@@ -5333,12 +6277,18 @@ export default function App() {
     money: 50,
     health: 'healthy' as Person['health'],
   });
+  /** When creating/editing a person: next map click sets home or workplace */
+  const [pendingPersonFormPick, setPendingPersonFormPick] = useState<'home' | 'workplace' | null>(null);
   const [traffic, setTraffic] = useState<TrafficState>(DEFAULT_TRAFFIC_STATE);
   const localTrafficRef = useRef<TrafficState>(DEFAULT_TRAFFIC_STATE);
   const [showTrafficPanel, setShowTrafficPanel] = useState(false);
   const [trafficTool, setTrafficTool] = useState<TrafficTool>(null);
   const [selectedTrafficIds, setSelectedTrafficIds] = useState<Set<string>>(new Set());
   const [hoveredGridKey, setHoveredGridKey] = useState<string | null>(null);
+  /** Tile key whose coordinates are shown after a 3s hover dwell */
+  const [coordLabelKey, setCoordLabelKey] = useState<string | null>(null);
+  const hoverKeyRef = useRef<string | null>(null);
+  const hoverCoordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const roomCodeRef = useRef<string | null>(null);
   const [isSimLeader, setIsSimLeader] = useState(false);
   const isSimLeaderRef = useRef(false);
@@ -5355,8 +6305,27 @@ export default function App() {
 
   const [roomCode, setRoomCode] = useState<string | null>(null);
 
-  const emitTraffic = useCallback((next: TrafficState) => {
-    const normalized = normalizeTraffic(next);
+  /** Patch a display/badge flag on economy and sync to the room. */
+  const setEconomyBadgeFlag = useCallback(
+    <K extends keyof EconomyState>(key: K, value: EconomyState[K]) => {
+      const next = normalizeEconomy({ ...localEconomyRef.current, [key]: value });
+      setEconomy(next);
+      const rc = roomCodeRef.current || roomCode;
+      if (rc) socket.emit('update-economy', { roomCode: rc, economy: next });
+    },
+    [roomCode, setEconomy],
+  );
+
+  /**
+   * Always apply traffic updates against localTrafficRef (not possibly-stale React
+   * state). Accepts a full state or a functional updater. normalizeTraffic re-keys
+   * controls as kind:id so stop-signs and stoplights never overwrite each other.
+   */
+  const emitTraffic = useCallback((next: TrafficState | ((prev: TrafficState) => TrafficState)) => {
+    const prev = localTrafficRef.current;
+    const resolved = typeof next === 'function' ? next(prev) : next;
+    if (resolved === prev) return; // functional updaters may no-op
+    const normalized = normalizeTraffic(resolved);
     setTraffic(normalized);
     localTrafficRef.current = normalized;
     const rc = roomCodeRef.current;
@@ -5586,12 +6555,6 @@ export default function App() {
     }
     setUser({ uid });
     userRef.current = { uid };
-    
-    // Assign a random color
-    const colors = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
-    const randomColor = colors[Math.floor(Math.random() * colors.length)];
-    setUserColor(randomColor);
-    userColorRef.current = randomColor;
   }, []);
 
   useEffect(() => {
@@ -5627,31 +6590,6 @@ export default function App() {
     }, 32);
   }, [flushGridSync]);
 
-  const emitCursorPosition = useCallback((gridX: number, gridY: number, isBuffered: boolean) => {
-    const rc = roomCodeRef.current;
-    const uid = userRef.current?.uid;
-    if (!rc || !uid) return;
-
-    socket.emit('cursor-move', {
-      roomCode: rc,
-      gridX,
-      gridY,
-      userId: uid,
-      userColor: userColorRef.current,
-      isBuffered,
-    });
-  }, []);
-
-  const scheduleCursorEmit = useCallback((gridX: number, gridY: number, isBuffered: boolean) => {
-    localCursorGridRef.current = { gridX, gridY };
-    if (cursorEmitTimerRef.current) return;
-    cursorEmitTimerRef.current = setTimeout(() => {
-      cursorEmitTimerRef.current = null;
-      const { gridX: gx, gridY: gy } = localCursorGridRef.current;
-      emitCursorPosition(gx, gy, isBuffered);
-    }, 50);
-  }, [emitCursorPosition]);
-
   // Sync grid from Socket.io
   useEffect(() => {
     if (!roomCode) {
@@ -5662,18 +6600,7 @@ export default function App() {
     resetTrafficState();
     bufferedKeysRef.current.clear();
     updateBufferedState();
-    remoteCursorsRef.current.clear();
-    setRemoteCursors([]);
     socket.emit('join-room', roomCode);
-
-    const uid = userRef.current?.uid;
-    if (uid) {
-      socket.emit('presence-hello', {
-        roomCode,
-        userId: uid,
-        userColor: userColorRef.current,
-      });
-    }
 
     const handleWorldState = (data: any) => {
       if (data.roomCode && data.roomCode !== roomCodeRef.current) return;
@@ -5752,49 +6679,53 @@ export default function App() {
       }
     };
 
-    const handlePresenceJoined = ({ socketId, userId, userColor: color }: { socketId: string; userId: string; userColor: string }) => {
-      if (socketId === socket.id) return;
-      const existing = remoteCursorsRef.current.get(socketId);
-      remoteCursorsRef.current.set(socketId, {
-        socketId,
-        userId,
-        userColor: color,
-        gridX: existing?.gridX ?? 0,
-        gridY: existing?.gridY ?? 0,
-        isBuffered: existing?.isBuffered ?? false,
-        lastSeen: Date.now(),
-      });
-      setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
-    };
-
-    const handlePresenceLeft = ({ socketId }: { socketId: string }) => {
-      remoteCursorsRef.current.delete(socketId);
-      setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
-    };
-
-    const handleCursorMoved = (payload: {
-      socketId: string;
-      gridX: number;
-      gridY: number;
-      userId: string;
-      userColor: string;
-      isBuffered: boolean;
-    }) => {
-      if (payload.socketId === socket.id) return;
-      remoteCursorsRef.current.set(payload.socketId, {
-        ...payload,
-        lastSeen: Date.now(),
-      });
-      setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
-    };
-
     const handleVehiclesUpdated = (payload: any) => {
       const eventRoom = typeof payload?.roomCode === 'string' ? payload.roomCode : null;
       const newVehicles = payload?.vehicles ?? payload;
       if (eventRoom && eventRoom !== roomCodeRef.current) return;
+      // setVehicles re-stamps durable manualOverride flags so stale peer snapshots
+      // (missing the field) cannot flip the checkbox off.
       const normalized = normalizeVehicles(newVehicles);
+      if (isSimLeaderRef.current) {
+        // Leader owns kinematics — only adopt explicit control flags (and brand-new vehicles)
+        // from peers. Never full-replace; never drop vehicles on a stale peer snapshot.
+        setVehicles(prev => {
+          let changed = false;
+          const next = { ...prev };
+          for (const [id, rv] of Object.entries(normalized)) {
+            if (!prev[id]) {
+              next[id] = rv;
+              changed = true;
+              continue;
+            }
+            const overrideChanged =
+              (rv.manualOverride === true || rv.manualOverride === false) &&
+              (prev[id].manualOverride !== rv.manualOverride ||
+                prev[id].manualOverrideByUid !== rv.manualOverrideByUid);
+            if (overrideChanged) {
+              const merged: Vehicle = {
+                ...prev[id],
+                manualOverride: rv.manualOverride,
+                manualOverrideByUid: rv.manualOverride
+                  ? rv.manualOverrideByUid || prev[id].manualOverrideByUid
+                  : undefined,
+              };
+              if (rv.manualOverride) {
+                delete merged.trafficStopUntil;
+                delete merged.trafficStopReason;
+                delete merged.nextHomeReturnAt;
+              } else {
+                delete merged.manualOverrideByUid;
+              }
+              next[id] = merged;
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+        return;
+      }
       lastSyncedVehicles.current = normalized;
-      vehiclesRef.current = normalized;
       setVehicles(normalized);
     };
 
@@ -5831,37 +6762,18 @@ export default function App() {
     socket.on('world-state', handleWorldState);
     socket.on('grid-updated', handleGridUpdated);
     socket.on('grid-update-ack', handleGridUpdateAck);
-    socket.on('presence-joined', handlePresenceJoined);
-    socket.on('presence-left', handlePresenceLeft);
-    socket.on('cursor-moved', handleCursorMoved);
     socket.on('vehicles-updated', handleVehiclesUpdated);
     socket.on('economy-updated', handleEconomyUpdated);
     socket.on('traffic-updated', handleTrafficUpdated);
     socket.on('room-sim-role', handleRoomSimRole);
 
-    const cursorStaleInterval = setInterval(() => {
-      const now = Date.now();
-      let pruned = false;
-      for (const [id, cursor] of remoteCursorsRef.current) {
-        if (now - cursor.lastSeen > 8000) {
-          remoteCursorsRef.current.delete(id);
-          pruned = true;
-        }
-      }
-      if (pruned) setRemoteCursors(Array.from(remoteCursorsRef.current.values()));
-    }, 4000);
-
     return () => {
       socket.emit('leave-room', roomCode);
       isSimLeaderRef.current = false;
       setIsSimLeader(false);
-      clearInterval(cursorStaleInterval);
       socket.off('world-state', handleWorldState);
       socket.off('grid-updated', handleGridUpdated);
       socket.off('grid-update-ack', handleGridUpdateAck);
-      socket.off('presence-joined', handlePresenceJoined);
-      socket.off('presence-left', handlePresenceLeft);
-      socket.off('cursor-moved', handleCursorMoved);
       socket.off('vehicles-updated', handleVehiclesUpdated);
       socket.off('economy-updated', handleEconomyUpdated);
       socket.off('traffic-updated', handleTrafficUpdated);
@@ -5882,19 +6794,28 @@ export default function App() {
     return () => clearInterval(retryId);
   }, [roomCode, hasBufferedEdits, scheduleGridSync]);
 
-  // Broadcast buffered cursor state immediately when it changes
-  useEffect(() => {
-    if (!roomCode) return;
-    const { gridX, gridY } = localCursorGridRef.current;
-    emitCursorPosition(gridX, gridY, hasBufferedEdits);
-  }, [roomCode, hasBufferedEdits, emitCursorPosition]);
-
   useEffect(() => {
     if (selectedVehicles.size === 0) {
       setIsPlacingVehicles(false);
       setPendingRouteVehicleId(null);
     }
   }, [selectedVehicles]);
+
+  // Drop drive panels for vehicles that no longer exist
+  useEffect(() => {
+    setDrivePanels(prev => {
+      const next = prev.filter(p => !!vehicles[p.vehicleId]);
+      return next.length === prev.length ? prev : next;
+    });
+    if (activeDrivePanelId && !vehicles[activeDrivePanelId]) {
+      setActiveDrivePanelId(null);
+    }
+  }, [vehicles, activeDrivePanelId]);
+
+  // Keep a ref of vehicles under manual drive-panel control (used by the sim loop)
+  useEffect(() => {
+    drivePanelIdsRef.current = new Set(drivePanels.map(p => p.vehicleId));
+  }, [drivePanels]);
 
   const createRoom = async () => {
     const w1 = WORDS[Math.floor(Math.random() * WORDS.length)];
@@ -6186,7 +7107,12 @@ export default function App() {
 
     ids.forEach(id => {
       if (updatedVehicles[id]) {
-        updatedVehicles[id] = { ...updatedVehicles[id], [attr]: newState };
+        const next = { ...updatedVehicles[id], [attr]: newState };
+        // Manual Go from panel/keyboard: defer home-tour so it doesn't look like "set destination"
+        if (attr === 'isMoving' && newState && next.homeKey) {
+          next.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+        }
+        updatedVehicles[id] = next;
         anyUpdates = true;
       }
     });
@@ -6259,8 +7185,122 @@ export default function App() {
     }
   };
 
+  const activateDrivePanel = useCallback((vehicleId: string, opts?: { keepHomeAssign?: boolean }) => {
+    drivePanelZRef.current += 1;
+    const z = drivePanelZRef.current;
+    setDrivePanels(prev =>
+      prev.map(p => (p.vehicleId === vehicleId ? { ...p, zIndex: z } : p))
+    );
+    setActiveDrivePanelId(vehicleId);
+    setSelectedVehicles(new Set([vehicleId]));
+    setPendingRouteVehicleId(prev => (prev && prev !== vehicleId ? null : prev));
+    setIsPlacingVehicles(false);
+    // Keep house-assign mode when the Assign house button intentionally toggles it
+    if (!opts?.keepHomeAssign) {
+      setPendingHomeAssign(false);
+    }
+  }, []);
+
+  const closeDrivePanel = useCallback((vehicleId: string) => {
+    setDrivePanels(prev => prev.filter(p => p.vehicleId !== vehicleId));
+    setActiveDrivePanelId(prev => {
+      if (prev !== vehicleId) return prev;
+      return null;
+    });
+    if (pendingRouteVehicleId === vehicleId) setPendingRouteVehicleId(null);
+  }, [pendingRouteVehicleId]);
+
+  const moveDrivePanel = useCallback((vehicleId: string, pos: Point) => {
+    setDrivePanels(prev =>
+      prev.map(p => (p.vehicleId === vehicleId ? { ...p, x: pos.x, y: pos.y } : p))
+    );
+  }, []);
+
+  /** Spawn a floating drive panel for each selected vehicle (or a specific id list). */
+  const spawnDrivePanels = useCallback((targetIds?: Iterable<string>) => {
+    const ids = Array.from(targetIds ?? selectedVehicles).filter(id => !!vehiclesRef.current[id]);
+    if (ids.length === 0) return;
+
+    setDrivePanels(prev => {
+      const existing = new Set(prev.map(p => p.vehicleId));
+      const next = [...prev];
+      let cascade = 0;
+      for (const id of ids) {
+        if (existing.has(id)) {
+          // Bring existing to front
+          drivePanelZRef.current += 1;
+          const z = drivePanelZRef.current;
+          const idx = next.findIndex(p => p.vehicleId === id);
+          if (idx >= 0) next[idx] = { ...next[idx], zIndex: z };
+          continue;
+        }
+        drivePanelZRef.current += 1;
+        const z = drivePanelZRef.current;
+        const baseX = 72 + (next.length + cascade) * 28;
+        const baseY = 96 + (next.length + cascade) * 28;
+        next.push({
+          vehicleId: id,
+          x: Math.min(baseX, Math.max(24, window.innerWidth - 300)),
+          y: Math.min(baseY, Math.max(24, window.innerHeight - 360)),
+          zIndex: z,
+        });
+        cascade += 1;
+      }
+      return next;
+    });
+
+    const focusId = ids[ids.length - 1];
+    setActiveDrivePanelId(focusId);
+    setSelectedVehicles(new Set([focusId]));
+    setPendingRouteVehicleId(null);
+    setIsPlacingVehicles(false);
+    setPendingHomeAssign(false);
+  }, [selectedVehicles]);
+
+  /**
+   * If the matching type's vehicle list panel is open, scroll that row into view.
+   * Uses data-vehicle-list-id on list rows (see renderVehicleListItem).
+   */
+  const scrollVehicleListItemIntoView = useCallback((vehicleId: string) => {
+    const v = vehiclesRef.current[vehicleId];
+    if (!v) return;
+    const panelType: VehiclePanelType = vehicleMatchesPanelType(v, 'train')
+      ? 'train'
+      : vehicleMatchesPanelType(v, 'semi')
+        ? 'semi'
+        : vehicleMatchesPanelType(v, 'service')
+          ? 'service'
+          : 'car';
+    const listVisible =
+      (panelType === 'car' && showCarsPanel) ||
+      (panelType === 'semi' && showSemiTrailerPanel) ||
+      (panelType === 'train' && showTrainPanel) ||
+      (panelType === 'service' && showServicePanel);
+    if (!listVisible) return;
+
+    // Wait a frame so selection highlight paints, then scroll within the list
+    requestAnimationFrame(() => {
+      const safeId =
+        typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+          ? CSS.escape(vehicleId)
+          : vehicleId.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const el = document.querySelector(
+        `[data-vehicle-list-id="${safeId}"]`
+      ) as HTMLElement | null;
+      if (!el) return;
+      el.scrollIntoView({ block: 'nearest', behavior: 'smooth', inline: 'nearest' });
+    });
+  }, [showCarsPanel, showSemiTrailerPanel, showTrainPanel, showServicePanel]);
+
   const handleVehicleSelect = useCallback((vehicleId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (e.detail === 2) {
+      // Double-click: open / focus drive panel for this vehicle
+      setSelectedVehicles(new Set([vehicleId]));
+      spawnDrivePanels([vehicleId]);
+      scrollVehicleListItemIntoView(vehicleId);
+      return;
+    }
     if (e.shiftKey) {
       setSelectedVehicles(prev => {
         const next = new Set(prev);
@@ -6270,8 +7310,18 @@ export default function App() {
       });
     } else {
       setSelectedVehicles(new Set([vehicleId]));
+      // If a drive panel is already open for this vehicle, activate it
+      setDrivePanels(prev => {
+        if (prev.some(p => p.vehicleId === vehicleId)) {
+          drivePanelZRef.current += 1;
+          const z = drivePanelZRef.current;
+          setActiveDrivePanelId(vehicleId);
+          return prev.map(p => (p.vehicleId === vehicleId ? { ...p, zIndex: z } : p));
+        }
+        return prev;
+      });
     }
-  }, []);
+  }, [spawnDrivePanels, scrollVehicleListItemIntoView]);
 
   const toggleBuildingProduction = useCallback((anchorKey: string) => {
     setEconomy(prev => {
@@ -6301,32 +7351,44 @@ export default function App() {
     setIsPlacingVehicles(false);
     setPendingHomeAssign(false);
     setPendingEmployeeAssign(false);
+    setPendingPersonFormPick(null);
     setPendingRouteVehicleId(ids[0]);
   };
 
   const toggleHomeAssignMode = (targetIds: Iterable<string> = selectedVehicles) => {
+    const live = vehiclesRef.current;
     const ids = Array.from(targetIds).filter(id => {
-      const t = vehicles[id]?.type || 'car';
-      return t !== 'train' && t !== 'semi';
+      const t = live[id]?.type || 'car';
+      return t !== 'train' && t !== 'semi' && !!live[id];
     });
     if (ids.length === 0) return;
-    // If already assigning, cancel
-    if (pendingHomeAssign) {
-      setPendingHomeAssign(false);
-      return;
-    }
-    // If selection already has homes, allow re-assign; toggle mode on
+
+    // Ensure the vehicles we intend to assign are selected (drive panel / multi-select)
+    setSelectedVehicles(new Set(ids));
     setPendingRouteVehicleId(null);
     setPendingEmployeeAssign(false);
+    setPendingPersonFormPick(null);
     setIsPlacingVehicles(false);
     setSelectedTile(null);
+
+    // Toggle off only when already assigning the same set; otherwise switch targets and stay on
+    if (pendingHomeAssign) {
+      const sameSelection =
+        ids.length === selectedVehicles.size && ids.every(id => selectedVehicles.has(id));
+      if (sameSelection) {
+        setPendingHomeAssign(false);
+        return;
+      }
+      // Different targets while mode is on — keep mode, selection already updated
+      return;
+    }
     setPendingHomeAssign(true);
   };
 
   const clearSelectedHomes = (targetIds: Iterable<string> = selectedVehicles) => {
     const ids = Array.from(targetIds);
     if (ids.length === 0) return;
-    const updatedVehicles = { ...vehicles };
+    const updatedVehicles = { ...vehiclesRef.current };
     let any = false;
     ids.forEach(id => {
       if (updatedVehicles[id]?.homeKey) {
@@ -6346,9 +7408,10 @@ export default function App() {
 
   /** Assign each selected car to a random house on the map (unique when possible). */
   const assignSelectedCarsToRandomHomes = (targetIds: Iterable<string> = selectedVehicles) => {
+    const live = vehiclesRef.current;
     const ids = Array.from(targetIds).filter(id => {
-      const t = vehicles[id]?.type || 'car';
-      return t !== 'train' && t !== 'semi' && !!vehicles[id];
+      const t = live[id]?.type || 'car';
+      return t !== 'train' && t !== 'semi' && !!live[id];
     });
     if (ids.length === 0) return;
 
@@ -6368,7 +7431,7 @@ export default function App() {
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
 
-    const updatedVehicles = { ...vehicles };
+    const updatedVehicles = { ...live };
     const now = Date.now();
     ids.forEach((id, index) => {
       const v = updatedVehicles[id];
@@ -6615,6 +7678,65 @@ export default function App() {
     }
   };
 
+  /**
+   * Toggle manual override for a vehicle — bound to the local anonymous user.
+   * Only the holding user may release; others cannot take over while active.
+   */
+  const setVehicleManualOverride = (vehicleId: string, enabled: boolean) => {
+    const myUid = userRef.current?.uid;
+    if (!myUid) return;
+
+    const base = vehiclesRef.current;
+    const v = base[vehicleId];
+    if (!v) return;
+
+    if (enabled) {
+      // Another user already holds override — do not steal
+      if (v.manualOverride && v.manualOverrideByUid && v.manualOverrideByUid !== myUid) {
+        return;
+      }
+      manualOverrideByIdRef.current[vehicleId] = { enabled: true, byUid: myUid };
+      const nextVeh: Vehicle = {
+        ...v,
+        manualOverride: true,
+        manualOverrideByUid: myUid,
+      };
+      delete nextVeh.trafficStopUntil;
+      delete nextVeh.trafficStopReason;
+      delete nextVeh.nextHomeReturnAt;
+      const updatedVehicles = stampManualOverrideFlags(
+        normalizeVehicles({ ...base, [vehicleId]: nextVeh })
+      );
+      vehiclesRef.current = updatedVehicles;
+      setVehicles(updatedVehicles);
+      if (roomCode) {
+        lastSyncedVehicles.current = updatedVehicles;
+        socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+      }
+      return;
+    }
+
+    // Disable: only the controller may release
+    if (v.manualOverrideByUid && v.manualOverrideByUid !== myUid) {
+      return;
+    }
+    manualOverrideByIdRef.current[vehicleId] = { enabled: false };
+    const nextVeh: Vehicle = { ...v, manualOverride: false };
+    delete nextVeh.manualOverrideByUid;
+    if (nextVeh.homeKey) {
+      nextVeh.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+    }
+    const updatedVehicles = stampManualOverrideFlags(
+      normalizeVehicles({ ...base, [vehicleId]: nextVeh })
+    );
+    vehiclesRef.current = updatedVehicles;
+    setVehicles(updatedVehicles);
+    if (roomCode) {
+      lastSyncedVehicles.current = updatedVehicles;
+      socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+    }
+  };
+
   const requestRef = useRef<number>(0);
   const lastTimeRef = useRef<number>(0);
 
@@ -6634,12 +7756,18 @@ export default function App() {
 
         for (const [uid, v] of Object.entries(prev)) {
           const vehicle = v as Vehicle;
+          const manualOverride = !!vehicle.manualOverride;
           const peopleMap = localEconomyRef.current.people || {};
           const hasPeopleSim = Object.keys(peopleMap).length > 0;
           // When people sim is active, vehicles need a driver to move
-          if (hasPeopleSim) {
-            const driverId = vehicle.driverId || getDriverId(peopleMap, vehicle.id);
-            if (!driverId) {
+          // Manual override: user may drive without a sim driver
+          // Robotaxis: never require a person driver
+          if (hasPeopleSim && !manualOverride) {
+            const isRobotaxi = vehicle.type === 'taxi';
+            const driverId = isRobotaxi
+              ? undefined
+              : vehicle.driverId || getDriverId(peopleMap, vehicle.id);
+            if (!driverId && !isRobotaxi) {
               if (vehicle.isMoving) {
                 nextVehicles[uid] = { ...vehicle, isMoving: false, driverId: undefined };
                 hasChanges = true;
@@ -6652,8 +7780,12 @@ export default function App() {
                 hasChanges = true;
               }
               continue;
-            } else if (vehicle.driverId !== driverId) {
+            } else if (!isRobotaxi && driverId && vehicle.driverId !== driverId) {
               nextVehicles[uid] = { ...vehicle, driverId };
+              hasChanges = true;
+            } else if (isRobotaxi && vehicle.driverId) {
+              // Clear any stale human driver assignment on robotaxis
+              nextVehicles[uid] = { ...vehicle, driverId: undefined };
               hasChanges = true;
             }
           }
@@ -6669,10 +7801,15 @@ export default function App() {
             if (Date.now() >= vehicle.parkingStopUntil) {
               const newVehicle = { ...vehicle };
               delete newVehicle.parkingStopUntil;
-              // Resume touring after home (or lot) parking
-              newVehicle.isMoving = true;
-              if (newVehicle.homeKey && !newVehicle.nextHomeReturnAt) {
-                newVehicle.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+              if (manualOverride) {
+                // Stay stopped — user must press Go
+                newVehicle.isMoving = false;
+              } else {
+                // Resume touring after home (or lot) parking
+                newVehicle.isMoving = true;
+                if (newVehicle.homeKey && !newVehicle.nextHomeReturnAt) {
+                  newVehicle.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+                }
               }
               nextVehicles[uid] = newVehicle;
               hasChanges = true;
@@ -6680,15 +7817,18 @@ export default function App() {
             continue;
           }
 
-          // Cars with an assigned home occasionally set destination back home
+          // Cars with an assigned home occasionally set destination back home.
+          // Skip under manual override or while the floating drive panel is open.
           const vTypeForHome = vehicle.type || 'car';
           const isCarLike =
             vTypeForHome === 'car' || isServiceVehicleType(vTypeForHome);
+          const underManualDrive = manualOverride || drivePanelIdsRef.current.has(vehicle.id);
           if (
             isCarLike &&
             vehicle.homeKey &&
             !vehicle.destination &&
-            vehicle.isMoving !== false
+            vehicle.isMoving !== false &&
+            !underManualDrive
           ) {
             const now = Date.now();
             if (!vehicle.nextHomeReturnAt) {
@@ -6741,7 +7881,8 @@ export default function App() {
           const trafficState = localTrafficRef.current;
           const vType = vehicle.type || 'car';
 
-          if (vehicle.trafficStopUntil && vType !== 'train') {
+          // Traffic control automation is system operation — skip under manual override
+          if (!manualOverride && vehicle.trafficStopUntil && vType !== 'train') {
             const key = `${vehicle.x},${vehicle.y}`;
             const tiles = currentGrid[key];
             const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
@@ -6774,6 +7915,7 @@ export default function App() {
           }
 
           if (!vehicle.isMoving && !vehicle.stepForward && !vehicle.stepBackward) {
+            // Stoplight resume always applies (emergency+lights may proceed via shouldStopForLight)
             if (vehicle.trafficStopReason === 'stoplight' && vType !== 'train') {
               const tiles = currentGrid[`${vehicle.x},${vehicle.y}`];
               const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
@@ -6783,34 +7925,36 @@ export default function App() {
                 nextVehicles[uid] = resumed;
                 hasChanges = true;
               }
-            } else if (vehicle.trafficStopReason === 'vehicle') {
-              if (canResumeAfterVehicleStop(vehicle, nextVehicles, currentGrid)) {
-                const resumed = { ...vehicle, isMoving: true };
-                delete resumed.trafficStopReason;
-                nextVehicles[uid] = resumed;
-                hasChanges = true;
-              }
-            } else if (vehicle.trafficStopReason === 'stop-sign') {
-              const tiles = currentGrid[`${vehicle.x},${vehicle.y}`];
-              const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
-              if (roadTile) {
-                const signStop = shouldStopForSign(vehicle, roadTile, trafficState, nextVehicles, currentGrid);
-                if (!signStop.stop) {
+            } else if (!manualOverride) {
+              if (vehicle.trafficStopReason === 'vehicle') {
+                if (canResumeAfterVehicleStop(vehicle, nextVehicles, currentGrid)) {
                   const resumed = { ...vehicle, isMoving: true };
-                  delete resumed.trafficStopUntil;
                   delete resumed.trafficStopReason;
-                  const sign = findStopSignForVehicle(
-                    `${vehicle.x},${vehicle.y}`,
-                    vehicle.heading,
-                    vehicle.lane,
-                    roadTile,
-                    trafficState
-                  );
-                  if (sign?.kind === 'stop-sign') {
-                    resumed.satisfiedStopSignKey = `${vehicle.x},${vehicle.y}:${sign.id}`;
-                  }
                   nextVehicles[uid] = resumed;
                   hasChanges = true;
+                }
+              } else if (vehicle.trafficStopReason === 'stop-sign') {
+                const tiles = currentGrid[`${vehicle.x},${vehicle.y}`];
+                const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
+                if (roadTile) {
+                  const signStop = shouldStopForSign(vehicle, roadTile, trafficState, nextVehicles, currentGrid);
+                  if (!signStop.stop) {
+                    const resumed = { ...vehicle, isMoving: true };
+                    delete resumed.trafficStopUntil;
+                    delete resumed.trafficStopReason;
+                    const sign = findStopSignForVehicle(
+                      `${vehicle.x},${vehicle.y}`,
+                      vehicle.heading,
+                      vehicle.lane,
+                      roadTile,
+                      trafficState
+                    );
+                    if (sign?.kind === 'stop-sign') {
+                      resumed.satisfiedStopSignKey = `${vehicle.x},${vehicle.y}:${sign.id}`;
+                    }
+                    nextVehicles[uid] = resumed;
+                    hasChanges = true;
+                  }
                 }
               }
             }
@@ -6818,6 +7962,7 @@ export default function App() {
           }
 
           let { x, y, heading, lane, progress, zIndex, turnIntent } = vehicle;
+          const emergencyMode = isEmergencyMode(vehicle);
           
           let newParkingStopUntil = vehicle.parkingStopUntil;
           let newLastParkingKey = vehicle.lastParkingKey;
@@ -6830,15 +7975,44 @@ export default function App() {
             const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
             return (zIndex === 1 && isBridge) || (zIndex === 0 && !isBridge);
           });
+
+          // Emergency mode: overtake on the wrong side when traffic is ahead; merge home when clear
+          if (
+            emergencyMode &&
+            vType !== 'train' &&
+            currentTile &&
+            isRoadTile(currentTile.type) &&
+            (vehicle.isMoving || vehicle.stepForward)
+          ) {
+            const is4Lane = currentTile.type.includes('4lane');
+            const homeLane = getEmergencyHomeLane(lane, is4Lane);
+            const passLane = getEmergencyPassLane(lane, is4Lane);
+            const onWrongSide = lane < 0;
+            if (!onWrongSide && hasVehicleBlockingAhead(vehicle, nextVehicles, currentGrid)) {
+              lane = passLane;
+            } else if (
+              onWrongSide &&
+              isLaneClearForEmergency({ ...vehicle, lane }, homeLane, nextVehicles)
+            ) {
+              lane = homeLane;
+            }
+          }
+          // Working snapshot with any emergency lane change applied
+          const activeVehicle: Vehicle = lane !== vehicle.lane ? { ...vehicle, lane } : vehicle;
           
           const onBuildingBay = isBuildingParkingBay(currentTile);
           const onHome = isHouseTile(currentTile);
           const isOwnerHome = onHome && vehicle.homeKey === currentTileKey;
+          // Auto-park is system behavior. Under manual override, only park when the user
+          // requested it via parkOnNextLot (panel Park button).
+          const mayAutoPark =
+            !manualOverride || !!vehicle.parkOnNextLot;
           if (
+            mayAutoPark &&
             currentTile &&
             (currentTile.type.startsWith('parking-') ||
               onBuildingBay ||
-              isOwnerHome ||
+              (!manualOverride && isOwnerHome) ||
               (onHome && vehicle.parkOnNextLot))
           ) {
             const parkingLotId = currentTile.part === 'member' ? currentTile.anchorKey : currentTileKey;
@@ -6870,7 +8044,7 @@ export default function App() {
                 newStallIndex = Math.floor(Math.random() * maxStalls);
               }
             }
-          } else {
+          } else if (!manualOverride) {
             newLastParkingKey = undefined;
           }
 
@@ -6881,7 +8055,7 @@ export default function App() {
             newParkOnNextLot !== vehicle.parkOnNextLot
           ) {
             nextVehicles[uid] = {
-              ...vehicle,
+              ...activeVehicle,
               parkingStopUntil: newParkingStopUntil,
               lastParkingKey: newLastParkingKey,
               parkingStallIndex: newStallIndex,
@@ -6891,48 +8065,115 @@ export default function App() {
             continue;
           }
 
+          // Stoplights / stop signs: apply to all road vehicles including robotaxis.
+          // Only emergency vehicles with lights on may run red/yellow.
+          // Stop signs remain skipped under manual override (user drives).
           if (vType !== 'train' && currentTile && isRoadTile(currentTile.type)) {
-            if (shouldStopForLight(vehicle, trafficState)) {
+            if (shouldStopForLight(activeVehicle, trafficState)) {
               nextVehicles[uid] = {
-                ...vehicle,
+                ...activeVehicle,
                 isMoving: false,
                 trafficStopReason: 'stoplight',
               };
               hasChanges = true;
               continue;
             }
-            const signStop = shouldStopForSign(vehicle, currentTile, trafficState, nextVehicles, currentGrid);
-            if (signStop.stop) {
-              nextVehicles[uid] = {
-                ...vehicle,
-                isMoving: false,
-                trafficStopUntil: signStop.minUntil,
-                trafficStopReason: 'stop-sign',
-              };
-              hasChanges = true;
-              continue;
+            if (!manualOverride) {
+              const signStop = shouldStopForSign(activeVehicle, currentTile, trafficState, nextVehicles, currentGrid);
+              if (signStop.stop) {
+                nextVehicles[uid] = {
+                  ...activeVehicle,
+                  isMoving: false,
+                  trafficStopUntil: signStop.minUntil,
+                  trafficStopReason: 'stop-sign',
+                };
+                hasChanges = true;
+                continue;
+              }
             }
           }
 
           hasChanges = true;
 
-          const speed = vehicle.speed || 1;
+          const speed = activeVehicle.speed || 1;
           let step = 0;
           
-          if (vehicle.isMoving) {
+          if (activeVehicle.isMoving) {
             step = (speed * deltaTime) / 1000;
-          } else if (vehicle.stepForward) {
+          } else if (activeVehicle.stepForward) {
             step = 0.1; // One step forward
-          } else if (vehicle.stepBackward) {
+          } else if (activeVehicle.stepBackward) {
             step = -0.1; // One step backward
           }
 
           let newProgress = progress + step;
-          if (step > 0 && (vehicle.isMoving || vehicle.stepForward)) {
-            newProgress = findMaxSafeProgress(vehicle, newProgress, nextVehicles, currentGrid);
-            if (vehicle.isMoving && newProgress <= progress + 1e-6) {
+          if (step > 0 && (activeVehicle.isMoving || activeVehicle.stepForward)) {
+            newProgress = findMaxSafeProgress(activeVehicle, newProgress, nextVehicles, currentGrid);
+
+            // Never jump over a red/yellow stop line (robotaxis and all non-emergency)
+            if (
+              !emergencyMode &&
+              vType !== 'train' &&
+              currentTile &&
+              isRoadTile(currentTile.type)
+            ) {
+              const lightClamp = clampProgressForRedLight(
+                { ...activeVehicle, progress },
+                newProgress,
+                trafficState
+              );
+              if (lightClamp.mustStop) {
+                nextVehicles[uid] = {
+                  ...activeVehicle,
+                  progress: lightClamp.progress,
+                  isMoving: false,
+                  trafficStopReason: 'stoplight',
+                };
+                hasChanges = true;
+                continue;
+              }
+              newProgress = lightClamp.progress;
+            }
+
+            // Stop-sign approach: do not skip past the hold line in one frame
+            if (
+              !manualOverride &&
+              !emergencyMode &&
+              vType !== 'train' &&
+              currentTile &&
+              isRoadTile(currentTile.type) &&
+              newProgress > progress
+            ) {
+              const signStop = shouldStopForSign(
+                { ...activeVehicle, progress: Math.max(progress, 0.72) },
+                currentTile,
+                trafficState,
+                nextVehicles,
+                currentGrid
+              );
+              if (signStop.stop && progress < 0.72 && newProgress >= 0.72) {
+                nextVehicles[uid] = {
+                  ...activeVehicle,
+                  progress: 0.72,
+                  isMoving: false,
+                  trafficStopUntil: signStop.minUntil,
+                  trafficStopReason: 'stop-sign',
+                };
+                hasChanges = true;
+                continue;
+              }
+            }
+
+            // Emergency mode never gets stuck behind traffic (collision free-pass)
+            // Under manual override: clamp progress only — don't flip isMoving (user keeps Go intent)
+            if (activeVehicle.isMoving && newProgress <= progress + 1e-6) {
+              if (emergencyMode || manualOverride) {
+                nextVehicles[uid] = { ...activeVehicle, progress };
+                hasChanges = true;
+                continue;
+              }
               nextVehicles[uid] = {
-                ...vehicle,
+                ...activeVehicle,
                 isMoving: false,
                 trafficStopReason: 'vehicle',
                 progress,
@@ -6944,9 +8185,9 @@ export default function App() {
 
           progress = newProgress;
 
-          let newVehicleState = { ...vehicle, progress };
+          let newVehicleState = { ...activeVehicle, progress, lane };
           
-          if (vehicle.stepForward || vehicle.stepBackward) {
+          if (activeVehicle.stepForward || activeVehicle.stepBackward) {
             newVehicleState.stepForward = false;
             newVehicleState.stepBackward = false;
           }
@@ -6961,9 +8202,30 @@ export default function App() {
             });
 
             if (currentTile) {
-              const ports = (TILE_CONNECTIONS[currentTile.type] || []).map(p => (p + currentTile.rotation / 90) % 4);
+              const isRobotaxi = vehicle.type === 'taxi';
+              const onTaxiBay = isTaxiStationBay(currentTile) || isBuildingParkingBay(currentTile);
+              // Robotaxis on station/service bays can exit toward any of the 4 edges
+              const basePorts =
+                isRobotaxi && onTaxiBay
+                  ? [0, 1, 2, 3]
+                  : (TILE_CONNECTIONS[currentTile.type] || []);
+              const ports = basePorts.map(p =>
+                isRobotaxi && onTaxiBay ? p : (p + currentTile.rotation / 90) % 4
+              );
               const entryPort = (heading / 90 + 2) % 4;
               let otherPorts = ports.filter(p => p !== entryPort);
+              // Prefer exits that land on an adjacent road when leaving a taxi bay
+              if (isRobotaxi && onTaxiBay && otherPorts.length > 1) {
+                const roadExits = otherPorts.filter(exitPort => {
+                  const eh = exitPort * 90;
+                  const ndx = eh === 90 ? 1 : eh === 270 ? -1 : 0;
+                  const ndy = eh === 180 ? 1 : eh === 0 ? -1 : 0;
+                  const nk = `${x + ndx},${y + ndy}`;
+                  const nt = currentGrid[nk];
+                  return !!nt?.some(t => t.type.startsWith('road'));
+                });
+                if (roadExits.length > 0) otherPorts = roadExits;
+              }
               
               if (currentTile.type === 'rail-road-crossing') {
                 const straightPort = (entryPort + 2) % 4;
@@ -7029,10 +8291,45 @@ export default function App() {
               if (nextTile) {
                 const nextPorts = (TILE_CONNECTIONS[nextTile.type] || []).map(p => (p + nextTile.rotation / 90) % 4);
                 const nextEntryPort = (exitHeading / 90 + 2) % 4;
+                // Robotaxis may enter any adjacent road from a bay (driveway access),
+                // even if the road tile does not list that edge as a normal port.
+                const robotaxiOntoRoad =
+                  vehicle.type === 'taxi' && nextTile.type.startsWith('road');
+                const canEnterNext =
+                  nextPorts.includes(nextEntryPort) ||
+                  robotaxiOntoRoad ||
+                  (vehicle.type === 'taxi' && isBuildingParkingBay(nextTile));
 
-                if (nextPorts.includes(nextEntryPort)) {
+                if (canEnterNext) {
                   const isNext4Lane = nextTile.type.includes('4lane');
                   const nextIsBridge = nextTile.type.includes('bridge') || nextTile.type.includes('trestle');
+
+                  // Robotaxi entering a road: snap travel heading onto a legal road axis
+                  // so stoplights/stop signs (matched by heading) actually apply.
+                  let enterHeading = exitHeading;
+                  let enterLane = vehicle.type === 'train' ? 0 : isNext4Lane ? lane : 1;
+                  if (robotaxiOntoRoad && nextPorts.length > 0) {
+                    let bestPort = nextPorts[0];
+                    let bestScore = -Infinity;
+                    for (const p of nextPorts) {
+                      const h = p * 90;
+                      // Prefer continuing in the exit direction / toward destination
+                      let score = Math.cos(((h - exitHeading) * Math.PI) / 180);
+                      if (vehicle.destination) {
+                        const tdx = vehicle.destination.x - nextX;
+                        const tdy = vehicle.destination.y - nextY;
+                        const fx = h === 90 ? 1 : h === 270 ? -1 : 0;
+                        const fy = h === 180 ? 1 : h === 0 ? -1 : 0;
+                        score += tdx * fx + tdy * fy;
+                      }
+                      if (score > bestScore) {
+                        bestScore = score;
+                        bestPort = p;
+                      }
+                    }
+                    enterHeading = bestPort * 90;
+                    enterLane = isNext4Lane ? (enterLane < 0 ? -1 : 1) : 1;
+                  }
                   
                   // Force vehicles strictly forward on rail crossings without turning
                   if (nextTile.type === 'rail-road-crossing') {
@@ -7050,29 +8347,43 @@ export default function App() {
                      } else {
                          // Must continue straight over the crossing without turning intent checking
                          newVehicleState = {
-                           ...vehicle,
+                           ...activeVehicle,
                            x: nextX,
                            y: nextY,
-                           heading: exitHeading,
+                           heading: enterHeading,
                            progress: progress - 1,
                            zIndex: 0,
                            turnIntent: null,
-                           lane: vehicle.type === 'train' ? 0 : 1,
-                           ...getDestinationArrivalPatch(vehicle, nextX, nextY),
+                           lane: enterLane,
+                           ...getDestinationArrivalPatch(activeVehicle, nextX, nextY),
                          };
 
                      }
                   } else {
                     newVehicleState = {
-                      ...vehicle,
+                      ...activeVehicle,
                       x: nextX,
                       y: nextY,
-                      heading: exitHeading,
+                      heading: enterHeading,
                       progress: progress - 1,
                       zIndex: nextIsBridge ? 1 : 0,
-                      turnIntent: vehicle.destination ? null : (vehicle.randomTurning ? ['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any : null),
-                      lane: vehicle.type === 'train' ? 0 : isNext4Lane ? vehicle.lane : 1,
-                      ...getDestinationArrivalPatch(vehicle, nextX, nextY),
+                      turnIntent: activeVehicle.destination
+                        ? null
+                        : (activeVehicle.randomTurning
+                            ? (['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any)
+                            : null),
+                      // Robotaxi snaps to legal road heading/lane; emergency may keep pass lane
+                      lane:
+                        vehicle.type === 'taxi'
+                          ? enterLane
+                          : activeVehicle.type === 'train'
+                            ? 0
+                            : isNext4Lane
+                              ? lane
+                              : emergencyMode
+                                ? lane
+                                : 1,
+                      ...getDestinationArrivalPatch(activeVehicle, nextX, nextY),
                     };
                   }
                   } else {
@@ -7299,26 +8610,22 @@ export default function App() {
   useEffect(() => {
     if (!roomCode || !isSimLeader) return;
     const iv = setInterval(() => {
-      const current = localTrafficRef.current;
-      let changed = false;
-      const nextControls = { ...current.controls };
-      const now = Date.now();
-      for (const [id, ctrl] of Object.entries(nextControls)) {
-        const advanced = advanceLightPhase(ctrl, now);
-        if (advanced) {
-          nextControls[id] = advanced;
-          changed = true;
+      emitTraffic(current => {
+        let changed = false;
+        const nextControls = { ...current.controls };
+        const now = Date.now();
+        for (const [id, ctrl] of Object.entries(nextControls)) {
+          const advanced = advanceLightPhase(ctrl, now);
+          if (advanced) {
+            nextControls[id] = advanced;
+            changed = true;
+          }
         }
-      }
-      if (changed) {
-        const next = { ...current, controls: nextControls };
-        setTraffic(next);
-        localTrafficRef.current = next;
-        socket.emit('update-traffic', { roomCode, traffic: next });
-      }
+        return changed ? { ...current, controls: nextControls } : current;
+      });
     }, 250);
     return () => clearInterval(iv);
-  }, [roomCode, isSimLeader]);
+  }, [roomCode, isSimLeader, emitTraffic]);
 
   // Plant growth tick
   useEffect(() => {
@@ -7614,17 +8921,35 @@ export default function App() {
   // Handle keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't trigger shortcuts if typing in an input
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      // Don't trigger shortcuts if typing in an input / select
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
         return;
       }
-      
+
       if (e.repeat) return;
 
       // Vehicle controls (F/B step, L/R turn at intersections, arrows lane/speed)
       // R rotates the palette tile while a tile is selected for placement.
+      // When a floating drive panel is active, ALL vehicle keystrokes go to that vehicle only.
       const inTilePlacementMode = selectedTile !== null;
-      if (selectedVehicles.size > 0) {
+      const driveTargetId =
+        activeDrivePanelId && vehicles[activeDrivePanelId] ? activeDrivePanelId : null;
+      const myUid = userRef.current?.uid;
+      const controlIds: string[] = (driveTargetId
+        ? [driveTargetId]
+        : Array.from(selectedVehicles)
+      ).filter(id => {
+        const v = vehicles[id];
+        if (!v?.manualOverride || !v.manualOverrideByUid) return true;
+        // Only the user who holds manual override may key-drive that vehicle
+        return !!myUid && v.manualOverrideByUid === myUid;
+      });
+
+      if (controlIds.length > 0) {
         const key = e.key.toLowerCase();
         const isArrowKey = e.key.startsWith('Arrow');
         const isVehicleControlKey =
@@ -7632,19 +8957,31 @@ export default function App() {
           key === 'l' || (key === 'r' && !inTilePlacementMode) || isArrowKey;
 
         if (isVehicleControlKey) {
-          if (isArrowKey) e.preventDefault();
+          // Prevent focused UI buttons (e.g. Destination 🎯) from also activating
+          e.preventDefault();
+          e.stopPropagation();
+          if (document.activeElement instanceof HTMLElement) {
+            const tag = document.activeElement.tagName;
+            if (tag === 'BUTTON' || tag === 'A') {
+              document.activeElement.blur();
+            }
+          }
 
           let anyUpdated = false;
           const updatedVehicles = { ...vehicles };
 
-          selectedVehicles.forEach(id => {
+          for (const id of controlIds) {
             const myVehicle = updatedVehicles[id];
-            if (!myVehicle) return;
+            if (!myVehicle) continue;
             let updated = false;
             let newVehicle = { ...myVehicle };
 
             if (key === 'g') {
               newVehicle.isMoving = !newVehicle.isMoving;
+              // Manual Go: don't let home-tour AI instantly assign a destination
+              if (newVehicle.isMoving && newVehicle.homeKey) {
+                newVehicle.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+              }
               updated = true;
             } else if (key === 's') {
               if (newVehicle.isMoving !== false) {
@@ -7672,7 +9009,7 @@ export default function App() {
                 updated = true;
               }
             } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-              if ((newVehicle.type || 'car') === 'train') return;
+              if ((newVehicle.type || 'car') === 'train') continue;
 
               const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
               const currentTile = currentTiles?.find(t => {
@@ -7680,7 +9017,7 @@ export default function App() {
                 return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
               });
 
-              if (!currentTile?.type.startsWith('road')) return;
+              if (!currentTile?.type.startsWith('road')) continue;
 
               const is4Lane = currentTile.type.includes('4lane');
               const nextLane = e.key === 'ArrowRight'
@@ -7691,7 +9028,7 @@ export default function App() {
                 updated = true;
               }
             } else if (key === 'l' || key === 'r') {
-              if ((newVehicle.type || 'car') === 'train') return;
+              if ((newVehicle.type || 'car') === 'train') continue;
 
               const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
               const currentTile = currentTiles?.find(t => {
@@ -7699,8 +9036,8 @@ export default function App() {
                 return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
               });
 
-              if (!currentTile?.type.startsWith('road')) return;
-              if (!isIntersectionTile(currentTile.type)) return;
+              if (!currentTile?.type.startsWith('road')) continue;
+              if (!isIntersectionTile(currentTile.type)) continue;
 
               const intent = key === 'r' ? 'right' : 'left';
               if (newVehicle.turnIntent !== intent) {
@@ -7713,9 +9050,14 @@ export default function App() {
               updatedVehicles[id] = newVehicle;
               anyUpdated = true;
             }
-          });
+          }
 
-          if (anyUpdated) setVehicles(updatedVehicles);
+          if (anyUpdated) {
+            setVehicles(updatedVehicles);
+            if (roomCode) {
+              socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+            }
+          }
           return;
         }
       }
@@ -7756,13 +9098,18 @@ export default function App() {
         setPendingHomeAssign(false);
         setPendingFireStart(false);
         setPendingEmployeeAssign(false);
+        setPendingPersonFormPick(null);
         setPendingRouteVehicleId(null);
         setInspectHomeKey(null);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [undo, redo, copySelection, cutSelection, deleteSelection, clipboard, rotateClipboard, rotateSelection, isPasting, selectionStart, selectionEnd, selectedTile, selectedVehicles, vehicles, user]);
+  }, [
+    undo, redo, copySelection, cutSelection, deleteSelection, clipboard,
+    rotateClipboard, rotateSelection, isPasting, selectionStart, selectionEnd,
+    selectedTile, selectedVehicles, vehicles, user, activeDrivePanelId, roomCode,
+  ]);
 
   useEffect(() => {
     if (!isPanning && !isSelecting) return;
@@ -7833,14 +9180,24 @@ export default function App() {
       setPastePreviewPos(null);
     }
 
-    if (isWithinGridCanvas(worldX, worldY)) {
-      setHoveredGridKey(`${worldX},${worldY}`);
-    } else {
-      setHoveredGridKey(null);
-    }
-
-    if (roomCodeRef.current) {
-      scheduleCursorEmit(worldX, worldY, bufferedKeysRef.current.size > 0);
+    const nextHoverKey = isWithinGridCanvas(worldX, worldY) ? `${worldX},${worldY}` : null;
+    if (nextHoverKey !== hoverKeyRef.current) {
+      hoverKeyRef.current = nextHoverKey;
+      setHoveredGridKey(nextHoverKey);
+      // Hide coordinates immediately when the pointer leaves a tile
+      setCoordLabelKey(null);
+      if (hoverCoordTimerRef.current) {
+        clearTimeout(hoverCoordTimerRef.current);
+        hoverCoordTimerRef.current = null;
+      }
+      // After 3s dwell on the same tile, show its coordinates until leave
+      if (nextHoverKey) {
+        hoverCoordTimerRef.current = setTimeout(() => {
+          if (hoverKeyRef.current === nextHoverKey) {
+            setCoordLabelKey(nextHoverKey);
+          }
+        }, 3000);
+      }
     }
   };
 
@@ -7849,6 +9206,22 @@ export default function App() {
     setIsSelecting(false);
     pointerDownRef.current = null;
   };
+
+  const clearTileHover = useCallback(() => {
+    hoverKeyRef.current = null;
+    setHoveredGridKey(null);
+    setCoordLabelKey(null);
+    if (hoverCoordTimerRef.current) {
+      clearTimeout(hoverCoordTimerRef.current);
+      hoverCoordTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (hoverCoordTimerRef.current) clearTimeout(hoverCoordTimerRef.current);
+    };
+  }, []);
 
   const zoomRef = useRef(zoom);
   const offsetRef = useRef(offset);
@@ -7967,96 +9340,106 @@ export default function App() {
         if (trafficTool === 'stop-sign' && canPlaceStopSignOnTile(roadTile.type)) {
           const exitPort = detectStopSignPlacementClick(relX, relY, roadTile);
           if (exitPort !== null) {
-            const existing = findStopSignAt(key, exitPort, traffic);
-            const nextControls = { ...traffic.controls };
-            if (existing) {
-              delete nextControls[trafficControlKey(existing)];
-            } else {
-              const newSign = createStopSign(key, exitPort, traffic.nextSignId);
+            emitTraffic(prev => {
+              const existing = findStopSignAt(key, exitPort, prev);
+              const nextControls = { ...prev.controls };
+              if (existing) {
+                delete nextControls[trafficControlKey(existing)];
+                return { ...prev, controls: nextControls };
+              }
+              const newSign = createStopSign(key, exitPort, prev.nextSignId);
               nextControls[trafficControlKey(newSign)] = newSign;
-              emitTraffic({ ...traffic, controls: nextControls, nextSignId: traffic.nextSignId + 1 });
-              return;
-            }
-            emitTraffic({ ...traffic, controls: nextControls });
+              return { ...prev, controls: nextControls, nextSignId: prev.nextSignId + 1 };
+            });
           }
           return;
         }
         if (trafficTool === 'stoplight') {
           const slot = detectLightSlotClick(relX, relY, roadTile);
           if (slot) {
-            const existing = getStoplightsAt(key, traffic).find(
-              l => l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
-            );
-            const nextControls = { ...traffic.controls };
-            if (existing) {
-              delete nextControls[String(existing.id)];
-            } else {
-              const slots = getAvailableLightSlots(roadTile);
-              const occupied = getStoplightsAt(key, traffic).length;
-              if (occupied < slots.length) {
-                const newLight = createStoplight(key, slot.heading, slot.lane, traffic.nextLightId);
-                nextControls[String(newLight.id)] = newLight;
-                emitTraffic({ ...traffic, controls: nextControls, nextLightId: traffic.nextLightId + 1 });
-                return;
+            emitTraffic(prev => {
+              const existing = getStoplightsAt(key, prev).find(
+                l => l.kind === 'stoplight' && l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
+              );
+              const nextControls = { ...prev.controls };
+              if (existing) {
+                delete nextControls[trafficControlKey(existing)];
+                return { ...prev, controls: nextControls };
               }
-            }
-            if (existing) emitTraffic({ ...traffic, controls: nextControls });
+              const slots = getAvailableLightSlots(roadTile);
+              const occupied = getStoplightsAt(key, prev).length;
+              if (occupied >= slots.length) return prev;
+              const newLight = createStoplight(key, slot.heading, slot.lane, prev.nextLightId);
+              nextControls[trafficControlKey(newLight)] = newLight;
+              return { ...prev, controls: nextControls, nextLightId: prev.nextLightId + 1 };
+            });
           }
           return;
         }
         if (!trafficTool && !selectedTile && selectedTrafficIds.size === 1) {
           const selKey = Array.from(selectedTrafficIds)[0];
-          const sel = traffic.controls[selKey];
-          if (sel) {
+          emitTraffic(prev => {
+            const sel = prev.controls[selKey];
+            if (!sel) return prev;
             if (sel.kind === 'stop-sign' && canPlaceStopSignOnTile(roadTile.type)) {
               const exitPort = detectStopSignPlacementClick(relX, relY, roadTile);
-              if (exitPort !== null) {
-                const conflict = findStopSignAt(key, exitPort, traffic);
-                const samePlace = sel.gridKey === key && sel.edgePort === exitPort;
-                if (!samePlace && !conflict) {
-                  const nextControls = {
-                    ...traffic.controls,
-                    [selKey]: { ...sel, gridKey: key, edgePort: exitPort },
-                  };
-                  emitTraffic({ ...traffic, controls: nextControls });
-                }
-                return;
-              }
+              if (exitPort === null) return prev;
+              const conflict = findStopSignAt(key, exitPort, prev);
+              const samePlace = sel.gridKey === key && sel.edgePort === exitPort;
+              if (samePlace || conflict) return prev;
+              return {
+                ...prev,
+                controls: {
+                  ...prev.controls,
+                  [selKey]: { ...sel, gridKey: key, edgePort: exitPort },
+                },
+              };
             }
             if (sel.kind === 'stoplight') {
               const slot = detectLightSlotClick(relX, relY, roadTile);
-              if (slot) {
-                const conflict = getStoplightsAt(key, traffic).find(
-                  l => l.id !== sel.id && l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
-                );
-                const samePlace = sel.gridKey === key && sel.heading === slot.heading && Math.abs(sel.lane - slot.lane) < 0.01;
-                if (!conflict && !samePlace) {
-                  const nextControls = {
-                    ...traffic.controls,
-                    [selKey]: { ...sel, gridKey: key, heading: slot.heading, lane: slot.lane },
-                  };
-                  emitTraffic({ ...traffic, controls: nextControls });
-                }
-                return;
-              }
+              if (!slot) return prev;
+              const conflict = getStoplightsAt(key, prev).find(
+                l => l.kind === 'stoplight' && l.id !== sel.id && l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
+              );
+              const samePlace =
+                sel.gridKey === key &&
+                sel.heading === slot.heading &&
+                Math.abs(sel.lane - slot.lane) < 0.01;
+              if (conflict || samePlace) return prev;
+              return {
+                ...prev,
+                controls: {
+                  ...prev.controls,
+                  [selKey]: { ...sel, gridKey: key, heading: slot.heading, lane: slot.lane },
+                },
+              };
             }
-          }
+            return prev;
+          });
+          return;
         }
         if (!trafficTool && !selectedTile && selectedTrafficIds.size === 0) {
           const slot = detectLightSlotClick(relX, relY, roadTile);
           if (slot) {
-            const light = getStoplightsAt(key, traffic).find(
-              l => l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
-            );
-            if (light && light.kind === 'stoplight') {
+            emitTraffic(prev => {
+              const light = getStoplightsAt(key, prev).find(
+                l => l.kind === 'stoplight' && l.heading === slot.heading && Math.abs(l.lane - slot.lane) < 0.01
+              );
+              if (!light || light.kind !== 'stoplight') return prev;
               const nextPhase = cycleLightPhase(light.phase);
-              const nextControls = {
-                ...traffic.controls,
-                [String(light.id)]: { ...light, phase: nextPhase, phaseStartedAt: Date.now() },
+              return {
+                ...prev,
+                controls: {
+                  ...prev.controls,
+                  [trafficControlKey(light)]: {
+                    ...light,
+                    phase: nextPhase,
+                    phaseStartedAt: Date.now(),
+                  },
+                },
               };
-              emitTraffic({ ...traffic, controls: nextControls });
-              return;
-            }
+            });
+            return;
           }
         }
       }
@@ -8081,6 +9464,48 @@ export default function App() {
       }
       // Non-tree click while in fire mode — keep mode active
       return;
+    }
+
+    // Person create/edit form: pick home (house) or workplace (building) by map click
+    if (pendingPersonFormPick && peopleFormMode !== 'closed' && hasTile(gridX, gridY)) {
+      const tiles = getTile(gridX, gridY) || [];
+      if (pendingPersonFormPick === 'home') {
+        const house = tiles.find(t => t.type === 'building-home');
+        if (house) {
+          const homeKey =
+            house.part === 'member' ? (house.anchorKey || key) : key;
+          setPeopleForm(f => ({ ...f, homeKey }));
+          setPendingPersonFormPick(null);
+          setShowPeoplePanel(true);
+          return;
+        }
+        // Keep pick mode active until a house is clicked
+        return;
+      }
+      if (pendingPersonFormPick === 'workplace') {
+        const building = tiles.find(
+          t => t.type.startsWith('building-') && t.type !== 'building-home',
+        );
+        if (building) {
+          const workplaceKey =
+            building.part === 'member' ? (building.anchorKey || key) : key;
+          // Ensure economy config exists when picking a workplace building
+          if (isEconomyBuilding(building.type) && !economy.buildings[workplaceKey]) {
+            const initCfg = createBuildingConfig(workplaceKey, building.type);
+            const nextEco = {
+              ...economy,
+              buildings: { ...economy.buildings, [workplaceKey]: initCfg },
+            };
+            setEconomy(nextEco);
+            if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+          }
+          setPeopleForm(f => ({ ...f, workplaceKey }));
+          setPendingPersonFormPick(null);
+          setShowPeoplePanel(true);
+          return;
+        }
+        return;
+      }
     }
 
     // Assign selected people as employees of a building
@@ -8121,7 +9546,8 @@ export default function App() {
       const house = tiles.find(t => t.type === 'building-home');
       if (house) {
         const homeKey = `${gridX},${gridY}`;
-        const updatedVehicles = { ...vehicles };
+        // Use live vehicle map so house assign never drops sim state
+        const updatedVehicles = { ...vehiclesRef.current };
         let anyAssigned = false;
         selectedVehicles.forEach(id => {
           const v = updatedVehicles[id];
@@ -8318,7 +9744,8 @@ export default function App() {
           topTile.type === 'building-college' || topTile.type === 'building-university' ||
           topTile.type === 'building-large-park' || topTile.type === 'building-warehouse-large' ||
           topTile.type === 'building-factory-large' || topTile.type === 'building-train-station-large' ||
-          topTile.type === 'building-repair-shop' || topTile.type === 'building-hospital';
+          topTile.type === 'building-repair-shop' || topTile.type === 'building-hospital' ||
+          topTile.type === 'building-taxi-station';
         if (isMulti) {
           const anchorKey = topTile.part === 'member' ? topTile.anchorKey : key;
           if (anchorKey) {
@@ -8357,7 +9784,8 @@ export default function App() {
         selectedTile === 'building-college' || selectedTile === 'building-university' ||
         selectedTile === 'building-large-park' || selectedTile === 'building-warehouse-large' ||
         selectedTile === 'building-factory-large' || selectedTile === 'building-train-station-large' ||
-        selectedTile === 'building-repair-shop' || selectedTile === 'building-hospital';
+        selectedTile === 'building-repair-shop' || selectedTile === 'building-hospital' ||
+        selectedTile === 'building-taxi-station';
       if (isMultiTile) {
         const { w, h } = getMultiTileDimensions(selectedTile);
         const cells = getMultiTileCells(selectedTile, rotation);
@@ -9009,21 +10437,6 @@ export default function App() {
   const gridX = Math.floor(worldX / GRID_SIZE);
   const gridY = Math.floor(worldY / GRID_SIZE);
 
-  const selectedVehiclesList = Array.from(selectedVehicles);
-  const activeCountIsMoving = selectedVehiclesList.filter(id => vehicles[id]?.isMoving).length;
-  const isMovingActive = selectedVehicles.size > 0 && activeCountIsMoving >= selectedVehicles.size / 2;
-
-  const activeCountTurnAround = selectedVehiclesList.filter(id => vehicles[id]?.turnAroundAtDeadEnd).length;
-  const isTurnAroundActive = selectedVehicles.size > 0 && activeCountTurnAround >= selectedVehicles.size / 2;
-
-  const activeCountRandomTurn = selectedVehiclesList.filter(id => vehicles[id]?.randomTurning).length;
-  const isRandomTurnActive = selectedVehicles.size > 0 && activeCountRandomTurn >= selectedVehicles.size / 2;
-
-  const selectedHaveDestination = selectedVehiclesList.some(id => vehicles[id]?.destination);
-  const isDestinationToggleActive = !!pendingRouteVehicleId || selectedHaveDestination;
-  const isParkNextActive = selectedVehiclesList.some(id => vehicles[id]?.parkOnNextLot);
-  const selectedSemiIds = getSelectedSemiIds(selectedVehicles, vehicles);
-
   const carsFilteredSelection = filterSelectionByPanelType(selectedVehicles, vehicles, 'car');
   const semiFilteredSelection = filterSelectionByPanelType(selectedVehicles, vehicles, 'semi');
   const trainFilteredSelection = filterSelectionByPanelType(selectedVehicles, vehicles, 'train');
@@ -9098,13 +10511,13 @@ export default function App() {
   };
 
   const openCreatePersonForm = () => {
-    const homes = listHomeKeys(gridRef.current);
+    setPendingPersonFormPick(null);
     setPeopleForm({
       firstName: randomFirstName('m'),
       lastName: randomLastName(),
       sex: 'm',
       ageYears: 30,
-      homeKey: homes[0] || '',
+      homeKey: '',
       workplaceKey: '',
       money: 50,
       health: 'healthy',
@@ -9117,6 +10530,7 @@ export default function App() {
     const p = id ? economy.people?.[id] : undefined;
     if (!p) return;
     setSelectedPersonIds(new Set([p.id]));
+    setPendingPersonFormPick(null);
     setPeopleForm({
       firstName: p.firstName,
       lastName: p.lastName,
@@ -9128,6 +10542,17 @@ export default function App() {
       health: p.health,
     });
     setPeopleFormMode('edit');
+  };
+
+  const startPersonFormMapPick = (field: 'home' | 'workplace') => {
+    if (peopleFormMode === 'closed') return;
+    setPendingEmployeeAssign(false);
+    setPendingHomeAssign(false);
+    setPendingFireStart(false);
+    setPendingRouteVehicleId(null);
+    setSelectedTile(null);
+    setIsPlacingVehicles(false);
+    setPendingPersonFormPick(prev => (prev === field ? null : field));
   };
 
   const savePersonForm = () => {
@@ -9193,6 +10618,7 @@ export default function App() {
     const nextEco = { ...economy, people, families };
     setEconomy(nextEco);
     if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+    setPendingPersonFormPick(null);
     setPeopleFormMode('closed');
   };
 
@@ -9240,13 +10666,22 @@ export default function App() {
     setPendingHomeAssign(false);
     setPendingFireStart(false);
     setPendingRouteVehicleId(null);
+    setPendingPersonFormPick(null);
     setPendingEmployeeAssign(true);
   };
 
   const boardSelectedPeople = (seat: 'driver' | 'passenger') => {
-    if (selectedPersonIds.size === 0 || selectedVehicles.size === 0) return;
-    const vehicleId = Array.from(selectedVehicles)[0];
-    const v = vehicles[vehicleId];
+    if (selectedPersonIds.size === 0) return;
+    // Prefer active drive-panel vehicle, then first selected
+    const vehicleId =
+      (activeDrivePanelId && vehiclesRef.current[activeDrivePanelId]
+        ? activeDrivePanelId
+        : null) ||
+      Array.from(selectedVehicles)[0] ||
+      null;
+    if (!vehicleId) return;
+    const live = vehiclesRef.current;
+    const v = live[vehicleId];
     if (!v) return;
     let people = { ...(economy.people || {}) };
     for (const pid of selectedPersonIds) {
@@ -9259,8 +10694,14 @@ export default function App() {
       }
       people = boardPerson(people, pid, vehicleId, seat);
     }
-    let nextVehicles = { ...vehicles };
-    nextVehicles[vehicleId] = syncVehicleOccupancy(v, people);
+    let nextVehicles = { ...live };
+    nextVehicles[vehicleId] = syncVehicleOccupancy(nextVehicles[vehicleId], people);
+    // Sync occupancy on any other vehicles people left
+    Object.keys(nextVehicles).forEach(vid => {
+      if (vid !== vehicleId) {
+        nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+      }
+    });
     const nextEco = { ...economy, people };
     setEconomy(nextEco);
     setVehicles(nextVehicles);
@@ -9369,11 +10810,20 @@ export default function App() {
     const passengers = v.passengerIds || getPassengerIds(peopleMap, v.id);
     const maxPax = v.maxPassengers ?? getMaxPassengers(v.type);
     const driver = driverId ? peopleMap[driverId] : null;
+    const isSelected = selectedVehicles.has(v.id);
     return (
-      <label key={v.id} className="flex items-center gap-3 p-3 hover:bg-slate-50 border-b border-slate-50 cursor-pointer">
+      <label
+        key={v.id}
+        data-vehicle-list-id={v.id}
+        className={`flex items-center gap-3 p-3 border-b border-slate-50 cursor-pointer transition-colors ${
+          isSelected
+            ? 'bg-indigo-50 hover:bg-indigo-100 ring-1 ring-inset ring-indigo-200'
+            : 'hover:bg-slate-50'
+        }`}
+      >
         <input
           type="checkbox"
-          checked={selectedVehicles.has(v.id)}
+          checked={isSelected}
           onChange={(e) => {
             const newSet = new Set(selectedVehicles);
             if (e.target.checked) newSet.add(v.id);
@@ -9815,11 +11265,14 @@ export default function App() {
       {/* Main Viewport */}
       <div 
         ref={containerRef}
-        className={`flex-1 relative overflow-hidden cursor-${isPanning ? 'grabbing' : pendingRouteVehicleId || pendingHomeAssign || pendingFireStart || pendingEmployeeAssign || trafficTool ? 'crosshair' : selectedTile ? 'crosshair' : 'grab'}`}
+        className={`flex-1 relative overflow-hidden cursor-${isPanning ? 'grabbing' : pendingRouteVehicleId || pendingHomeAssign || pendingFireStart || pendingEmployeeAssign || pendingPersonFormPick || trafficTool ? 'crosshair' : selectedTile ? 'crosshair' : 'grab'}`}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
+        onMouseLeave={() => {
+          handleMouseUp();
+          clearTileHover();
+        }}
         onClick={handleGridClick}
       >
         {!showSidebar && (
@@ -9850,6 +11303,16 @@ export default function App() {
         {pendingFireStart && (
           <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-orange-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
             Click a tree to start a fire (burns 30s)
+          </div>
+        )}
+        {pendingPersonFormPick === 'home' && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-rose-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click a house to set this person&apos;s home (Esc to cancel)
+          </div>
+        )}
+        {pendingPersonFormPick === 'workplace' && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-emerald-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click a building to set this person&apos;s workplace (Esc to cancel)
           </div>
         )}
         {pendingEmployeeAssign && (
@@ -9883,9 +11346,6 @@ export default function App() {
               boxShadow: 'inset 0 0 0 2px rgba(148, 163, 184, 0.8)',
             }}
           />
-          {roomCode && remoteCursors.length > 0 && (
-            <RemoteCursors cursors={remoteCursors} gridSize={GRID_SIZE} />
-          )}
           {(Object.entries(grid) as [string, GridTile[]][]).map(([key, tiles]) => {
             const [x, y] = key.split(',').map(Number);
             return (
@@ -9928,6 +11388,7 @@ export default function App() {
                 {(() => {
                   const roadTile = getTrafficRoadTile(tiles);
                   if (!roadTile) return null;
+                  if (traffic.showControls === false) return null;
                   const cellControls = getAllTrafficControls(traffic).filter(c => c.gridKey === key);
                   if (!cellControls.length) return null;
                   return (
@@ -9946,15 +11407,17 @@ export default function App() {
                       } : undefined}
                       onLightClick={!trafficTool ? (ctrl) => {
                         if (ctrl.kind !== 'stoplight') return;
-                        const nextControls = {
-                          ...traffic.controls,
-                          [String(ctrl.id)]: {
-                            ...ctrl,
-                            phase: cycleLightPhase(ctrl.phase),
-                            phaseStartedAt: Date.now(),
+                        emitTraffic(prev => ({
+                          ...prev,
+                          controls: {
+                            ...prev.controls,
+                            [trafficControlKey(ctrl)]: {
+                              ...ctrl,
+                              phase: cycleLightPhase(ctrl.phase),
+                              phaseStartedAt: Date.now(),
+                            },
                           },
-                        };
-                        emitTraffic({ ...traffic, controls: nextControls });
+                        }));
                       } : undefined}
                     />
                   );
@@ -9963,28 +11426,72 @@ export default function App() {
             );
           })}
 
-          {/* Home occupancy badges */}
-          {Object.entries(grid).map(([homeKey, homeTiles]) => {
-            if (!homeTiles?.length) return null;
-            const top = homeTiles[homeTiles.length - 1];
-            if (top.type !== 'building-home') return null;
-            const residents = peopleResidingAt(economy.people, homeKey);
-            const atHome = peopleAtHome(economy.people || {}, homeKey);
-            if (residents.length === 0 && atHome.length === 0) return null;
-            const [hx, hy] = homeKey.split(',').map(Number);
+          {/* Tile coordinates after 3s hover dwell */}
+          {coordLabelKey && (() => {
+            const [cx, cy] = coordLabelKey.split(',').map(Number);
+            if (Number.isNaN(cx) || Number.isNaN(cy)) return null;
             return (
               <div
-                key={`home-badge-${homeKey}`}
-                className="absolute"
-                style={{ left: hx * GRID_SIZE, top: hy * GRID_SIZE }}
+                key={`coord-label-${coordLabelKey}`}
+                className="absolute pointer-events-none z-[60] flex items-center justify-center"
+                style={{
+                  left: cx * GRID_SIZE,
+                  top: cy * GRID_SIZE,
+                  width: GRID_SIZE,
+                  height: GRID_SIZE,
+                }}
               >
-                <HomeOccupancyBadge
-                  atHomeCount={atHome.length}
-                  residentCount={residents.length}
-                />
+                <span className="px-1.5 py-0.5 rounded-md bg-slate-900/90 text-white text-[10px] font-mono font-bold shadow-lg border border-white/25 whitespace-nowrap">
+                  {cx},{cy}
+                </span>
               </div>
             );
-          })}
+          })()}
+
+          {/* Home occupancy badges */}
+          {economy.showHomeBadges !== false &&
+            Object.entries(grid).map(([homeKey, homeTiles]) => {
+              if (!homeTiles?.length) return null;
+              const top = homeTiles[homeTiles.length - 1];
+              if (top.type !== 'building-home') return null;
+              const residents = peopleResidingAt(economy.people, homeKey);
+              const atHome = peopleAtHome(economy.people || {}, homeKey);
+              if (residents.length === 0 && atHome.length === 0) return null;
+              const [hx, hy] = homeKey.split(',').map(Number);
+              return (
+                <div
+                  key={`home-badge-${homeKey}`}
+                  className="absolute"
+                  style={{ left: hx * GRID_SIZE, top: hy * GRID_SIZE }}
+                >
+                  <HomeOccupancyBadge
+                    atHomeCount={atHome.length}
+                    residentCount={residents.length}
+                  />
+                </div>
+              );
+            })}
+
+          {/* Seedling growth % badges */}
+          {economy.showSeedlingBadges !== false &&
+            Object.entries(grid).map(([key, tiles]) => {
+              if (!tiles?.length) return null;
+              const top = tiles[tiles.length - 1];
+              if (top.type !== 'tree-pine-seedling') return null;
+              const progress = Math.max(0, Math.min(1, top.growthProgress ?? 0));
+              const [sx, sy] = key.split(',').map(Number);
+              return (
+                <div
+                  key={`seedling-badge-${key}`}
+                  className="absolute pointer-events-none z-10 flex items-start justify-center pt-0.5"
+                  style={{ left: sx * GRID_SIZE, top: sy * GRID_SIZE, width: GRID_SIZE, height: GRID_SIZE }}
+                >
+                  <span className="inline-flex items-center gap-px px-1 py-px rounded-full border text-[8px] font-bold leading-none shadow-sm bg-lime-100/95 border-lime-300 text-lime-900">
+                    🌱{Math.round(progress * 100)}%
+                  </span>
+                </div>
+              );
+            })}
 
           {/* Building name + economy badges */}
           {Object.entries(grid).map(([anchorKey, anchorTiles]) => {
@@ -10091,7 +11598,9 @@ export default function App() {
                     exitHeading={exitHeading}
                     trailerCargos={v.trailerCargos}
                     railcarCargos={v.railcarCargos}
-                    showCargoLabels={economy.showCargoLabels}
+                    showCargoLabels={economy.showTrailerCargoLabels ?? economy.showCargoLabels}
+                    showRailcarCargoLabels={economy.showRailcarCargoLabels ?? economy.showCargoLabels}
+                    showStopTimerBadge={economy.showVehicleStopBadges !== false}
                     itemEmojiResolver={(itemId) => getItemEmoji(itemId, economy.itemDefs)}
                     onSelect={(e) => handleVehicleSelect(v.id, e)}
                     onTrailerSelect={(idx, e) => handleTrailerSelect(v.id, idx, e)}
@@ -10124,7 +11633,7 @@ export default function App() {
                   tileH={currentTile?.h}
                   stallIndex={pt.stallIndex}
                   cargo={pt.cargo}
-                  showCargoLabels={economy.showCargoLabels}
+                  showCargoLabels={economy.showTrailerCargoLabels ?? economy.showCargoLabels}
                   itemEmojiResolver={(itemId) => getItemEmoji(itemId, economy.itemDefs)}
                   selected={isSelected}
                   onSelect={(e) => handleParkedTrailerSelect(pt.id, e)}
@@ -10134,30 +11643,31 @@ export default function App() {
           </AnimatePresence>
 
           {/* Destination bullseyes (selected vehicles only) */}
-          {(Object.values(vehicles) as Vehicle[])
-            .filter(v => v.destination && selectedVehicles.has(v.id))
-            .map(v => {
-              const { x: dx, y: dy } = v.destination!;
-              return (
-                <div
-                  key={`dest-target-${v.id}`}
-                  className="absolute pointer-events-none z-[60] flex items-center justify-center"
-                  style={{
-                    left: dx * GRID_SIZE,
-                    top: dy * GRID_SIZE,
-                    width: GRID_SIZE,
-                    height: GRID_SIZE,
-                  }}
-                >
-                  <div className="relative w-[90%] h-[90%] animate-pulse">
-                    <div className="absolute inset-0 rounded-full border-[3px] border-red-600 shadow-[0_0_10px_rgba(239,68,68,0.85)]" />
-                    <div className="absolute inset-[28%] rounded-full bg-red-500" />
-                    <div className="absolute top-1/2 left-0 right-0 h-[3px] bg-red-500 -translate-y-1/2" />
-                    <div className="absolute left-1/2 top-0 bottom-0 w-[3px] bg-red-500 -translate-x-1/2" />
+          {economy.showDestinationMarkers !== false &&
+            (Object.values(vehicles) as Vehicle[])
+              .filter(v => v.destination && selectedVehicles.has(v.id))
+              .map(v => {
+                const { x: dx, y: dy } = v.destination!;
+                return (
+                  <div
+                    key={`dest-target-${v.id}`}
+                    className="absolute pointer-events-none z-[60] flex items-center justify-center"
+                    style={{
+                      left: dx * GRID_SIZE,
+                      top: dy * GRID_SIZE,
+                      width: GRID_SIZE,
+                      height: GRID_SIZE,
+                    }}
+                  >
+                    <div className="relative w-[90%] h-[90%] animate-pulse">
+                      <div className="absolute inset-0 rounded-full border-[3px] border-red-600 shadow-[0_0_10px_rgba(239,68,68,0.85)]" />
+                      <div className="absolute inset-[28%] rounded-full bg-red-500" />
+                      <div className="absolute top-1/2 left-0 right-0 h-[3px] bg-red-500 -translate-y-1/2" />
+                      <div className="absolute left-1/2 top-0 bottom-0 w-[3px] bg-red-500 -translate-x-1/2" />
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
 
           {/* Paste Preview */}
           {isPasting && clipboard && pastePreviewPos && (
@@ -10388,6 +11898,22 @@ export default function App() {
             >
               <Timer className="w-5 h-5 mx-auto" />
             </button>
+            <button
+              onClick={() => spawnDrivePanels()}
+              disabled={selectedVehicles.size === 0}
+              className={`p-3 rounded-xl transition-colors disabled:opacity-30 disabled:pointer-events-none ${
+                drivePanels.length > 0
+                  ? 'text-sky-600 bg-sky-50 ring-2 ring-sky-200'
+                  : 'text-slate-400 hover:bg-slate-50'
+              }`}
+              title={
+                selectedVehicles.size === 0
+                  ? 'Select vehicle(s), then open floating drive panel(s)'
+                  : `Open drive panel for ${selectedVehicles.size} selected vehicle${selectedVehicles.size === 1 ? '' : 's'}`
+              }
+            >
+              <Joystick className="w-5 h-5 mx-auto" />
+            </button>
             <button 
               onClick={() => setShowLogistics(!showLogistics)}
               className={`p-3 rounded-xl transition-colors ${showLogistics ? 'text-emerald-600 bg-emerald-50' : 'text-slate-400 hover:bg-slate-50'}`}
@@ -10401,31 +11927,6 @@ export default function App() {
               title="Plant Growth"
             >
               <Sprout className="w-5 h-5 mx-auto" />
-            </button>
-
-            {/* Destination Floater */}
-            <button 
-              onClick={() => {
-                if (selectedVehicles.size > 0) {
-                  toggleDestinationMode();
-                } else {
-                  toggleCarsPanel();
-                }
-              }}
-              className={`p-3 rounded-xl flex items-center justify-center shadow transition-colors ${
-                isDestinationToggleActive
-                  ? 'bg-red-600 hover:bg-red-700 text-white ring-2 ring-red-300'
-                  : 'bg-blue-600 hover:bg-blue-700 text-white'
-              } ${pendingRouteVehicleId ? 'animate-pulse' : ''}`}
-              title={
-                pendingRouteVehicleId
-                  ? 'Click a road tile to set destination (toggle off to clear)'
-                  : selectedHaveDestination
-                    ? 'Clear destinations for selected vehicles'
-                    : 'Set destination for selected vehicles'
-              }
-            >
-              <Target className="w-5 h-5" />
             </button>
 
             {/* Factory / Recipe Floater */}
@@ -10705,24 +12206,39 @@ export default function App() {
                     ))}
                 </div>
 
-                <div className="border-t pt-3">
-                  <div className="font-semibold mb-1">Toggles</div>
-                  <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={economy.showInventoryLabels} onChange={e => {
-                    const next = { ...economy, showInventoryLabels: e.target.checked };
-                    setEconomy(next); if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
-                  }} /> Show building inventory badges</label>
-                  <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={economy.showCargoLabels} onChange={e => {
-                    const next = { ...economy, showCargoLabels: e.target.checked };
-                    setEconomy(next); if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
-                  }} /> Show trailer cargo labels</label>
-                  <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={economy.economyPaused} onChange={e => {
-                    const next = { ...economy, economyPaused: e.target.checked };
-                    setEconomy(next); if (roomCode) socket.emit('update-economy', { roomCode, economy: next });
-                  }} /> Pause economy simulation</label>
+                <div className="border-t pt-3 space-y-1.5">
+                  <div className="font-semibold mb-1">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showInventoryLabels}
+                      onChange={e => setEconomyBadgeFlag('showInventoryLabels', e.target.checked)}
+                    />
+                    Show building inventory / production badges
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showTrailerCargoLabels ?? economy.showCargoLabels}
+                      onChange={e => {
+                        setEconomyBadgeFlag('showTrailerCargoLabels', e.target.checked);
+                        setEconomyBadgeFlag('showCargoLabels', e.target.checked);
+                      }}
+                    />
+                    Show trailer cargo badges
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.economyPaused}
+                      onChange={e => setEconomyBadgeFlag('economyPaused', e.target.checked)}
+                    />
+                    Pause economy simulation
+                  </label>
                 </div>
 
                 <div className="text-[10px] text-slate-500 pt-2 border-t">
-                  Use the 🎯 and 🏭 floaters (bottom-right) for quick access to Destinations and Factories/Recipes. Or open Cars / Semis / Trains panels or Logistics for full controls.
+                  Use the 🏭 floater (bottom-right) for Factories/Recipes, or open Cars / Semis / Trains / Service / drive panels for destinations and vehicle controls.
                 </div>
               </div>
             </motion.div>
@@ -10807,8 +12323,17 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="border-t pt-3">
-                  <label className="flex items-center gap-2 text-xs">
+                <div className="border-t pt-3 space-y-1.5">
+                  <div className="font-semibold text-xs mb-1">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showSeedlingBadges !== false}
+                      onChange={e => setEconomyBadgeFlag('showSeedlingBadges', e.target.checked)}
+                    />
+                    Show seedling growth % badges
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
                     <input
                       type="checkbox"
                       checked={economy.plantGrowth?.paused ?? false}
@@ -10861,7 +12386,21 @@ export default function App() {
                   <X className="w-5 h-5" />
                 </button>
               </div>
-              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 space-y-3">
+                <div className="bg-slate-50 rounded-xl p-3 border border-slate-100 space-y-1.5 shrink-0">
+                  <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={traffic.showControls !== false}
+                      onChange={e => {
+                        const show = e.target.checked;
+                        emitTraffic(prev => ({ ...prev, showControls: show }));
+                      }}
+                    />
+                    Show stop signs &amp; stoplights on map
+                  </label>
+                </div>
                 <TrafficPanel
                   traffic={traffic}
                   selectedIds={selectedTrafficIds}
@@ -10871,45 +12410,51 @@ export default function App() {
                   onSetTool={setTrafficTool}
                   onUpdateTraffic={emitTraffic}
                   onDeleteByKind={(kind) => {
-                    const nextControls = { ...traffic.controls };
                     const nextSelected = new Set(selectedTrafficIds);
-                    Object.values(traffic.controls).forEach(c => {
-                      if (c.kind === kind && selectedTrafficIds.has(trafficControlKey(c))) {
-                        delete nextControls[trafficControlKey(c)];
-                        nextSelected.delete(trafficControlKey(c));
-                      }
+                    emitTraffic(prev => {
+                      const nextControls = { ...prev.controls };
+                      Object.values(prev.controls).forEach(c => {
+                        if (c.kind === kind && selectedTrafficIds.has(trafficControlKey(c))) {
+                          delete nextControls[trafficControlKey(c)];
+                          nextSelected.delete(trafficControlKey(c));
+                        }
+                      });
+                      return { ...prev, controls: nextControls };
                     });
-                    emitTraffic({ ...traffic, controls: nextControls });
                     setSelectedTrafficIds(nextSelected);
                   }}
                   onLinkSelected={() => {
                     const groupId = `grp-${Date.now()}`;
-                    const nextControls = { ...traffic.controls };
-                    selectedTrafficIds.forEach(id => {
-                      const c = nextControls[id];
-                      if (c?.kind === 'stoplight') nextControls[id] = { ...c, groupId };
-                    });
-                    const coordinated = coordinateLightGroup(Object.values(nextControls), groupId);
-                    emitTraffic({
-                      ...traffic,
-                      controls: Object.fromEntries(coordinated.map(c => [trafficControlKey(c), c])),
+                    emitTraffic(prev => {
+                      const nextControls = { ...prev.controls };
+                      selectedTrafficIds.forEach(id => {
+                        const c = nextControls[id];
+                        if (c?.kind === 'stoplight') nextControls[id] = { ...c, groupId };
+                      });
+                      const coordinated = coordinateLightGroup(Object.values(nextControls), groupId);
+                      return {
+                        ...prev,
+                        controls: Object.fromEntries(coordinated.map(c => [trafficControlKey(c), c])),
+                      };
                     });
                   }}
                   onUnlinkSelected={() => {
-                    emitTraffic({
-                      ...traffic,
-                      controls: unlinkStoplights(traffic.controls, selectedTrafficIds),
-                    });
+                    emitTraffic(prev => ({
+                      ...prev,
+                      controls: unlinkStoplights(prev.controls, selectedTrafficIds),
+                    }));
                   }}
                   onToggleManual={(manual) => {
-                    const nextControls = { ...traffic.controls };
-                    selectedTrafficIds.forEach(id => {
-                      const c = nextControls[id];
-                      if (c?.kind === 'stoplight') {
-                        nextControls[id] = { ...c, manualOnly: manual };
-                      }
+                    emitTraffic(prev => {
+                      const nextControls = { ...prev.controls };
+                      selectedTrafficIds.forEach(id => {
+                        const c = nextControls[id];
+                        if (c?.kind === 'stoplight') {
+                          nextControls[id] = { ...c, manualOnly: manual };
+                        }
+                      });
+                      return { ...prev, controls: nextControls };
                     });
-                    emitTraffic({ ...traffic, controls: nextControls });
                   }}
                 />
               </div>
@@ -10966,24 +12511,35 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between px-2">
-                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                <div className="flex items-center justify-between px-2 gap-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer min-w-0">
                     <input
                       type="checkbox"
                       checked={carsList.length > 0 && carsFilteredSelection.size === carsList.length}
                       onChange={() => toggleAllVehiclesOfType('car')}
                       className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-600"
                     />
-                    Select All ({carsFilteredSelection.size}/{carsList.length})
+                    <span className="truncate">Select All ({carsFilteredSelection.size}/{carsList.length})</span>
                   </label>
-                  <button
-                    onClick={() => removeSelectedCars(carsFilteredSelection)}
-                    disabled={carsFilteredSelection.size === 0 || !roomCode}
-                    className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
-                    title="Remove Selected"
-                  >
-                    <Trash2 className="w-5 h-5" />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => spawnDrivePanels(carsFilteredSelection)}
+                      disabled={carsFilteredSelection.size === 0}
+                      className="text-sky-600 hover:text-sky-700 disabled:opacity-30 disabled:pointer-events-none p-1 bg-sky-50 hover:bg-sky-100 rounded-md transition-colors"
+                      title="Open floating drive panel(s) for selected"
+                    >
+                      <Joystick className="w-5 h-5" />
+                    </button>
+                    <button
+                      onClick={() => removeSelectedCars(carsFilteredSelection)}
+                      disabled={carsFilteredSelection.size === 0 || !roomCode}
+                      className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
+                      title="Remove Selected"
+                    >
+                      <Trash2 className="w-5 h-5" />
+                    </button>
+                  </div>
                 </div>
 
                 <div className="bg-white border border-slate-100 rounded-2xl overflow-y-auto overscroll-contain shadow-inner flex flex-col min-h-[120px] max-h-[280px] shrink-0">
@@ -10995,10 +12551,10 @@ export default function App() {
 
                 <div className="bg-white border border-rose-100 rounded-xl p-3 space-y-2 shrink-0">
                   <div className="text-xs font-semibold text-rose-800 flex items-center gap-1">
-                    <span>🏠</span> Owner house
+                    <span>🏠</span> Assign owner house
                   </div>
                   <p className="text-[10px] text-slate-500">
-                    Assign selected cars to a house. They tour town, then return home to park for 10s.
+                    Set which Home tile owns the selected cars. Residents of that house are shown as owners on the drive panel. Cars tour town, then return home to park for 10s.
                   </p>
                   <div className="flex gap-1.5">
                     <button
@@ -11011,7 +12567,7 @@ export default function App() {
                           : 'bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200'
                       }`}
                     >
-                      {pendingHomeAssign ? 'Click a house…' : 'Assign home'}
+                      {pendingHomeAssign ? 'Click a house…' : 'Assign house'}
                     </button>
                     <button
                       type="button"
@@ -11041,6 +12597,26 @@ export default function App() {
                       Click a Home tile on the map to set ownership.
                     </div>
                   )}
+                </div>
+
+                <div className="bg-white border border-slate-100 rounded-xl p-3 space-y-1.5 shrink-0">
+                  <div className="text-xs font-semibold text-slate-700">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showDestinationMarkers !== false}
+                      onChange={e => setEconomyBadgeFlag('showDestinationMarkers', e.target.checked)}
+                    />
+                    Show destination markers
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showVehicleStopBadges !== false}
+                      onChange={e => setEconomyBadgeFlag('showVehicleStopBadges', e.target.checked)}
+                    />
+                    Show stop / park timer badges
+                  </label>
                 </div>
               </div>
 
@@ -11118,24 +12694,35 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between px-2">
-                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                <div className="flex items-center justify-between px-2 gap-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer min-w-0">
                     <input
                       type="checkbox"
                       checked={semisList.length > 0 && semiFilteredSelection.size === semisList.length}
                       onChange={() => toggleAllVehiclesOfType('semi')}
                       className="rounded border-slate-300 text-amber-600 focus:ring-amber-600"
                     />
-                    Semis ({semiFilteredSelection.size}/{semisList.length})
+                    <span className="truncate">Semis ({semiFilteredSelection.size}/{semisList.length})</span>
                   </label>
-                  <button
-                    onClick={() => removeSelectedCars(semiFilteredSelection)}
-                    disabled={semiFilteredSelection.size === 0 || !roomCode}
-                    className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
-                    title="Remove Selected"
-                  >
-                    <Trash2 className="w-5 h-5" />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => spawnDrivePanels(semiFilteredSelection)}
+                      disabled={semiFilteredSelection.size === 0}
+                      className="text-sky-600 hover:text-sky-700 disabled:opacity-30 disabled:pointer-events-none p-1 bg-sky-50 hover:bg-sky-100 rounded-md transition-colors"
+                      title="Open floating drive panel(s) for selected"
+                    >
+                      <Joystick className="w-5 h-5" />
+                    </button>
+                    <button
+                      onClick={() => removeSelectedCars(semiFilteredSelection)}
+                      disabled={semiFilteredSelection.size === 0 || !roomCode}
+                      className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
+                      title="Remove Selected"
+                    >
+                      <Trash2 className="w-5 h-5" />
+                    </button>
+                  </div>
                 </div>
 
                 <div className="bg-white border border-slate-100 rounded-2xl overflow-y-auto overscroll-contain shadow-inner flex flex-col max-h-[160px] shrink-0">
@@ -11239,6 +12826,37 @@ export default function App() {
                     <div className="p-3 text-sm text-slate-400 text-center">No parked trailers</div>
                   )}
                 </div>
+
+                <div className="bg-white border border-slate-100 rounded-xl p-3 space-y-1.5 shrink-0">
+                  <div className="text-xs font-semibold text-slate-700">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showTrailerCargoLabels ?? economy.showCargoLabels}
+                      onChange={e => {
+                        setEconomyBadgeFlag('showTrailerCargoLabels', e.target.checked);
+                        setEconomyBadgeFlag('showCargoLabels', e.target.checked);
+                      }}
+                    />
+                    Show trailer cargo badges
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showDestinationMarkers !== false}
+                      onChange={e => setEconomyBadgeFlag('showDestinationMarkers', e.target.checked)}
+                    />
+                    Show destination markers
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showVehicleStopBadges !== false}
+                      onChange={e => setEconomyBadgeFlag('showVehicleStopBadges', e.target.checked)}
+                    />
+                    Show stop / park timer badges
+                  </label>
+                </div>
               </div>
 
               <div className="shrink-0 p-4 border-t border-slate-200 bg-slate-50/50 max-h-[40vh] overflow-y-auto overscroll-contain">
@@ -11315,24 +12933,35 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between px-2">
-                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                <div className="flex items-center justify-between px-2 gap-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer min-w-0">
                     <input
                       type="checkbox"
                       checked={trainsList.length > 0 && trainFilteredSelection.size === trainsList.length}
                       onChange={() => toggleAllVehiclesOfType('train')}
                       className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-600"
                     />
-                    Trains ({trainFilteredSelection.size}/{trainsList.length})
+                    <span className="truncate">Trains ({trainFilteredSelection.size}/{trainsList.length})</span>
                   </label>
-                  <button
-                    onClick={() => removeSelectedCars(trainFilteredSelection)}
-                    disabled={trainFilteredSelection.size === 0 || !roomCode}
-                    className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
-                    title="Remove Selected"
-                  >
-                    <Trash2 className="w-5 h-5" />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => spawnDrivePanels(trainFilteredSelection)}
+                      disabled={trainFilteredSelection.size === 0}
+                      className="text-sky-600 hover:text-sky-700 disabled:opacity-30 disabled:pointer-events-none p-1 bg-sky-50 hover:bg-sky-100 rounded-md transition-colors"
+                      title="Open floating drive panel(s) for selected"
+                    >
+                      <Joystick className="w-5 h-5" />
+                    </button>
+                    <button
+                      onClick={() => removeSelectedCars(trainFilteredSelection)}
+                      disabled={trainFilteredSelection.size === 0 || !roomCode}
+                      className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
+                      title="Remove Selected"
+                    >
+                      <Trash2 className="w-5 h-5" />
+                    </button>
+                  </div>
                 </div>
 
                 <div className="bg-white border border-slate-100 rounded-2xl overflow-y-auto overscroll-contain shadow-inner flex flex-col max-h-[140px] shrink-0">
@@ -11392,6 +13021,34 @@ export default function App() {
                     Select a single train to manage its railcars.
                   </div>
                 )}
+
+                <div className="bg-white border border-slate-100 rounded-xl p-3 space-y-1.5 shrink-0">
+                  <div className="text-xs font-semibold text-slate-700">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showRailcarCargoLabels ?? economy.showCargoLabels}
+                      onChange={e => setEconomyBadgeFlag('showRailcarCargoLabels', e.target.checked)}
+                    />
+                    Show railcar cargo badges
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showDestinationMarkers !== false}
+                      onChange={e => setEconomyBadgeFlag('showDestinationMarkers', e.target.checked)}
+                    />
+                    Show destination markers
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showVehicleStopBadges !== false}
+                      onChange={e => setEconomyBadgeFlag('showVehicleStopBadges', e.target.checked)}
+                    />
+                    Show stop / park timer badges
+                  </label>
+                </div>
               </div>
 
               <div className="shrink-0 p-4 border-t border-slate-200 bg-slate-50/50 max-h-[40vh] overflow-y-auto overscroll-contain">
@@ -11479,24 +13136,35 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-between px-2">
-                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                <div className="flex items-center justify-between px-2 gap-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer min-w-0">
                     <input
                       type="checkbox"
                       checked={serviceList.length > 0 && serviceFilteredSelection.size === serviceList.length}
                       onChange={() => toggleAllVehiclesOfType('service')}
                       className="rounded border-slate-300 text-orange-600 focus:ring-orange-600"
                     />
-                    Select All ({serviceFilteredSelection.size}/{serviceList.length})
+                    <span className="truncate">Select All ({serviceFilteredSelection.size}/{serviceList.length})</span>
                   </label>
-                  <button
-                    onClick={() => removeSelectedCars(serviceFilteredSelection)}
-                    disabled={serviceFilteredSelection.size === 0 || !roomCode}
-                    className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
-                    title="Remove Selected"
-                  >
-                    <Trash2 className="w-5 h-5" />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => spawnDrivePanels(serviceFilteredSelection)}
+                      disabled={serviceFilteredSelection.size === 0}
+                      className="text-sky-600 hover:text-sky-700 disabled:opacity-30 disabled:pointer-events-none p-1 bg-sky-50 hover:bg-sky-100 rounded-md transition-colors"
+                      title="Open floating drive panel(s) for selected"
+                    >
+                      <Joystick className="w-5 h-5" />
+                    </button>
+                    <button
+                      onClick={() => removeSelectedCars(serviceFilteredSelection)}
+                      disabled={serviceFilteredSelection.size === 0 || !roomCode}
+                      className="text-red-500 hover:text-red-600 disabled:opacity-30 disabled:pointer-events-none p-1 bg-red-50 hover:bg-red-100 rounded-md transition-colors"
+                      title="Remove Selected"
+                    >
+                      <Trash2 className="w-5 h-5" />
+                    </button>
+                  </div>
                 </div>
 
                 <div className="bg-white border border-slate-100 rounded-2xl overflow-y-auto overscroll-contain shadow-inner flex flex-col min-h-[120px] max-h-[280px] shrink-0">
@@ -11526,6 +13194,7 @@ export default function App() {
                       setPendingFireStart(p => !p);
                       setPendingHomeAssign(false);
                       setPendingEmployeeAssign(false);
+                      setPendingPersonFormPick(null);
                       setPendingRouteVehicleId(null);
                       setSelectedTile(null);
                       setIsPlacingVehicles(false);
@@ -11538,6 +13207,26 @@ export default function App() {
                   >
                     {pendingFireStart ? 'Click a tree… (Esc to cancel)' : 'Start fire on tree'}
                   </button>
+                </div>
+
+                <div className="bg-white border border-slate-100 rounded-xl p-3 space-y-1.5 shrink-0">
+                  <div className="text-xs font-semibold text-slate-700">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showDestinationMarkers !== false}
+                      onChange={e => setEconomyBadgeFlag('showDestinationMarkers', e.target.checked)}
+                    />
+                    Show destination markers
+                  </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showVehicleStopBadges !== false}
+                      onChange={e => setEconomyBadgeFlag('showVehicleStopBadges', e.target.checked)}
+                    />
+                    Show stop / park timer badges
+                  </label>
                 </div>
               </div>
 
@@ -11630,6 +13319,18 @@ export default function App() {
                   so production can run. 1 year of age = 1 hour real time.
                 </p>
 
+                <div className="bg-violet-50/60 border border-violet-100 rounded-xl p-2.5 space-y-1.5">
+                  <div className="text-[10px] font-semibold text-violet-900 uppercase tracking-wide">Map badges</div>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showHomeBadges !== false}
+                      onChange={e => setEconomyBadgeFlag('showHomeBadges', e.target.checked)}
+                    />
+                    Show home occupancy badges
+                  </label>
+                </div>
+
                 <div className="grid grid-cols-2 gap-1.5">
                   <button
                     type="button"
@@ -11681,7 +13382,10 @@ export default function App() {
                       </div>
                       <button
                         type="button"
-                        onClick={() => setPeopleFormMode('closed')}
+                        onClick={() => {
+                          setPendingPersonFormPick(null);
+                          setPeopleFormMode('closed');
+                        }}
                         className="text-slate-400 hover:text-slate-600"
                       >
                         <X className="w-4 h-4" />
@@ -11726,28 +13430,82 @@ export default function App() {
                           onChange={e => setPeopleForm(f => ({ ...f, ageYears: Math.max(0, parseInt(e.target.value) || 0) }))}
                         />
                       </label>
-                      <label className="text-[10px] text-slate-500 col-span-2">
-                        Home key (tile)
-                        <select
-                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs"
-                          value={peopleForm.homeKey}
-                          onChange={e => setPeopleForm(f => ({ ...f, homeKey: e.target.value }))}
-                        >
-                          <option value="">Select home…</option>
-                          {listHomeKeys(grid).map(hk => (
-                            <option key={hk} value={hk}>{hk}</option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="text-[10px] text-slate-500">
-                        Workplace key
-                        <input
-                          className="mt-0.5 w-full border border-slate-200 rounded px-2 py-1 text-xs font-mono"
-                          placeholder="e.g. 12,5 (optional)"
-                          value={peopleForm.workplaceKey}
-                          onChange={e => setPeopleForm(f => ({ ...f, workplaceKey: e.target.value }))}
-                        />
-                      </label>
+                      <div className="col-span-2 space-y-1">
+                        <div className="text-[10px] text-slate-500">Home (click house on map)</div>
+                        <div className="flex items-center gap-1.5">
+                          <div
+                            className={`flex-1 min-w-0 px-2 py-1 rounded border text-xs font-mono truncate ${
+                              peopleForm.homeKey
+                                ? 'bg-rose-50 border-rose-200 text-rose-800'
+                                : 'bg-slate-50 border-slate-200 text-slate-400'
+                            }`}
+                            title={peopleForm.homeKey || 'No home selected'}
+                          >
+                            {peopleForm.homeKey ? `🏠 ${peopleForm.homeKey}` : 'No home selected'}
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!roomCode}
+                            onClick={() => startPersonFormMapPick('home')}
+                            className={`shrink-0 px-2 py-1 rounded-lg text-[10px] font-bold border transition-colors disabled:opacity-40 ${
+                              pendingPersonFormPick === 'home'
+                                ? 'bg-rose-600 text-white border-rose-700 animate-pulse'
+                                : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'
+                            }`}
+                            title="Click a house on the map"
+                          >
+                            {pendingPersonFormPick === 'home' ? 'Click house…' : 'Pick house'}
+                          </button>
+                          {peopleForm.homeKey && (
+                            <button
+                              type="button"
+                              onClick={() => setPeopleForm(f => ({ ...f, homeKey: '' }))}
+                              className="shrink-0 px-1.5 py-1 rounded-lg text-[10px] text-slate-500 hover:bg-slate-100 border border-slate-200"
+                              title="Clear home"
+                            >
+                              Clear
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="col-span-2 space-y-1">
+                        <div className="text-[10px] text-slate-500">Workplace (click building on map, optional)</div>
+                        <div className="flex items-center gap-1.5">
+                          <div
+                            className={`flex-1 min-w-0 px-2 py-1 rounded border text-xs font-mono truncate ${
+                              peopleForm.workplaceKey
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                                : 'bg-slate-50 border-slate-200 text-slate-400'
+                            }`}
+                            title={peopleForm.workplaceKey || 'No workplace'}
+                          >
+                            {peopleForm.workplaceKey ? `👷 ${peopleForm.workplaceKey}` : 'No workplace'}
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!roomCode}
+                            onClick={() => startPersonFormMapPick('workplace')}
+                            className={`shrink-0 px-2 py-1 rounded-lg text-[10px] font-bold border transition-colors disabled:opacity-40 ${
+                              pendingPersonFormPick === 'workplace'
+                                ? 'bg-emerald-600 text-white border-emerald-700 animate-pulse'
+                                : 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                            }`}
+                            title="Click a building on the map"
+                          >
+                            {pendingPersonFormPick === 'workplace' ? 'Click building…' : 'Pick building'}
+                          </button>
+                          {peopleForm.workplaceKey && (
+                            <button
+                              type="button"
+                              onClick={() => setPeopleForm(f => ({ ...f, workplaceKey: '' }))}
+                              className="shrink-0 px-1.5 py-1 rounded-lg text-[10px] text-slate-500 hover:bg-slate-100 border border-slate-200"
+                              title="Clear workplace"
+                            >
+                              Clear
+                            </button>
+                          )}
+                        </div>
+                      </div>
                       <label className="text-[10px] text-slate-500">
                         Money
                         <input
@@ -11782,7 +13540,10 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => setPeopleFormMode('closed')}
+                        onClick={() => {
+                          setPendingPersonFormPick(null);
+                          setPeopleFormMode('closed');
+                        }}
                         className="px-3 py-1.5 rounded-lg text-[11px] font-bold border border-slate-200 text-slate-600"
                       >
                         Cancel
@@ -11947,6 +13708,90 @@ export default function App() {
           )}
         </AnimatePresence>
 
+          {/* Floating per-vehicle drive control panels */}
+          {drivePanels.map(panel => (
+            <FloatingVehicleDrivePanel
+              key={panel.vehicleId}
+              vehicleId={panel.vehicleId}
+              vehicle={vehicles[panel.vehicleId]}
+              people={economy.people}
+              localUserUid={user?.uid}
+              position={{ x: panel.x, y: panel.y }}
+              zIndex={panel.zIndex}
+              isActive={activeDrivePanelId === panel.vehicleId}
+              roomCode={roomCode}
+              controlsLockedByOther={
+                !!(
+                  vehicles[panel.vehicleId]?.manualOverride &&
+                  vehicles[panel.vehicleId]?.manualOverrideByUid &&
+                  user?.uid &&
+                  vehicles[panel.vehicleId]?.manualOverrideByUid !== user.uid
+                )
+              }
+              pendingRouteVehicleId={pendingRouteVehicleId}
+              isPlacingVehicles={isPlacingVehicles}
+              pendingHomeAssign={pendingHomeAssign}
+              onActivate={() => activateDrivePanel(panel.vehicleId)}
+              onClose={() => closeDrivePanel(panel.vehicleId)}
+              onMove={(pos) => moveDrivePanel(panel.vehicleId, pos)}
+              onSpeedChange={(s) => {
+                activateDrivePanel(panel.vehicleId);
+                changeSelectedCarsSpeed(s, [panel.vehicleId]);
+              }}
+              onToggleAttribute={(a) => {
+                activateDrivePanel(panel.vehicleId);
+                toggleSelectedCarsAttribute(a, [panel.vehicleId]);
+              }}
+              onDistribute={() => {
+                activateDrivePanel(panel.vehicleId);
+                distributeSelectedCars([panel.vehicleId]);
+              }}
+              onToggleDestination={() => {
+                activateDrivePanel(panel.vehicleId);
+                toggleDestinationMode([panel.vehicleId]);
+              }}
+              onPark={() => {
+                activateDrivePanel(panel.vehicleId);
+                parkSelectedVehicles([panel.vehicleId]);
+              }}
+              onUnpark={() => {
+                activateDrivePanel(panel.vehicleId);
+                unparkSelectedVehicles([panel.vehicleId]);
+              }}
+              onTogglePlacing={() => {
+                activateDrivePanel(panel.vehicleId);
+                const next = !isPlacingVehicles || activeDrivePanelId !== panel.vehicleId;
+                setIsPlacingVehicles(next);
+                if (next) setPendingRouteVehicleId(null);
+              }}
+              onToggleEmergencyLights={() => {
+                activateDrivePanel(panel.vehicleId);
+                toggleSelectedEmergencyLights([panel.vehicleId]);
+              }}
+              onToggleHomeAssign={() => {
+                // Keep home-assign mode so the toggle can cancel or enable correctly
+                activateDrivePanel(panel.vehicleId, { keepHomeAssign: true });
+                toggleHomeAssignMode([panel.vehicleId]);
+              }}
+              onAssignRandomHomes={() => {
+                activateDrivePanel(panel.vehicleId);
+                assignSelectedCarsToRandomHomes([panel.vehicleId]);
+              }}
+              onClearHomes={() => {
+                activateDrivePanel(panel.vehicleId);
+                clearSelectedHomes([panel.vehicleId]);
+              }}
+              onChangeTrailers={(delta) => {
+                activateDrivePanel(panel.vehicleId);
+                changeSelectedTrailers(delta, [panel.vehicleId]);
+              }}
+              onToggleManualOverride={(enabled) => {
+                activateDrivePanel(panel.vehicleId);
+                setVehicleManualOverride(panel.vehicleId, enabled);
+              }}
+            />
+          ))}
+
           {/* Home people / family inspector */}
           <AnimatePresence>
             {inspectHomeKey && (
@@ -11967,18 +13812,32 @@ export default function App() {
           {/* Building Economy Inspector Modal (new) */}
           <AnimatePresence>
             {inspectBuildingKey && economy.buildings[inspectBuildingKey] && (
-              <BuildingInspectorModal
-                bkey={inspectBuildingKey}
-                cfg={economy.buildings[inspectBuildingKey]}
-                economy={economy}
-                grid={grid}
-                vehicles={vehicles}
-                setEconomy={setEconomy}
-                setVehicles={setVehicles}
-                roomCode={roomCode}
-                onClose={() => setInspectBuildingKey(null)}
-                onOpenTrailer={(ref) => setInspectTrailerRef(ref)}
-              />
+              economy.buildings[inspectBuildingKey].role === 'taxi-station' ? (
+                <TaxiStationInspectorModal
+                  bkey={inspectBuildingKey}
+                  cfg={economy.buildings[inspectBuildingKey]}
+                  economy={economy}
+                  grid={grid}
+                  vehicles={vehicles}
+                  setEconomy={setEconomy}
+                  setVehicles={setVehicles}
+                  roomCode={roomCode}
+                  onClose={() => setInspectBuildingKey(null)}
+                />
+              ) : (
+                <BuildingInspectorModal
+                  bkey={inspectBuildingKey}
+                  cfg={economy.buildings[inspectBuildingKey]}
+                  economy={economy}
+                  grid={grid}
+                  vehicles={vehicles}
+                  setEconomy={setEconomy}
+                  setVehicles={setVehicles}
+                  roomCode={roomCode}
+                  onClose={() => setInspectBuildingKey(null)}
+                  onOpenTrailer={(ref) => setInspectTrailerRef(ref)}
+                />
+              )
             )}
           </AnimatePresence>
 

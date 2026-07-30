@@ -1,6 +1,13 @@
 import React from 'react';
 import { TrafficControl, TrafficState } from '../types';
-import { edgePortLabel, getStopSignPosition, getStoplightPosition } from '../traffic';
+import {
+  edgePortLabel,
+  getStopSignPosition,
+  getStoplightPosition,
+  trafficControlKey,
+} from '../traffic';
+
+export { trafficControlKey };
 
 const PHASE_COLORS: Record<string, string> = {
   red: '#ef4444',
@@ -51,7 +58,7 @@ export function TrafficOverlay({
           const half = signSize / 2;
           return (
             <div
-              key={ctrl.id}
+              key={trafficControlKey(ctrl)}
               className={`absolute ${onSignClick ? 'pointer-events-auto cursor-pointer' : 'pointer-events-none'}`}
               style={{
                 left: pos.x - half,
@@ -94,7 +101,7 @@ export function TrafficOverlay({
         const radius = lightDiameter / 2;
         return (
           <div
-            key={ctrl.id}
+            key={trafficControlKey(ctrl)}
             className={`absolute ${onLightClick ? 'pointer-events-auto cursor-pointer' : 'pointer-events-none'}`}
             style={{
               left: pos.x - radius,
@@ -153,8 +160,4 @@ export function TrafficCountdownBadge({ seconds }: { seconds: number }) {
 
 export function getAllTrafficControls(traffic: TrafficState): TrafficControl[] {
   return Object.values(traffic.controls);
-}
-
-export function trafficControlKey(c: TrafficControl): string {
-  return String(c.id);
 }

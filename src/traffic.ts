@@ -1,5 +1,13 @@
 import { LANE_OFFSET_UNIT, TILE_CENTER } from './roadGeometry';
-import { GridData, GridTile, TrafficControl, TrafficLightPhase, TrafficState, Vehicle } from './types';
+import {
+  GridData,
+  GridTile,
+  TrafficControl,
+  TrafficLightPhase,
+  TrafficState,
+  Vehicle,
+  hasEmergencyLights,
+} from './types';
 
 export const DEFAULT_TRAFFIC_STATE: TrafficState = {
   stopSignMinDurationSec: 3,
@@ -8,6 +16,7 @@ export const DEFAULT_TRAFFIC_STATE: TrafficState = {
   nextLightId: 1,
   nextSignId: 1,
   controls: {},
+  showControls: true,
 };
 
 const EDGE_LABELS = ['N', 'E', 'S', 'W'];
@@ -35,6 +44,17 @@ export const TILE_CONNECTIONS: Record<string, number[]> = {
   'road-roundabout': [0, 1, 2, 3],
   'road-end': [2],
   'road-4lane-end': [2],
+  // Driveable bays / lots — full 4-way access (robotaxis exit onto any adjacent road)
+  'parking-1x1': [0, 1, 2, 3],
+  'parking-1x2': [0, 1, 2, 3],
+  'parking-1x3': [0, 1, 2, 3],
+  'parking-2x2': [0, 1, 2, 3],
+  'parking-2x4': [0, 1, 2, 3],
+  'parking-4x4': [0, 1, 2, 3],
+  'building-repair-shop': [0, 1, 2, 3],
+  'building-hospital': [0, 1, 2, 3],
+  'building-taxi-station': [0, 1, 2, 3],
+  'building-home': [0, 1, 2, 3],
 };
 
 const STRAIGHT_ROAD_TYPES = new Set([
@@ -178,20 +198,38 @@ export function findStopSignForVehicle(
   });
 }
 
+/** Normalize heading to 0 / 90 / 180 / 270 */
+export function normalizeHeading(heading: number): number {
+  const h = ((Math.round(heading / 90) % 4) + 4) % 4;
+  return h * 90;
+}
+
+/** N/S share an axis; E/W share the other (for coordinated light groups). */
+export function headingAxis(heading: number): 'ns' | 'ew' {
+  const h = normalizeHeading(heading);
+  return h === 0 || h === 180 ? 'ns' : 'ew';
+}
+
+/**
+ * Find the stoplight that governs this vehicle on this tile.
+ * Prefers exact heading+lane match; falls back to any light for the same
+ * travel heading so a single signal still stops all lanes (incl. robotaxis
+ * that may not sit on the painted lane after leaving a bay).
+ */
 export function findStoplightForVehicle(
   gridKey: string,
   heading: number,
   lane: number,
   traffic: TrafficState
 ): Extract<TrafficControl, { kind: 'stoplight' }> | undefined {
-  const candidates = getStoplightsAt(gridKey, traffic).filter(
+  const h = normalizeHeading(heading);
+  const lights = getStoplightsAt(gridKey, traffic).filter(
     (light): light is Extract<TrafficControl, { kind: 'stoplight' }> =>
-      light.kind === 'stoplight' && light.heading === heading
+      light.kind === 'stoplight' && normalizeHeading(light.heading) === h
   );
-  if (!candidates.length) return undefined;
-  return (
-    candidates.find(light => Math.abs(light.lane - lane) < 0.01) ?? candidates[0]
-  );
+  if (!lights.length) return undefined;
+  const exact = lights.find(light => Math.abs(light.lane - lane) < 0.01);
+  return exact ?? lights[0];
 }
 
 /** Progress (0–1) at which a vehicle has reached the stop line for this light */
@@ -199,8 +237,9 @@ export function approachProgressForLight(
   light: Extract<TrafficControl, { kind: 'stoplight' }>
 ): number {
   const margin = 6;
-  const pos = getStoplightPosition(light.heading, light.lane, 0);
-  const h = light.heading;
+  const h = normalizeHeading(light.heading);
+  const pos = getStoplightPosition(h, light.lane, 0);
+  // Stop line is near the light, which sits toward the exit of this travel direction.
   if (h === 0) return Math.max(0, Math.min(0.98, (64 - pos.y - margin) / 64));
   if (h === 180) return Math.max(0, Math.min(0.98, (pos.y - margin) / 64));
   if (h === 90) return Math.max(0, Math.min(0.98, 0.5 + (pos.x - TILE_CENTER - margin) / 64));
@@ -337,7 +376,17 @@ export function advanceLightPhase(control: TrafficControl, now = Date.now()): Tr
   return { ...control, phase: next, phaseStartedAt: now };
 }
 
-/** Safe coordinated phases: group lights at same intersection with offset cycles */
+/**
+ * Coordinate phases for a linked light group.
+ * Lights on the same axis (N+S, or E+W) share phase so opposite directions
+ * on a bidirectional road go green together. Perpendicular axes are offset
+ * by half a cycle (when N/S is green, E/W is red).
+ */
+/** Stable map key — must include kind so stop-sign #1 and stoplight #1 do not collide. */
+export function trafficControlKey(c: Pick<TrafficControl, 'kind' | 'id'>): string {
+  return `${c.kind}:${c.id}`;
+}
+
 export function coordinateLightGroup(
   controls: TrafficControl[],
   groupId: string
@@ -346,31 +395,33 @@ export function coordinateLightGroup(
   const grouped = lights.filter(l => l.groupId === groupId);
   if (grouped.length < 2) return controls;
 
-  const headings = [...new Set(grouped.map(l => l.heading))];
-  if (headings.length < 2) return controls;
-
+  const axes = [...new Set(grouped.map(l => headingAxis(l.heading)))];
+  // Need at least two axes (or still sync timings even if same-axis only)
   const now = Date.now();
-  const result = { ...Object.fromEntries(controls.map(c => [c.id, c])) };
+  const result: Record<string, TrafficControl> = Object.fromEntries(
+    controls.map(c => [trafficControlKey(c), c])
+  );
 
   const primary = grouped[0];
-  const perp = grouped.find(l => l.heading !== primary.heading) || grouped[1];
+  const primaryAxis = headingAxis(primary.heading);
   const totalCycle = primary.redMs + primary.yellowMs + primary.greenMs;
+  const hasPerp = axes.length >= 2;
 
-  grouped.forEach((light, idx) => {
-    const isPrimary = light.heading === primary.heading;
-    const offset = isPrimary ? 0 : Math.floor(totalCycle / 2);
-    result[light.id] = {
+  grouped.forEach(light => {
+    const sameAxis = headingAxis(light.heading) === primaryAxis;
+    // Opposite direction on the same road = same phase; perpendicular = offset
+    const offset = sameAxis || !hasPerp ? 0 : Math.floor(totalCycle / 2);
+    result[trafficControlKey(light)] = {
       ...light,
       groupId,
       manualOnly: false,
       redMs: primary.redMs,
       yellowMs: primary.yellowMs,
       greenMs: primary.greenMs,
-      phase: isPrimary ? 'green' : 'red',
+      phase: sameAxis || !hasPerp ? 'green' : 'red',
       phaseStartedAt: now - offset,
     };
   });
-  void perp;
   return Object.values(result);
 }
 
@@ -507,16 +558,85 @@ export function shouldStopForSign(
   };
 }
 
+/**
+ * Emergency mode: fire / police / ambulance / tow with light bar on
+ * (undefined emergencyLightsOn defaults to on).
+ * Grants red/yellow ignore, vehicle pass-through, and wrong-side overtaking.
+ */
+export function isEmergencyMode(vehicle: Vehicle): boolean {
+  if (!hasEmergencyLights(vehicle.type)) return false;
+  // Match Vehicle.tsx: undefined means lights are on
+  return vehicle.emergencyLightsOn !== false;
+}
+
+/** @deprecated Prefer isEmergencyMode — same predicate */
+export function canIgnoreTrafficLights(vehicle: Vehicle): boolean {
+  return isEmergencyMode(vehicle);
+}
+
+/** Correct-side lane for this road (right of center relative to heading). */
+export function getEmergencyHomeLane(lane: number, is4Lane: boolean): number {
+  if (is4Lane) {
+    const mag = Math.abs(lane) >= 2 ? 2.5 : 1;
+    return mag;
+  }
+  return 1;
+}
+
+/** Opposite (wrong-side) lane used to pass slower traffic. */
+export function getEmergencyPassLane(lane: number, is4Lane: boolean): number {
+  return -getEmergencyHomeLane(lane, is4Lane);
+}
+
 export function shouldStopForLight(
   vehicle: Vehicle,
   traffic: TrafficState
 ): boolean {
+  // Only emergency vehicles with lights on may run red/yellow
+  // Robotaxis and all other vehicles MUST stop
+  if (isEmergencyMode(vehicle)) return false;
+
   const key = `${vehicle.x},${vehicle.y}`;
   const light = findStoplightForVehicle(key, vehicle.heading, vehicle.lane, traffic);
   if (!light) return false;
+  if (normalizeHeading(light.heading) !== normalizeHeading(vehicle.heading)) return false;
   if (vehicle.progress < approachProgressForLight(light)) return false;
-  if (vehicle.progress >= 0.99) return false;
+  // Still enforce until the vehicle actually leaves the tile
+  if (vehicle.progress >= 1) return false;
   return light.phase === 'red' || light.phase === 'yellow';
+}
+
+/**
+ * Clamp a proposed progress so the vehicle cannot jump over a red/yellow stop line
+ * in a single frame (large deltaTime / high speed). Returns clamped progress and
+ * whether the vehicle must hard-stop at the line.
+ */
+export function clampProgressForRedLight(
+  vehicle: Vehicle,
+  targetProgress: number,
+  traffic: TrafficState
+): { progress: number; mustStop: boolean } {
+  if (isEmergencyMode(vehicle)) return { progress: targetProgress, mustStop: false };
+  if (targetProgress <= vehicle.progress) return { progress: targetProgress, mustStop: false };
+
+  const key = `${vehicle.x},${vehicle.y}`;
+  const light = findStoplightForVehicle(key, vehicle.heading, vehicle.lane, traffic);
+  if (!light) return { progress: targetProgress, mustStop: false };
+  if (light.phase !== 'red' && light.phase !== 'yellow') {
+    return { progress: targetProgress, mustStop: false };
+  }
+
+  const stopAt = approachProgressForLight(light);
+  // Approaching or already at the line: do not pass stopAt while red/yellow
+  if (vehicle.progress <= stopAt + 1e-4) {
+    if (targetProgress > stopAt) {
+      return { progress: stopAt, mustStop: true };
+    }
+  } else if (vehicle.progress < 0.995) {
+    // Already past the painted line but still on tile — hold position on red/yellow
+    return { progress: vehicle.progress, mustStop: true };
+  }
+  return { progress: targetProgress, mustStop: false };
 }
 
 export function createStopSign(gridKey: string, edgePort: number, id: number, lane?: number): TrafficControl {
@@ -540,7 +660,7 @@ export function createStoplight(
     kind: 'stoplight',
     id,
     gridKey,
-    heading,
+    heading: normalizeHeading(heading),
     lane,
     phase: 'red',
     manualOnly: false,
@@ -558,14 +678,36 @@ export function normalizeTraffic(raw: Partial<TrafficState> | null | undefined):
   let nextLightId = raw.nextLightId ?? 1;
   const controls: TrafficState['controls'] = {};
 
-  for (const c of Object.values(raw.controls ?? {})) {
+  // Collect first so we can re-key legacy plain-numeric keys without collisions.
+  // Historically both stop-signs and stoplights used String(id) as the map key while
+  // keeping independent id counters — the later write wiped the earlier control.
+  const entries = Object.entries(raw.controls ?? {});
+  for (const [, c] of entries) {
+    if (!c || typeof c !== 'object') continue;
     if (c.kind === 'stop-sign') {
-      const id = typeof c.id === 'number' ? c.id : nextSignId++;
+      const id =
+        typeof c.id === 'number' && Number.isFinite(c.id) ? c.id : nextSignId++;
       nextSignId = Math.max(nextSignId, id + 1);
-      controls[String(id)] = { ...c, id };
+      const sign: TrafficControl = { ...c, kind: 'stop-sign', id };
+      controls[trafficControlKey(sign)] = sign;
     } else if (c.kind === 'stoplight') {
-      controls[String(c.id)] = c;
-      nextLightId = Math.max(nextLightId, c.id + 1);
+      const id =
+        typeof c.id === 'number' && Number.isFinite(c.id) ? c.id : nextLightId++;
+      nextLightId = Math.max(nextLightId, id + 1);
+      const light: TrafficControl = {
+        ...c,
+        kind: 'stoplight',
+        id,
+        heading: normalizeHeading(c.heading ?? 0),
+        lane: typeof c.lane === 'number' ? c.lane : 1,
+        phase: c.phase === 'green' || c.phase === 'yellow' || c.phase === 'red' ? c.phase : 'red',
+        manualOnly: !!c.manualOnly,
+        redMs: typeof c.redMs === 'number' ? c.redMs : 5000,
+        yellowMs: typeof c.yellowMs === 'number' ? c.yellowMs : 2000,
+        greenMs: typeof c.greenMs === 'number' ? c.greenMs : 5000,
+        phaseStartedAt: typeof c.phaseStartedAt === 'number' ? c.phaseStartedAt : Date.now(),
+      };
+      controls[trafficControlKey(light)] = light;
     }
   }
 
@@ -576,5 +718,6 @@ export function normalizeTraffic(raw: Partial<TrafficState> | null | undefined):
     nextLightId,
     nextSignId,
     controls,
+    showControls: raw.showControls !== false,
   };
 }
