@@ -69,9 +69,11 @@ import {
   Joystick,
   GripHorizontal,
   ShipWheel,
+  Clock,
 } from 'lucide-react';
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent, ParkedTrailerVisual } from './components/Vehicle';
+import { DriverView3D, PersonView3D } from './components/DriverView3D';
 import { TrafficOverlay, getAllTrafficControls, trafficControlKey } from './components/TrafficOverlay';
 import { diffGrid, mergeAcceptedIntoBaseline } from './gridSync';
 import {
@@ -104,12 +106,29 @@ import {
   isAdult,
   MS_PER_AGE_YEAR,
   countEmployeesAtBuilding,
+  countEmployeesAssignedToBuilding,
   assignPeopleWorkplace,
   createPerson,
   randomFirstName,
   randomLastName,
   listHomeKeys,
+  isResidentialHomeType,
+  resolveHomeKeyFromTile,
+  assignHomesWithDrivers,
+  getPersonMapPlacement,
+  getPersonFacingHeading,
+  shouldYieldToPedestrians,
+  generatePersonSchedule,
+  formatScheduleTime,
+  listStoreKeys,
+  advanceWalkingPerson,
+  getSimNow,
+  formatClock12h,
+  cityTimeOffsetForLocalTime,
+  parseClockInput,
+  locationForMapPlacement,
 } from './people';
+import { PersonMapIcon } from './components/PersonMarker';
 import {
   DEFAULT_TRAFFIC_STATE,
   normalizeTraffic,
@@ -246,6 +265,8 @@ const TILE_CONNECTIONS: Record<string, number[]> = {
   'road-roundabout': [0, 1, 2, 3],
   'road-end': [2],
   'road-4lane-end': [2],
+  'road-bus-stop': [0, 2],
+  'road-4lane-bus-stop': [0, 2],
   'rail-straight': [0, 2],
   'rail-curve': [0, 3],
   'rail-t': [0, 2, 3],
@@ -263,8 +284,10 @@ const TILE_CONNECTIONS: Record<string, number[]> = {
   'building-repair-shop': [0, 1, 2, 3],
   'building-hospital': [0, 1, 2, 3],
   'building-taxi-station': [0, 1, 2, 3],
-  // Houses are approachable driveway-style parking for assigned cars
+  'building-bus-station': [0, 1, 2, 3],
+  // Houses / apartments are approachable driveway-style parking for assigned cars
   'building-home': [0, 1, 2, 3],
+  'building-apartment': [0, 1, 2, 3],
 };
 
 const FOUR_LANE_INNER = 1;
@@ -348,6 +371,8 @@ export function getMultiTileDimensions(type: string): { w: number; h: number } {
   if (type === 'building-hospital') return { w: 4, h: 4 };
   // 4×2 taxi station: office row + 4 taxi bays
   if (type === 'building-taxi-station') return { w: 4, h: 2 };
+  // 2×2 bus station: terminal row + 2 bus bays
+  if (type === 'building-bus-station') return { w: 2, h: 2 };
   return { w: 1, h: 1 };
 }
 
@@ -357,7 +382,8 @@ export function isEconomyBuilding(type: string): boolean {
     type.includes('warehouse') || type.includes('factory') || type === 'building-store' ||
     type === 'building-strip-mall' || type === 'building-lumbermill' || type === 'building-station' ||
     type === 'building-train-station-large' || type === 'building-repair-shop' ||
-    type === 'building-hospital' || type === 'building-taxi-station'
+    type === 'building-hospital' || type === 'building-taxi-station' ||
+    type === 'building-bus-station'
   );
 }
 
@@ -369,6 +395,7 @@ export function getBuildingRole(type: string): BuildingConfig['role'] {
   if (type === 'building-repair-shop') return 'repair-shop';
   if (type === 'building-hospital') return 'hospital';
   if (type === 'building-taxi-station') return 'taxi-station';
+  if (type === 'building-bus-station') return 'bus-station';
   return 'none';
 }
 
@@ -402,14 +429,30 @@ export function getTaxiStationBayIndex(tile: GridTile): number {
   return Math.max(0, Math.min(3, tile.localX ?? 0));
 }
 
-/** Any building cell that vehicles can park in (repair / hospital / taxi bays). */
+/** Bus station: bottom row of the 2×2 terminal (2 bays). */
+export function isBusStationBay(tile: GridTile | undefined | null): boolean {
+  if (!tile || tile.type !== 'building-bus-station') return false;
+  return (tile.localY ?? 0) >= 1;
+}
+
+export function getBusStationBayIndex(tile: GridTile): number {
+  return Math.max(0, Math.min(1, tile.localX ?? 0));
+}
+
+/** Any building cell that vehicles can park in (repair / hospital / taxi / bus bays). */
 export function isBuildingParkingBay(tile: GridTile | undefined | null): boolean {
-  return isRepairShopServiceBay(tile) || isHospitalAmbulanceBay(tile) || isTaxiStationBay(tile);
+  return (
+    isRepairShopServiceBay(tile) ||
+    isHospitalAmbulanceBay(tile) ||
+    isTaxiStationBay(tile) ||
+    isBusStationBay(tile)
+  );
 }
 
 export function getBuildingParkingBayIndex(tile: GridTile): number {
   if (isHospitalAmbulanceBay(tile)) return getHospitalBayIndex(tile);
   if (isTaxiStationBay(tile)) return getTaxiStationBayIndex(tile);
+  if (isBusStationBay(tile)) return getBusStationBayIndex(tile);
   return getRepairShopBayIndex(tile);
 }
 
@@ -477,6 +520,40 @@ export const SERVICE_VEHICLE_META: Record<
   taxi: { label: 'Robotaxi', color: '#facc15', emoji: '🚕' },
   bus: { label: 'Bus', color: '#2563eb', emoji: '🚌' },
 };
+
+/**
+ * Short type prefix for vehicle ids (service vehicles use recognizable names).
+ * taxi → cab so lists read cab-…, bus → bus, etc.
+ */
+export function vehicleIdPrefix(type?: VehicleType | string): string {
+  switch (type) {
+    case 'taxi':
+      return 'cab';
+    case 'bus':
+      return 'bus';
+    case 'fire-truck':
+      return 'fire';
+    case 'police':
+      return 'police';
+    case 'ambulance':
+      return 'amb';
+    case 'tow-truck':
+      return 'tow';
+    case 'train':
+      return 'train';
+    case 'semi':
+      return 'semi';
+    case 'car':
+    default:
+      return 'car';
+  }
+}
+
+/** Unique vehicle id always starting with the type prefix, e.g. bus-m5k2-ab12 */
+export function makeVehicleId(type?: VehicleType | string): string {
+  const prefix = vehicleIdPrefix(type);
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
 
 export const DEFAULT_ILLNESS_RECIPES: IllnessRecipe[] = [
   {
@@ -958,6 +1035,10 @@ function normalizeBuildingConfig(cfg: BuildingConfig): BuildingConfig {
     if (!next.taxiFleetIds) next = { ...next, taxiFleetIds: [] };
     if (!next.activeTaxiRides) next = { ...next, activeTaxiRides: [] };
   }
+  if (next.role === 'bus-station') {
+    if (!next.busFleetIds) next = { ...next, busFleetIds: [] };
+    if (!next.busRoute) next = { ...next, busRoute: [] };
+  }
   const inventory = { ...(next.inventory || {}) };
   Object.keys(inventory).forEach(itemId => {
     inventory[itemId] = Math.min(inventory[itemId], getItemCapacity(next, itemId));
@@ -1089,7 +1170,7 @@ function BuildingTileBadges({
                 ? 'bg-rose-100/95 border-rose-300 text-rose-900'
                 : 'bg-emerald-100/95 border-emerald-300 text-emerald-900'
             }`}
-            title={`${staffCount}/${requiredStaff} employees assigned`}
+            title={`${staffCount}/${requiredStaff} employees on-site (assigned people must arrive before production uses them)`}
           >
             👷{staffCount}/{requiredStaff}
           </span>
@@ -1638,7 +1719,7 @@ interface RouteNode {
 }
 
 function isHouseTile(tile: GridTile | undefined | null): boolean {
-  return !!tile && tile.type === 'building-home';
+  return !!tile && isResidentialHomeType(tile.type);
 }
 
 /** Badge overlay: people currently at home on a house tile. */
@@ -1876,6 +1957,467 @@ function randomHomeTourDelayMs(): number {
   return HOME_TOUR_MIN_MS + Math.floor(Math.random() * (HOME_TOUR_MAX_MS - HOME_TOUR_MIN_MS));
 }
 
+/** Bus route service constants */
+const BUS_LOOPS_BEFORE_REFUEL = 5;
+const BUS_REFUEL_TICKS = 20; // ~1 tick/sec while parked at station
+const BUS_BOARDING_MS = 3500;
+const BUS_BOARD_RADIUS = 2; // tiles
+
+export function isBusStopTileType(type: string | undefined): boolean {
+  return type === 'road-bus-stop' || type === 'road-4lane-bus-stop';
+}
+
+export function isBusStationTileType(type: string | undefined): boolean {
+  return type === 'building-bus-station';
+}
+
+/**
+ * Bus-stop art is drawn N–S with the bay on the **local east** curb.
+ * After rotation, preferred travel heading is local-north (tile.rotation):
+ * then the bay sits on the vehicle's right — the curb lane for that stop.
+ */
+export function getBusStopApproachHeading(tile: GridTile): number {
+  return (((tile.rotation % 360) + 360) % 360);
+}
+
+/**
+ * Right-hand traffic lane for the current road (always positive / correct side).
+ * Buses must never use the opposite (negative) lane.
+ */
+export function getLegalTrafficLane(is4Lane: boolean, preferOuter = false): number {
+  if (is4Lane) return preferOuter ? FOUR_LANE_OUTER : FOUR_LANE_INNER;
+  return FOUR_LANE_INNER;
+}
+
+/**
+ * Lane that sits against the bus-stop bay when traveling the **approach** heading.
+ * Always a legal right-hand (positive) lane — buses must approach with correct heading
+ * rather than using the wrong-way curb.
+ */
+export function getBusStopBayLane(tile: GridTile, heading?: number): number {
+  const is4 = tile.type.includes('4lane');
+  const approach = getBusStopApproachHeading(tile);
+  const h = heading !== undefined ? ((heading % 360) + 360) % 360 : approach;
+  let diff = Math.abs(h - approach) % 360;
+  if (diff > 180) diff = 360 - diff;
+  // Only legal when traveling approach direction; callers should force approach heading first
+  if (diff > 90) {
+    // Wrong way: still return legal positive for *current* heading (right-hand traffic)
+    return getLegalTrafficLane(is4, true);
+  }
+  // Outer curb lane on 4-lane roads sits next to the painted bay
+  return getLegalTrafficLane(is4, true);
+}
+
+/** Look up bus-stop tile at a grid cell (if any). */
+export function getBusStopTileAt(
+  grid: GridData,
+  x: number,
+  y: number,
+): GridTile | undefined {
+  const tiles = grid[`${x},${y}`];
+  if (!tiles?.length) return undefined;
+  return tiles.find(t => isBusStopTileType(t.type));
+}
+
+/** Prefer ground road tile for routing on multi-layer cells. */
+function getRoutingRoadTile(tiles: GridTile[] | undefined): GridTile | undefined {
+  if (!tiles?.length) return undefined;
+  return (
+    tiles.find(
+      t =>
+        t.type.startsWith('road') ||
+        t.type === 'rail-road-crossing' ||
+        t.type.startsWith('parking-') ||
+        isBuildingParkingBay(t),
+    ) || tiles[tiles.length - 1]
+  );
+}
+
+/** Heading difference 0–180 */
+function headingDiffDeg(a: number, b: number): number {
+  let d = Math.abs((((a - b) % 360) + 360) % 360);
+  if (d > 180) d = 360 - d;
+  return d;
+}
+
+function parseGridKey(key: string | undefined): Point | null {
+  if (!key) return null;
+  const [x, y] = key.split(',').map(Number);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+}
+
+function findNearestBusStationKey(from: Point, grid: GridData): string | null {
+  let best: string | null = null;
+  let bestD = Infinity;
+  Object.entries(grid).forEach(([key, tiles]) => {
+    const top = tiles?.[tiles.length - 1];
+    if (!top || top.type !== 'building-bus-station') return;
+    // Prefer anchor cells
+    if (top.part === 'member') return;
+    const p = parseGridKey(key);
+    if (!p) return;
+    const d = Math.abs(p.x - from.x) + Math.abs(p.y - from.y);
+    if (d < bestD) {
+      bestD = d;
+      best = key;
+    }
+  });
+  // Fallback: any bay cell as station key
+  if (!best) {
+    Object.entries(grid).forEach(([key, tiles]) => {
+      const top = tiles?.[tiles.length - 1];
+      if (!top || top.type !== 'building-bus-station') return;
+      const p = parseGridKey(key);
+      if (!p) return;
+      const d = Math.abs(p.x - from.x) + Math.abs(p.y - from.y);
+      if (d < bestD) {
+        bestD = d;
+        best = top.anchorKey || key;
+      }
+    });
+  }
+  return best;
+}
+
+function busStopKeyAt(x: number, y: number, grid: GridData): string | null {
+  const tiles = grid[`${x},${y}`];
+  const top = tiles?.[tiles.length - 1];
+  if (top && isBusStopTileType(top.type)) return `${x},${y}`;
+  return null;
+}
+
+/**
+ * Advance bus service after arriving at destination (stop or station).
+ * Mutates people for board/alight. Returns updated vehicle + people.
+ */
+function processBusArrival(
+  vehicle: Vehicle,
+  people: Record<string, Person>,
+  grid: GridData,
+  now: number,
+): { vehicle: Vehicle; people: Record<string, Person> } {
+  let nextPeople = { ...people };
+  let v = { ...vehicle };
+  const route = v.busRoute || [];
+  const hereKey = `${v.x},${v.y}`;
+  const phase = v.busPhase || 'route';
+
+  // Arrived at station for fuel
+  const hereTop = grid[hereKey]?.[(grid[hereKey]?.length || 1) - 1];
+  const onBusStation =
+    hereTop?.type === 'building-bus-station' ||
+    (!!v.busStationKey &&
+      (hereKey === v.busStationKey || hereTop?.anchorKey === v.busStationKey));
+  if (phase === 'to-station' && onBusStation) {
+    v = {
+      ...v,
+      busPhase: 'refueling',
+      busRefuelTicks: BUS_REFUEL_TICKS,
+      busRefuelAccumMs: 0,
+      destination: null,
+      isMoving: false,
+      turnIntent: null,
+      progress: 0.5,
+      randomTurning: false,
+    };
+    // Alight all bus passengers at station
+    const pax = getPassengerIds(nextPeople, v.id);
+    for (const pid of pax) {
+      const p = nextPeople[pid];
+      if (!p) continue;
+      nextPeople = alightPerson(
+        nextPeople,
+        pid,
+        { kind: 'building', buildingKey: v.busStationKey || hereKey },
+        'idle',
+        now + 15_000,
+      );
+      const np = nextPeople[pid];
+      if (np) {
+        nextPeople[pid] = { ...np, busDropoffStop: undefined };
+      }
+    }
+    v = syncVehicleOccupancy(v, nextPeople);
+    return { vehicle: v, people: nextPeople };
+  }
+
+  // Arrived at a bus stop on the route
+  const stopKey = busStopKeyAt(v.x, v.y, grid) || hereKey;
+  const routeIdx = route.indexOf(stopKey);
+  if (routeIdx < 0 && phase !== 'boarding') {
+    // Not a route stop — generic arrival stop
+    return {
+      vehicle: {
+        ...v,
+        destination: null,
+        isMoving: false,
+        turnIntent: null,
+        progress: 0.5,
+      },
+      people: nextPeople,
+    };
+  }
+
+  // Drop off passengers for this stop
+  const passengers = getPassengerIds(nextPeople, v.id);
+  for (const pid of passengers) {
+    const p = nextPeople[pid];
+    if (!p) continue;
+    if (p.busDropoffStop === stopKey || p.busDropoffStop === hereKey) {
+      nextPeople = alightPerson(
+        nextPeople,
+        pid,
+        { kind: 'tile', x: v.x, y: v.y },
+        'idle',
+        now + 20_000,
+      );
+      const np = nextPeople[pid];
+      if (np) nextPeople[pid] = { ...np, busDropoffStop: undefined };
+    }
+  }
+
+  // Pick up people near the stop who are not already on a vehicle
+  const maxPax = v.maxPassengers ?? getMaxPassengers(v.type);
+  let aboard = getPassengerIds(nextPeople, v.id).length;
+  const stopPt = parseGridKey(stopKey) || { x: v.x, y: v.y };
+  const candidates = Object.values(nextPeople)
+    .filter(p => {
+      if (p.location.kind === 'vehicle') return false;
+      if (p.activity === 'working' || p.activity === 'in_care') return false;
+      // Near stop (homes, buildings, outdoor stands, sidewalks, tiles)
+      let px = stopPt.x;
+      let py = stopPt.y;
+      if (p.location.kind === 'tile') {
+        px = p.location.x;
+        py = p.location.y;
+      } else if (p.location.kind === 'home') {
+        const hp = parseGridKey(p.location.homeKey);
+        if (!hp) return false;
+        px = hp.x;
+        py = hp.y;
+      } else if (p.location.kind === 'building') {
+        const bp = parseGridKey(p.location.buildingKey);
+        if (!bp) return false;
+        px = bp.x;
+        py = bp.y;
+      } else if (p.location.kind === 'outdoor') {
+        const op = parseGridKey(p.location.atKey);
+        if (!op) return false;
+        px = op.x;
+        py = op.y;
+      } else if (p.location.kind === 'walking') {
+        px = Math.floor(p.location.x);
+        py = Math.floor(p.location.y);
+      }
+      return Math.abs(px - stopPt.x) + Math.abs(py - stopPt.y) <= BUS_BOARD_RADIUS;
+    })
+    .sort((a, b) => personDisplayName(a).localeCompare(personDisplayName(b)));
+
+  for (const p of candidates) {
+    if (aboard >= maxPax) break;
+    if (canBoardAsPassenger(p, v, nextPeople)) continue;
+    // Drop off at a different stop on the route when possible
+    const otherStops = route.filter(k => k !== stopKey);
+    const dropoff =
+      otherStops.length > 0
+        ? otherStops[Math.floor(Math.random() * otherStops.length)]
+        : stopKey;
+    nextPeople = boardPerson(nextPeople, p.id, v.id, 'passenger');
+    nextPeople[p.id] = {
+      ...nextPeople[p.id],
+      busDropoffStop: dropoff,
+      activity: 'commuting',
+      travelIntent: undefined,
+    };
+    aboard += 1;
+  }
+
+  v = syncVehicleOccupancy(v, nextPeople);
+
+  // Advance route index; count loop when wrapping
+  let nextIndex = routeIdx >= 0 ? (routeIdx + 1) % Math.max(1, route.length) : (v.busRouteIndex || 0);
+  let loops = v.busRouteLoops || 0;
+  if (route.length > 0 && routeIdx >= 0 && nextIndex === 0) {
+    loops += 1;
+  }
+
+  // After 5 loops → station for gas
+  if (loops >= BUS_LOOPS_BEFORE_REFUEL) {
+    const station =
+      v.busStationKey ||
+      findNearestBusStationKey({ x: v.x, y: v.y }, grid);
+    const stationPt = parseGridKey(station || undefined);
+    v = {
+      ...v,
+      busRouteIndex: 0,
+      busRouteLoops: loops,
+      busPhase: 'to-station',
+      busStationKey: station || v.busStationKey,
+      busStopUntil: undefined,
+      destination: stationPt,
+      isMoving: !!stationPt,
+      turnIntent: null,
+      progress: 0.5,
+      randomTurning: false,
+    };
+    return { vehicle: v, people: nextPeople };
+  }
+
+  // Dwell at stop, then continue to next stop — always on the bay curb
+  const nextStopKey = route.length > 0 ? route[nextIndex] : null;
+  const nextStopPt = parseGridKey(nextStopKey || undefined);
+  const stopTile = getBusStopTileAt(grid, v.x, v.y);
+  const approachH = stopTile ? getBusStopApproachHeading(stopTile) : v.heading;
+  // Always board facing approach heading on the legal bay curb lane
+  const bayLane = stopTile
+    ? getBusStopBayLane(stopTile, approachH)
+    : getLegalTrafficLane(false, false);
+  v = {
+    ...v,
+    busRouteIndex: nextIndex,
+    busRouteLoops: loops,
+    busPhase: 'boarding',
+    busStopUntil: now + BUS_BOARDING_MS,
+    destination: null,
+    isMoving: false,
+    turnIntent: null,
+    progress: 0.5,
+    heading: approachH,
+    lane: bayLane,
+    randomTurning: false,
+    // stash next dest for after boarding
+    ...(nextStopPt ? {} : {}),
+  };
+  // Store next destination on a temporary field via busPhase boarding end
+  // We'll set destination when boarding dwell ends
+  return { vehicle: v, people: nextPeople };
+}
+
+function advanceBusService(
+  vehicle: Vehicle,
+  people: Record<string, Person>,
+  grid: GridData,
+  deltaTime: number,
+  now: number,
+): { vehicle: Vehicle; people: Record<string, Person>; handled: boolean } {
+  if (vehicle.type !== 'bus' || vehicle.manualOverride) {
+    return { vehicle, people, handled: false };
+  }
+  const route = vehicle.busRoute;
+  if (!route || route.length === 0) {
+    return { vehicle, people, handled: false };
+  }
+
+  let v = { ...vehicle };
+  let nextPeople = people;
+
+  // Refueling countdown (~1 tick per second)
+  if (v.busPhase === 'refueling') {
+    const acc = (v.busRefuelAccumMs || 0) + deltaTime;
+    let ticks = v.busRefuelTicks ?? BUS_REFUEL_TICKS;
+    let accum = acc;
+    while (accum >= 1000 && ticks > 0) {
+      accum -= 1000;
+      ticks -= 1;
+    }
+    if (ticks <= 0) {
+      // Resume route from first stop
+      const first = parseGridKey(route[0]);
+      v = {
+        ...v,
+        busPhase: 'route',
+        busRouteLoops: 0,
+        busRouteIndex: 0,
+        busRefuelTicks: undefined,
+        busRefuelAccumMs: undefined,
+        destination: first,
+        isMoving: !!first,
+        turnIntent: null,
+        randomTurning: false,
+      };
+      delete v.parkingStopUntil;
+    } else {
+      v = {
+        ...v,
+        busRefuelTicks: ticks,
+        busRefuelAccumMs: accum,
+        isMoving: false,
+        destination: null,
+      };
+    }
+    return { vehicle: v, people: nextPeople, handled: true };
+  }
+
+  // Boarding dwell at stop
+  if (v.busPhase === 'boarding') {
+    if (v.busStopUntil && now < v.busStopUntil) {
+      return {
+        vehicle: { ...v, isMoving: false, destination: null },
+        people: nextPeople,
+        handled: true,
+      };
+    }
+    // Leave stop toward next index
+    const idx = v.busRouteIndex ?? 0;
+    const nextKey = route[idx] || route[0];
+    const nextPt = parseGridKey(nextKey);
+    v = {
+      ...v,
+      busPhase: 'route',
+      busStopUntil: undefined,
+      destination: nextPt,
+      isMoving: !!nextPt,
+      turnIntent: null,
+      randomTurning: false,
+    };
+    return { vehicle: v, people: nextPeople, handled: true };
+  }
+
+  // Ensure destination while on route / to-station
+  if (v.busPhase === 'to-station') {
+    if (!v.destination) {
+      const station =
+        v.busStationKey || findNearestBusStationKey({ x: v.x, y: v.y }, grid);
+      const pt = parseGridKey(station || undefined);
+      if (pt) {
+        v = {
+          ...v,
+          busStationKey: station || v.busStationKey,
+          destination: pt,
+          isMoving: true,
+          randomTurning: false,
+        };
+      }
+    }
+    return { vehicle: v, people: nextPeople, handled: true };
+  }
+
+  // Default route phase: keep heading to current stop
+  if (!v.busPhase || v.busPhase === 'route') {
+    const idx = v.busRouteIndex ?? 0;
+    const stopKey = route[idx] || route[0];
+    const pt = parseGridKey(stopKey);
+    if (pt && (!v.destination || v.destination.x !== pt.x || v.destination.y !== pt.y)) {
+      v = {
+        ...v,
+        busPhase: 'route',
+        destination: pt,
+        isMoving: true,
+        randomTurning: false,
+        turnAroundAtDeadEnd: true,
+      };
+    } else if (pt && !v.isMoving && !v.busStopUntil) {
+      // Was stopped but should be en route
+      v = { ...v, isMoving: true, destination: pt, randomTurning: false };
+    }
+    return { vehicle: v, people: nextPeople, handled: true };
+  }
+
+  return { vehicle: v, people: nextPeople, handled: false };
+}
+
 function parseHomeKey(homeKey: string | undefined): Point | null {
   if (!homeKey) return null;
   const p = homeKey.split(',').map(Number);
@@ -1928,6 +2470,10 @@ function getDestinationArrivalPatch(vehicle: Vehicle, tileX: number, tileY: numb
   if (!vehicle.destination) return {};
   if (vehicle.destination.x === tileX && vehicle.destination.y === tileY) {
     const key = `${tileX},${tileY}`;
+    // Bus service handles its own stop/station arrival (processBusArrival)
+    if (vehicle.type === 'bus' && vehicle.busRoute && vehicle.busRoute.length > 0 && !vehicle.manualOverride) {
+      return {};
+    }
     const isHomeArrival = !!vehicle.homeKey && vehicle.homeKey === key;
     // Manual override: stop on arrival only — no auto parking dwell or home-tour schedule
     if (vehicle.manualOverride) {
@@ -1947,7 +2493,17 @@ function getDestinationArrivalPatch(vehicle: Vehicle, tileX: number, tileY: numb
         nextHomeReturnAt: now + HOME_PARK_MS + randomHomeTourDelayMs(),
       };
     }
-    return { destination: null, isMoving: false, turnIntent: null, progress: 0.5 };
+    // Non-home arrival: stop and defer home AI so it doesn't immediately re-route home
+    const now = Date.now();
+    return {
+      destination: null,
+      isMoving: false,
+      turnIntent: null,
+      progress: 0.5,
+      ...(vehicle.homeKey
+        ? { nextHomeReturnAt: now + randomHomeTourDelayMs() }
+        : {}),
+    };
   }
   return {};
 }
@@ -1970,7 +2526,7 @@ export function getRecommendedExit(
   cy: number,
   entryHeading: number,
   dest: Point,
-  vType: 'car' | 'train' | 'semi' = 'car',
+  vType: 'car' | 'train' | 'semi' | 'bus' | string = 'car',
   grid: GridData
 ): number | null {
   if (!dest) return null;
@@ -1979,12 +2535,18 @@ export function getRecommendedExit(
   const visited = new Set<string>();
   const queue: RouteNode[] = [];
 
-  // Start after "current" tile: try all possible exits from current junction
-  const startPorts = (TILE_CONNECTIONS[g[`${cx},${cy}`]?.[0]?.type || ''] || []).map(p => (p + (g[`${cx},${cy}`]?.[0]?.rotation || 0) / 90) % 4);
+  const startTile = getRoutingRoadTile(g[`${cx},${cy}`]);
+  const startPorts = (TILE_CONNECTIONS[startTile?.type || ''] || []).map(
+    p => (p + (startTile?.rotation || 0) / 90) % 4,
+  );
   const entryPort = (entryHeading / 90 + 2) % 4;
   const possibleExits = startPorts.filter(p => p !== entryPort);
 
   if (possibleExits.length === 0) return null;
+
+  const destBusStop = getBusStopTileAt(g, dest.x, dest.y);
+  const busApproach = destBusStop ? getBusStopApproachHeading(destBusStop) : null;
+  const isBus = vType === 'bus';
 
   // Seed queue with 1-step moves
   for (const exitPort of possibleExits) {
@@ -2004,7 +2566,7 @@ export function getRecommendedExit(
     }
   }
 
-  const maxDepth = 180;
+  const maxDepth = isBus && destBusStop ? 220 : 180;
   let best: RouteNode | null = null;
   let bestCost = Infinity;
 
@@ -2012,11 +2574,31 @@ export function getRecommendedExit(
     const node = queue.shift()!;
     if (node.cost > maxDepth) continue;
 
-    // Reached dest tile (or any cell of a multi-building containing dest)
+    // Reached dest tile
     if (node.x === dest.x && node.y === dest.y) {
-      if (node.cost < bestCost) {
-        bestCost = node.cost;
+      let cost = node.cost;
+      // Buses: must prefer arrival heading matching bay approach (legal traffic side)
+      if (destBusStop && busApproach != null) {
+        const hDiff = headingDiffDeg(node.heading, busApproach);
+        if (hDiff <= 45) {
+          cost -= 2; // prefer correct approach
+        } else if (hDiff >= 135) {
+          // Wrong-way on the stop — almost never take this path
+          cost += isBus ? 80 : 8;
+        } else {
+          cost += isBus ? 25 : 2;
+        }
+      }
+      if (cost < bestCost) {
+        bestCost = cost;
         best = node;
+      }
+      // Keep exploring for a better approach arrival when routing buses to stops
+      if (isBus && destBusStop && busApproach != null) {
+        if (headingDiffDeg(node.heading, busApproach) <= 45) {
+          // Found a correct approach — can still look for shorter correct ones
+        }
+        continue;
       }
       continue;
     }
@@ -2024,30 +2606,52 @@ export function getRecommendedExit(
     // Explore next exits
     const curTiles = g[`${node.x},${node.y}`];
     if (!curTiles) continue;
-    const curTile = curTiles.find((t: any) => {
-      const br = t.type.includes('bridge') || t.type.includes('trestle');
-      return (node.heading === 0 || node.heading === 180 ? !br : true); // rough
-    }) || curTiles[0];
+    const curTile = getRoutingRoadTile(curTiles);
+    if (!curTile) continue;
 
-    const ports = (TILE_CONNECTIONS[curTile?.type || ''] || []).map((p: number) => (p + (curTile?.rotation || 0) / 90) % 4);
+    const ports = (TILE_CONNECTIONS[curTile.type || ''] || []).map(
+      (p: number) => (p + (curTile.rotation || 0) / 90) % 4,
+    );
     const entP = (node.heading / 90 + 2) % 4;
-    let nextExits = ports.filter((p: number) => p !== entP);
+    const nextExits = ports.filter((p: number) => p !== entP);
 
-    // Type filters (reuse existing logic)
+    // Type filters
     if (vType === 'train') {
-      if (!curTile?.type?.startsWith('rail') && curTile?.type !== 'rail-road-crossing') continue;
+      if (!curTile.type?.startsWith('rail') && curTile.type !== 'rail-road-crossing') continue;
     }
 
     for (const exP of nextExits) {
       const exH = exP * 90;
       const dx = exH === 90 ? 1 : exH === 270 ? -1 : 0;
       const dy = exH === 180 ? 1 : exH === 0 ? -1 : 0;
-      const nx = node.x + dx, ny = node.y + dy;
+      const nx = node.x + dx;
+      const ny = node.y + dy;
       const nkey = key(nx, ny, exH);
       if (visited.has(nkey)) continue;
+      // Skip non-drivable for road vehicles
+      const nextTiles = g[`${nx},${ny}`];
+      if (!nextTiles?.length) continue;
+      const nextRoad = getRoutingRoadTile(nextTiles);
+      if (!nextRoad && vType !== 'train') continue;
+
+      let stepCost = 1;
+      // Soft bias: when bus destination has a known approach, prefer headings aligned
+      // with that approach as we get close (helps set up the final approach leg)
+      if (isBus && busApproach != null) {
+        const dist = Math.abs(nx - dest.x) + Math.abs(ny - dest.y);
+        if (dist <= 6) {
+          const align = headingDiffDeg(exH, busApproach);
+          if (align <= 45) stepCost -= 0.15;
+          else if (align >= 135) stepCost += 0.35;
+        }
+      }
+
       visited.add(nkey);
       queue.push({
-        x: nx, y: ny, heading: exH, cost: node.cost + 1,
+        x: nx,
+        y: ny,
+        heading: exH,
+        cost: node.cost + stepCost,
         firstExit: node.firstExit,
         prev: { x: node.x, y: node.y, heading: node.heading, exit: exH },
       });
@@ -2057,16 +2661,24 @@ export function getRecommendedExit(
   if (best) return best.firstExit;
 
   // Fallback: pick the exit that points most toward dest
+  // For bus stops, bias toward the approach corridor (enter from opposite of approach)
   const dx = dest.x - cx;
   const dy = dest.y - cy;
   let bestExit = possibleExits[0] * 90;
   let bestDot = -999;
   for (const p of possibleExits) {
     const h = p * 90;
-    const ddx = (h === 90 ? 1 : h === 270 ? -1 : 0);
-    const ddy = (h === 180 ? 1 : h === 0 ? -1 : 0);
-    const dot = ddx * dx + ddy * dy;
-    if (dot > bestDot) { bestDot = dot; bestExit = h; }
+    const ddx = h === 90 ? 1 : h === 270 ? -1 : 0;
+    const ddy = h === 180 ? 1 : h === 0 ? -1 : 0;
+    let dot = ddx * dx + ddy * dy;
+    if (isBus && busApproach != null) {
+      // Prefer turning toward the approach heading when near the stop
+      if (headingDiffDeg(h, busApproach) <= 45) dot += 1.5;
+    }
+    if (dot > bestDot) {
+      bestDot = dot;
+      bestExit = h;
+    }
   }
   return bestExit;
 }
@@ -2464,9 +3076,131 @@ const blockGridPointerEvents: Pick<
 let floatingWindowZ = 160;
 let floatingWindowSpawnN = 0;
 
+type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+
+const FLOAT_PANEL_MIN_W = 240;
+const FLOAT_PANEL_MIN_H = 140;
+
+type PanelSize = { w: number; h: number };
+
+type ResizeSession = {
+  pointerId: number;
+  edge: ResizeEdge;
+  startClientX: number;
+  startClientY: number;
+  originX: number;
+  originY: number;
+  originW: number;
+  originH: number;
+};
+
+/** Compute new position + size while dragging a border/corner, clamped to viewport and mins. */
+function computePanelResize(
+  session: ResizeSession,
+  clientX: number,
+  clientY: number,
+  minW = FLOAT_PANEL_MIN_W,
+  minH = FLOAT_PANEL_MIN_H,
+): { pos: Point; size: PanelSize } {
+  const dx = clientX - session.startClientX;
+  const dy = clientY - session.startClientY;
+  const edge = session.edge;
+  let left = session.originX;
+  let top = session.originY;
+  let right = session.originX + session.originW;
+  let bottom = session.originY + session.originH;
+
+  if (edge.includes('e')) right = session.originX + session.originW + dx;
+  if (edge.includes('w')) left = session.originX + dx;
+  if (edge.includes('s')) bottom = session.originY + session.originH + dy;
+  if (edge.includes('n')) top = session.originY + dy;
+
+  // Min size (anchor the non-dragged edge)
+  if (right - left < minW) {
+    if (edge.includes('w')) left = right - minW;
+    else right = left + minW;
+  }
+  if (bottom - top < minH) {
+    if (edge.includes('n')) top = bottom - minH;
+    else bottom = top + minH;
+  }
+
+  // Viewport clamp
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  if (left < 0) {
+    left = 0;
+    if (right - left < minW) right = Math.min(vw, left + minW);
+  }
+  if (top < 0) {
+    top = 0;
+    if (bottom - top < minH) bottom = Math.min(vh, top + minH);
+  }
+  if (right > vw) {
+    right = vw;
+    if (right - left < minW) left = Math.max(0, right - minW);
+  }
+  if (bottom > vh) {
+    bottom = vh;
+    if (bottom - top < minH) top = Math.max(0, bottom - minH);
+  }
+
+  return {
+    pos: { x: left, y: top },
+    size: { w: Math.max(minW, right - left), h: Math.max(minH, bottom - top) },
+  };
+}
+
+const RESIZE_HANDLE_DEFS: { edge: ResizeEdge; className: string; cursor: string }[] = [
+  { edge: 'n', className: 'left-2 right-2 top-0 h-1.5', cursor: 'ns-resize' },
+  { edge: 's', className: 'left-2 right-2 bottom-0 h-1.5', cursor: 'ns-resize' },
+  { edge: 'e', className: 'top-2 bottom-2 right-0 w-1.5', cursor: 'ew-resize' },
+  { edge: 'w', className: 'top-2 bottom-2 left-0 w-1.5', cursor: 'ew-resize' },
+  { edge: 'ne', className: 'top-0 right-0 w-3 h-3', cursor: 'nesw-resize' },
+  { edge: 'nw', className: 'top-0 left-0 w-3 h-3', cursor: 'nwse-resize' },
+  { edge: 'se', className: 'bottom-0 right-0 w-3 h-3', cursor: 'nwse-resize' },
+  { edge: 'sw', className: 'bottom-0 left-0 w-3 h-3', cursor: 'nesw-resize' },
+];
+
+/** Invisible edge/corner hit targets for resizing a floating panel. */
+function PanelResizeHandles({
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  onLostPointerCapture,
+}: {
+  onPointerDown: (edge: ResizeEdge, e: React.PointerEvent<HTMLDivElement>) => void;
+  onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onLostPointerCapture: (e: React.PointerEvent<HTMLDivElement>) => void;
+}) {
+  return (
+    <>
+      {RESIZE_HANDLE_DEFS.map(({ edge, className, cursor }) => (
+        <div
+          key={edge}
+          data-resize-handle={edge}
+          className={`absolute z-30 touch-none ${className}`}
+          style={{ cursor }}
+          onPointerDown={(e) => {
+            if (e.button !== 0) return;
+            e.stopPropagation();
+            e.preventDefault();
+            onPointerDown(edge, e);
+          }}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+          onLostPointerCapture={onLostPointerCapture}
+        />
+      ))}
+    </>
+  );
+}
+
 /**
  * Persistent floating window (same interaction model as vehicle drive panels):
- * fixed to the viewport, draggable title bar, no modal backdrop — map stays usable.
+ * fixed to the viewport, draggable title bar, resizable borders/corners, no modal backdrop.
  */
 function FloatingWindow({
   title,
@@ -2501,8 +3235,11 @@ function FloatingWindow({
 
   const [localPos, setLocalPos] = useState<Point>({ x: spawn.current.x, y: spawn.current.y });
   const localPosRef = useRef(localPos);
+  const [size, setSize] = useState<PanelSize | null>(null);
+  const sizeRef = useRef<PanelSize | null>(null);
   const [zIndex, setZIndex] = useState(spawn.current.z);
   const [isDragging, setIsDragging] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
   const dragSessionRef = useRef<{
     pointerId: number;
     startClientX: number;
@@ -2511,10 +3248,11 @@ function FloatingWindow({
     originY: number;
     moved: boolean;
   } | null>(null);
+  const resizeSessionRef = useRef<ResizeSession | null>(null);
 
   const clampPos = useCallback((x: number, y: number): Point => {
-    const w = panelRef.current?.offsetWidth ?? 320;
-    const h = panelRef.current?.offsetHeight ?? 240;
+    const w = sizeRef.current?.w ?? panelRef.current?.offsetWidth ?? 320;
+    const h = sizeRef.current?.h ?? panelRef.current?.offsetHeight ?? 240;
     const maxX = Math.max(0, window.innerWidth - w);
     const maxY = Math.max(0, window.innerHeight - h);
     return {
@@ -2538,8 +3276,24 @@ function FloatingWindow({
     }
   }, []);
 
+  const endResizeSession = useCallback((el?: HTMLElement | null, pointerId?: number) => {
+    const session = resizeSessionRef.current;
+    if (!session) return;
+    if (pointerId !== undefined && session.pointerId !== pointerId) return;
+    resizeSessionRef.current = null;
+    setIsResizing(false);
+    if (el && pointerId !== undefined) {
+      try {
+        if (el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
   const handleHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
+    if (resizeSessionRef.current) return;
     e.stopPropagation();
     e.preventDefault();
     setZIndex(++floatingWindowZ);
@@ -2581,11 +3335,62 @@ function FloatingWindow({
     endDragSession(e.currentTarget, e.pointerId);
   };
 
+  const handleResizePointerDown = (edge: ResizeEdge, e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragSessionRef.current) {
+      endDragSession(headerRef.current, dragSessionRef.current.pointerId);
+    }
+    setZIndex(++floatingWindowZ);
+    const el = panelRef.current;
+    const w = sizeRef.current?.w ?? el?.offsetWidth ?? 320;
+    const h = sizeRef.current?.h ?? el?.offsetHeight ?? 240;
+    resizeSessionRef.current = {
+      pointerId: e.pointerId,
+      edge,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      originX: localPosRef.current.x,
+      originY: localPosRef.current.y,
+      originW: w,
+      originH: h,
+    };
+    setIsResizing(true);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const session = resizeSessionRef.current;
+    if (!session || e.pointerId !== session.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const next = computePanelResize(session, e.clientX, e.clientY);
+    localPosRef.current = next.pos;
+    sizeRef.current = next.size;
+    setLocalPos(next.pos);
+    setSize(next.size);
+  };
+
+  const handleResizePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizeSessionRef.current || resizeSessionRef.current.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    endResizeSession(e.currentTarget, e.pointerId);
+  };
+
   return (
     <div
       ref={panelRef}
-      className={`fixed ${widthClassName} ${maxHeightClassName} bg-white/98 backdrop-blur-md rounded-2xl shadow-2xl border-2 ${borderClassName} flex flex-col overflow-hidden pointer-events-auto`}
-      style={{ left: localPos.x, top: localPos.y, zIndex }}
+      className={`fixed ${size ? '' : widthClassName} ${size ? '' : maxHeightClassName} bg-white/98 backdrop-blur-md rounded-2xl shadow-2xl border-2 ${borderClassName} flex flex-col overflow-hidden pointer-events-auto ${
+        isResizing ? 'select-none' : ''
+      }`}
+      style={{
+        left: localPos.x,
+        top: localPos.y,
+        zIndex,
+        ...(size ? { width: size.w, height: size.h } : null),
+      }}
       data-grid-control
       onWheel={stopGridWheel}
       onContextMenu={stopGridPropagation}
@@ -2597,12 +3402,19 @@ function FloatingWindow({
       }}
       onPointerDown={(e) => {
         if ((e.target as HTMLElement).closest('[data-float-title]')) return;
+        if ((e.target as HTMLElement).closest('[data-resize-handle]')) return;
         stopGridPropagation(e);
         setZIndex(++floatingWindowZ);
       }}
       onPointerUp={stopGridPropagation}
       onPointerMove={stopGridPropagation}
     >
+      <PanelResizeHandles
+        onPointerDown={handleResizePointerDown}
+        onPointerMove={handleResizePointerMove}
+        onPointerUp={handleResizePointerUp}
+        onLostPointerCapture={(e) => endResizeSession(null, e.pointerId)}
+      />
       <div
         ref={headerRef}
         data-float-title
@@ -2664,6 +3476,8 @@ const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' 
   { type: 'road-4lane-bridge', label: '4-Lane Bridge', category: 'road' },
   { type: 'road-transition-2to4', label: '2-4 Transition', category: 'road' },
   { type: 'road-roundabout', label: 'Roundabout', category: 'road' },
+  { type: 'road-bus-stop', label: 'Bus Stop (2-Lane)', category: 'road' },
+  { type: 'road-4lane-bus-stop', label: 'Bus Stop (4-Lane)', category: 'road' },
   { type: 'rail-straight', label: 'Straight Rail', category: 'rail' },
   { type: 'rail-curve', label: 'Curve Rail', category: 'rail' },
   { type: 'rail-t', label: 'Rail T-Junction', category: 'rail' },
@@ -2707,6 +3521,7 @@ const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' 
   { type: 'building-repair-shop', label: 'Vehicle Repair Shop (4×6, 4 bays)', category: 'building' },
   { type: 'building-hospital', label: 'Hospital (4×4, ambulance bays)', category: 'building' },
   { type: 'building-taxi-station', label: 'Taxi Station (4×2, 4 bays)', category: 'building' },
+  { type: 'building-bus-station', label: 'Bus Station (2×2, 2 bays)', category: 'building' },
 ];
 
 function getDefaultBuildingName(type: string): string {
@@ -2896,14 +3711,33 @@ function VehicleMotionControls({
   const selectedList = Array.from(filteredSelection);
   const activeCountIsMoving = selectedList.filter(id => vehicles[id]?.isMoving).length;
   const isMovingActive = filteredSelection.size > 0 && activeCountIsMoving >= filteredSelection.size / 2;
-  const activeCountTurnAround = selectedList.filter(id => vehicles[id]?.turnAroundAtDeadEnd).length;
-  const isTurnAroundActive = filteredSelection.size > 0 && activeCountTurnAround >= filteredSelection.size / 2;
-  const activeCountRandomTurn = selectedList.filter(id => vehicles[id]?.randomTurning).length;
-  const isRandomTurnActive = filteredSelection.size > 0 && activeCountRandomTurn >= filteredSelection.size / 2;
-  const selectedHaveDestination = selectedList.some(id => vehicles[id]?.destination);
+  // Random turns / U-turn / destination routing disabled under manual override
+  const manualAiLocked =
+    selectedList.length > 0 && selectedList.every(id => !!vehicles[id]?.manualOverride);
+  const activeCountTurnAround = selectedList.filter(
+    id => vehicles[id]?.turnAroundAtDeadEnd && !vehicles[id]?.manualOverride,
+  ).length;
+  const isTurnAroundActive =
+    !manualAiLocked &&
+    filteredSelection.size > 0 &&
+    activeCountTurnAround >= filteredSelection.size / 2;
+  const activeCountRandomTurn = selectedList.filter(
+    id => vehicles[id]?.randomTurning && !vehicles[id]?.manualOverride,
+  ).length;
+  const isRandomTurnActive =
+    !manualAiLocked &&
+    filteredSelection.size > 0 &&
+    activeCountRandomTurn >= filteredSelection.size / 2;
+  // Under manual override destination routing is off — never show dest button as active
+  const selectedHaveDestination =
+    !manualAiLocked &&
+    selectedList.some(id => vehicles[id]?.destination && !vehicles[id]?.manualOverride);
   const isThisPendingRoute =
-    !!pendingRouteVehicleId && selectedList.includes(pendingRouteVehicleId);
-  const isDestinationToggleActive = isThisPendingRoute || selectedHaveDestination;
+    !manualAiLocked &&
+    !!pendingRouteVehicleId &&
+    selectedList.includes(pendingRouteVehicleId);
+  const isDestinationToggleActive =
+    !manualAiLocked && (isThisPendingRoute || selectedHaveDestination);
   const isParkNextActive = selectedList.some(id => vehicles[id]?.parkOnNextLot);
   const firstSpeed = selectedList.length > 0 ? (vehicles[selectedList[0]]?.speed || 1) : 1;
   // Lights default ON when undefined (emergency vehicles only)
@@ -2990,22 +3824,34 @@ function VehicleMotionControls({
             <>
               <button
                 type="button"
-                title="Turn around at end"
-                disabled={filteredSelection.size === 0 || !roomCode}
+                title={
+                  manualAiLocked
+                    ? 'U-turn at dead end is off in manual override'
+                    : 'Turn around at end'
+                }
+                disabled={filteredSelection.size === 0 || !roomCode || manualAiLocked}
                 onClick={() => onToggleAttribute('turnAroundAtDeadEnd')}
                 className={`flex-1 p-2 rounded-lg transition-colors flex items-center justify-center ${
-                  isTurnAroundActive ? 'bg-indigo-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                  isTurnAroundActive
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'bg-slate-100 text-slate-500 hover:bg-slate-200 disabled:opacity-40'
                 }`}
               >
                 <RotateCcw className="w-4 h-4" />
               </button>
               <button
                 type="button"
-                title="Random turns"
-                disabled={filteredSelection.size === 0 || !roomCode}
+                title={
+                  manualAiLocked
+                    ? 'Random turns are off in manual override'
+                    : 'Random turns'
+                }
+                disabled={filteredSelection.size === 0 || !roomCode || manualAiLocked}
                 onClick={() => onToggleAttribute('randomTurning')}
                 className={`flex-1 p-2 rounded-lg transition-colors flex items-center justify-center ${
-                  isRandomTurnActive ? 'bg-indigo-600 text-white shadow-sm' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                  isRandomTurnActive
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'bg-slate-100 text-slate-500 hover:bg-slate-200 disabled:opacity-40'
                 }`}
               >
                 <Shuffle className="w-4 h-4" />
@@ -3027,20 +3873,22 @@ function VehicleMotionControls({
           <button
             type="button"
             title={
-              isThisPendingRoute
-                ? 'Click a road tile to set destination (toggle off to clear)'
-                : selectedHaveDestination
-                  ? 'Clear destinations for selected vehicles'
-                  : 'Set destination for selected vehicles'
+              manualAiLocked
+                ? 'Destination routing is off in manual override'
+                : isThisPendingRoute
+                  ? 'Click a road tile to set destination (toggle off to clear)'
+                  : selectedHaveDestination
+                    ? 'Clear destinations for selected vehicles'
+                    : 'Set destination for selected vehicles'
             }
-            disabled={filteredSelection.size === 0 || !roomCode}
+            disabled={filteredSelection.size === 0 || !roomCode || manualAiLocked}
             onClick={onToggleDestination}
             className={`flex-1 p-2 rounded-lg transition-colors flex items-center justify-center ${
               isDestinationToggleActive
                 ? isThisPendingRoute
                   ? 'bg-red-600 text-white shadow-sm animate-pulse'
                   : 'bg-blue-600 text-white shadow-sm'
-                : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                : 'bg-slate-100 text-slate-500 hover:bg-slate-200 disabled:opacity-40'
             }`}
           >
             <Target className="w-4 h-4" />
@@ -3111,6 +3959,9 @@ function FloatingVehicleDrivePanel({
   pendingRouteVehicleId,
   isPlacingVehicles,
   pendingHomeAssign,
+  grid,
+  vehiclesMap,
+  traffic,
   onActivate,
   onClose,
   onMove,
@@ -3127,6 +3978,10 @@ function FloatingVehicleDrivePanel({
   onClearHomes,
   onChangeTrailers,
   onToggleManualOverride,
+  onAssignDriver,
+  onAssignPassenger,
+  onAssignOwnerPerson,
+  onClearOwner,
 }: {
   vehicleId: string;
   vehicle: Vehicle | undefined;
@@ -3142,6 +3997,10 @@ function FloatingVehicleDrivePanel({
   pendingRouteVehicleId: string | null;
   isPlacingVehicles: boolean;
   pendingHomeAssign: boolean;
+  /** Full city grid + fleet for driver 3D view */
+  grid: GridData;
+  vehiclesMap: Record<string, Vehicle>;
+  traffic?: TrafficState;
   onActivate: () => void;
   onClose: () => void;
   onMove: (pos: Point) => void;
@@ -3158,12 +4017,21 @@ function FloatingVehicleDrivePanel({
   onClearHomes?: () => void;
   onChangeTrailers?: (delta: number) => void;
   onToggleManualOverride: (enabled: boolean) => void;
+  /** Assign / clear person as driver (null clears) */
+  onAssignDriver?: (personId: string | null) => void;
+  /** Board or remove passenger */
+  onAssignPassenger?: (personId: string, board: boolean) => void;
+  /** Set owner house from a person's homeKey */
+  onAssignOwnerPerson?: (personId: string) => void;
+  onClearOwner?: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
-  /** Local window position — only committed to parent on drag end (desktop-style). */
+  /** Local window position — only committed to parent on drag/resize end (desktop-style). */
   const [localPos, setLocalPos] = useState<Point>(position);
   const localPosRef = useRef(position);
+  const [size, setSize] = useState<PanelSize | null>(null);
+  const sizeRef = useRef<PanelSize | null>(null);
   const onMoveRef = useRef(onMove);
   const onActivateRef = useRef(onActivate);
   const dragSessionRef = useRef<{
@@ -3174,11 +4042,13 @@ function FloatingVehicleDrivePanel({
     originY: number;
     moved: boolean;
   } | null>(null);
+  const resizeSessionRef = useRef<ResizeSession | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
 
-  // Sync from parent only when not actively dragging (spawn / external layout).
+  // Sync from parent only when not actively dragging/resizing (spawn / external layout).
   useEffect(() => {
-    if (dragSessionRef.current) return;
+    if (dragSessionRef.current || resizeSessionRef.current) return;
     localPosRef.current = position;
     setLocalPos(position);
   }, [position.x, position.y]);
@@ -3225,6 +4095,10 @@ function FloatingVehicleDrivePanel({
 
   const [houseMenuOpen, setHouseMenuOpen] = useState(false);
   const houseMenuRef = useRef<HTMLDivElement>(null);
+  /** Inline people assigner: driver | passenger | owner */
+  const [peoplePick, setPeoplePick] = useState<null | 'driver' | 'passenger' | 'owner'>(null);
+  const [peoplePickFilter, setPeoplePickFilter] = useState('');
+  const peoplePickRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!houseMenuOpen) return;
@@ -3236,6 +4110,38 @@ function FloatingVehicleDrivePanel({
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
   }, [houseMenuOpen]);
+
+  useEffect(() => {
+    if (!peoplePick) return;
+    const onDoc = (e: MouseEvent) => {
+      if (peoplePickRef.current && !peoplePickRef.current.contains(e.target as Node)) {
+        setPeoplePick(null);
+        setPeoplePickFilter('');
+      }
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [peoplePick]);
+
+  const allPeopleList = React.useMemo(() => {
+    const list = Object.values(peopleMap);
+    list.sort((a, b) => personDisplayName(a).localeCompare(personDisplayName(b)));
+    return list;
+  }, [peopleMap]);
+
+  const filteredPeopleForPick = React.useMemo(() => {
+    const q = peoplePickFilter.trim().toLowerCase();
+    return allPeopleList.filter(p => {
+      if (peoplePick === 'driver' && !isAdult(p)) return false;
+      if (peoplePick === 'driver' && vehicle?.type === 'taxi') return false;
+      if (!q) return true;
+      return (
+        personDisplayName(p).toLowerCase().includes(q) ||
+        p.homeKey.toLowerCase().includes(q) ||
+        (p.workplaceKey || '').toLowerCase().includes(q)
+      );
+    });
+  }, [allPeopleList, peoplePickFilter, peoplePick, vehicle?.type]);
 
   const controllerUid = vehicle?.manualOverride
     ? vehicle.manualOverrideByUid
@@ -3259,8 +4165,8 @@ function FloatingVehicleDrivePanel({
   const effectiveRoomCode = isControlledByOther ? null : roomCode;
 
   const clampPos = useCallback((x: number, y: number): Point => {
-    const w = panelRef.current?.offsetWidth ?? 280;
-    const h = panelRef.current?.offsetHeight ?? 200;
+    const w = sizeRef.current?.w ?? panelRef.current?.offsetWidth ?? 280;
+    const h = sizeRef.current?.h ?? panelRef.current?.offsetHeight ?? 200;
     const maxX = Math.max(0, window.innerWidth - w);
     const maxY = Math.max(0, window.innerHeight - h);
     return {
@@ -3286,6 +4192,23 @@ function FloatingVehicleDrivePanel({
     onMoveRef.current(localPosRef.current);
   }, []);
 
+  const endResizeSession = useCallback((el?: HTMLElement | null, pointerId?: number) => {
+    const session = resizeSessionRef.current;
+    if (!session) return;
+    if (pointerId !== undefined && session.pointerId !== pointerId) return;
+    resizeSessionRef.current = null;
+    setIsResizing(false);
+    if (el && pointerId !== undefined) {
+      try {
+        if (el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+    }
+    // Position may change when resizing from n/w edges
+    onMoveRef.current(localPosRef.current);
+  }, []);
+
   /**
    * Drag is handled entirely on the title bar with setPointerCapture.
    * Window listeners are unreliable here because the panel uses stopPropagation
@@ -3293,6 +4216,7 @@ function FloatingVehicleDrivePanel({
    */
   const handleHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
+    if (resizeSessionRef.current) return;
     // Close button stops propagation before reaching here
     e.stopPropagation();
     e.preventDefault();
@@ -3349,6 +4273,50 @@ function FloatingVehicleDrivePanel({
     endDragSession(null, e.pointerId);
   };
 
+  const handleResizePointerDown = (edge: ResizeEdge, e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragSessionRef.current) {
+      endDragSession(headerRef.current, dragSessionRef.current.pointerId);
+    }
+    onActivateRef.current();
+    const el = panelRef.current;
+    const w = sizeRef.current?.w ?? el?.offsetWidth ?? 320;
+    const h = sizeRef.current?.h ?? el?.offsetHeight ?? 240;
+    resizeSessionRef.current = {
+      pointerId: e.pointerId,
+      edge,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      originX: localPosRef.current.x,
+      originY: localPosRef.current.y,
+      originW: w,
+      originH: h,
+    };
+    setIsResizing(true);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const session = resizeSessionRef.current;
+    if (!session || e.pointerId !== session.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const next = computePanelResize(session, e.clientX, e.clientY);
+    localPosRef.current = next.pos;
+    sizeRef.current = next.size;
+    setLocalPos(next.pos);
+    setSize(next.size);
+  };
+
+  const handleResizePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizeSessionRef.current || resizeSessionRef.current.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    endResizeSession(e.currentTarget, e.pointerId);
+  };
+
   const accent =
     panelType === 'train' ? 'emerald'
       : panelType === 'semi' ? 'amber'
@@ -3374,15 +4342,16 @@ function FloatingVehicleDrivePanel({
   return (
     <div
       ref={panelRef}
-      className={`fixed w-[17.5rem] bg-white/98 backdrop-blur-md rounded-2xl shadow-2xl border-2 flex flex-col overflow-hidden pointer-events-auto transition-shadow ${
+      className={`fixed ${size ? '' : 'w-[20rem]'} bg-white/98 backdrop-blur-md rounded-2xl shadow-2xl border-2 flex flex-col overflow-hidden pointer-events-auto transition-shadow ${
         isActive
           ? `${accentBorder} ring-2 shadow-xl`
           : 'border-slate-200 opacity-95'
-      }`}
+      } ${isResizing ? 'select-none' : ''}`}
       style={{
         left: localPos.x,
         top: localPos.y,
         zIndex: isActive ? Math.max(zIndex, 160) : zIndex,
+        ...(size ? { width: size.w, height: size.h } : null),
       }}
       data-grid-control
       onWheel={stopGridWheel}
@@ -3398,6 +4367,7 @@ function FloatingVehicleDrivePanel({
       onPointerDown={(e) => {
         // Title bar manages its own pointerdown + capture drag
         if ((e.target as HTMLElement).closest('[data-drive-panel-title]')) return;
+        if ((e.target as HTMLElement).closest('[data-resize-handle]')) return;
         stopGridPropagation(e);
         onActivateRef.current();
       }}
@@ -3405,6 +4375,12 @@ function FloatingVehicleDrivePanel({
       onPointerUp={stopGridPropagation}
       onPointerMove={stopGridPropagation}
     >
+      <PanelResizeHandles
+        onPointerDown={handleResizePointerDown}
+        onPointerMove={handleResizePointerMove}
+        onPointerUp={handleResizePointerUp}
+        onLostPointerCapture={(e) => endResizeSession(null, e.pointerId)}
+      />
       <div
         ref={headerRef}
         data-drive-panel-title
@@ -3419,13 +4395,13 @@ function FloatingVehicleDrivePanel({
       >
         <GripHorizontal className="w-4 h-4 opacity-80 shrink-0 pointer-events-none" />
         <div className="min-w-0 flex-1 pointer-events-none">
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-start gap-1.5 min-w-0">
             <span
-              className="w-2.5 h-2.5 rounded-full border border-white/70 shrink-0"
+              className="w-2.5 h-2.5 rounded-full border border-white/70 shrink-0 mt-0.5"
               style={{ backgroundColor: vehicle.color }}
             />
-            <span className="text-xs font-bold truncate">
-              Drive · {vehicleId.slice(0, 8)}
+            <span className="text-xs font-bold break-all leading-tight min-w-0" title={vehicleId}>
+              Drive · {vehicleId}
             </span>
           </div>
           <div className="text-[10px] text-white/80 capitalize truncate flex items-center gap-1">
@@ -3498,35 +4474,109 @@ function FloatingVehicleDrivePanel({
         </div>
       )}
 
-      <div className="p-3 flex flex-col gap-2 max-h-[min(70vh,420px)] overflow-y-auto overscroll-contain">
-        {/* Occupancy & ownership */}
-        <div className="bg-slate-50 border border-slate-200 rounded-xl p-2 space-y-1.5">
+      <div
+        className={`p-3 flex flex-col gap-2 overflow-y-auto overscroll-contain ${
+          size ? 'flex-1 min-h-0' : 'max-h-[min(75vh,560px)]'
+        }`}
+      >
+        {/* Driver-perspective 3D city view (read-only; keys/buttons still control the vehicle) */}
+        <DriverView3D
+          vehicle={vehicle}
+          vehicleId={vehicleId}
+          grid={grid}
+          vehicles={vehiclesMap}
+          traffic={traffic}
+          people={people}
+          width={296}
+          height={168}
+        />
+
+        {/* Occupancy & ownership — click rows to assign from existing people */}
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-2 space-y-1.5 relative" ref={peoplePickRef}>
           <div className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
             People
           </div>
           <div className="grid grid-cols-[3.25rem_1fr] gap-x-1.5 gap-y-1 text-[10px] leading-snug">
-            <span className="text-slate-500 font-semibold">Driver</span>
-            <span className={`truncate ${driver ? 'text-slate-800 font-medium' : 'text-slate-400 italic'}`}>
+            <span className="text-slate-500 font-semibold self-center">Driver</span>
+            <button
+              type="button"
+              disabled={!hasPeople || !effectiveRoomCode || vehicle?.type === 'taxi'}
+              onClick={() => {
+                onActivate();
+                setPeoplePick(p => (p === 'driver' ? null : 'driver'));
+                setPeoplePickFilter('');
+              }}
+              title={
+                vehicle?.type === 'taxi'
+                  ? 'Robotaxis have no human driver'
+                  : 'Click to assign driver from people'
+              }
+              className={`text-left truncate rounded-md px-1.5 py-0.5 border transition-colors disabled:opacity-50 ${
+                peoplePick === 'driver'
+                  ? 'bg-indigo-100 border-indigo-300 text-indigo-900'
+                  : driver
+                    ? 'bg-white border-slate-200 text-slate-800 font-medium hover:border-indigo-300'
+                    : 'bg-white border-dashed border-slate-300 text-slate-400 italic hover:border-indigo-300'
+              }`}
+            >
               {hasPeople
                 ? driver
                   ? `${personDisplayName(driver)}${driver.ageYears != null ? ` · ${formatAge(driver.ageYears)}` : ''}`
-                  : 'None'
+                  : 'Click to assign…'
                 : vehicle?.driverId
                   ? vehicle.driverId.slice(0, 8)
                   : '—'}
-            </span>
-            <span className="text-slate-500 font-semibold">Riding</span>
-            <span className={`truncate ${passengers.length ? 'text-slate-800' : 'text-slate-400 italic'}`}>
+            </button>
+
+            <span className="text-slate-500 font-semibold self-center">Riding</span>
+            <button
+              type="button"
+              disabled={!hasPeople || !effectiveRoomCode || maxPax <= 0}
+              onClick={() => {
+                onActivate();
+                setPeoplePick(p => (p === 'passenger' ? null : 'passenger'));
+                setPeoplePickFilter('');
+              }}
+              title="Click to add/remove riders from people"
+              className={`text-left truncate rounded-md px-1.5 py-0.5 border transition-colors disabled:opacity-50 ${
+                peoplePick === 'passenger'
+                  ? 'bg-sky-100 border-sky-300 text-sky-900'
+                  : passengers.length
+                    ? 'bg-white border-slate-200 text-slate-800 hover:border-sky-300'
+                    : 'bg-white border-dashed border-slate-300 text-slate-400 italic hover:border-sky-300'
+              }`}
+            >
               {hasPeople
                 ? passengers.length > 0
                   ? `${passengers.map(p => personDisplayName(p)).join(', ')} (${passengers.length}/${maxPax})`
-                  : `None (0/${maxPax})`
+                  : `Click to assign… (0/${maxPax})`
                 : (vehicle?.passengerIds?.length
                     ? `${vehicle.passengerIds.length} passenger(s)`
                     : '—')}
-            </span>
-            <span className="text-slate-500 font-semibold">Owner</span>
-            <span className={`min-w-0 ${owners.length || vehicle?.homeKey ? 'text-slate-800' : 'text-slate-400 italic'}`}>
+            </button>
+
+            <span className="text-slate-500 font-semibold self-center">Owner</span>
+            <button
+              type="button"
+              disabled={!hasPeople || !effectiveRoomCode || !isCarLike}
+              onClick={() => {
+                onActivate();
+                setPeoplePick(p => (p === 'owner' ? null : 'owner'));
+                setPeoplePickFilter('');
+              }}
+              title={
+                isCarLike
+                  ? 'Click to set owner house from a person\'s home'
+                  : 'Owner home is for cars/service vehicles'
+              }
+              className={`text-left min-w-0 rounded-md px-1.5 py-0.5 border transition-colors disabled:opacity-50 ${
+                peoplePick === 'owner'
+                  ? 'bg-rose-100 border-rose-300 text-rose-900'
+                  : vehicle?.homeKey
+                    ? 'bg-white border-slate-200 text-slate-800 hover:border-rose-300'
+                    : 'bg-white border-dashed border-slate-300 text-slate-400 italic hover:border-rose-300'
+              }`}
+            >
               {vehicle?.homeKey ? (
                 <span className="flex flex-col gap-0.5">
                   <span className="font-mono text-rose-600 text-[9px]" title={vehicle.homeKey}>
@@ -3541,13 +4591,134 @@ function FloatingVehicleDrivePanel({
                   )}
                 </span>
               ) : (
-                'Unassigned'
+                'Click to assign…'
               )}
-            </span>
+            </button>
           </div>
-          {hasPeople && !driver && (
+
+          {peoplePick && hasPeople && (
+            <div className="mt-1 rounded-xl border border-slate-200 bg-white shadow-lg overflow-hidden">
+              <div className="px-2 py-1.5 border-b border-slate-100 flex items-center gap-2">
+                <input
+                  type="search"
+                  autoFocus
+                  value={peoplePickFilter}
+                  onChange={e => setPeoplePickFilter(e.target.value)}
+                  placeholder={
+                    peoplePick === 'driver'
+                      ? 'Search adults…'
+                      : peoplePick === 'passenger'
+                        ? 'Search people…'
+                        : 'Search people (use their home)…'
+                  }
+                  className="flex-1 min-w-0 text-[10px] px-1.5 py-1 rounded-md border border-slate-200 outline-none focus:border-indigo-400"
+                  onClick={e => e.stopPropagation()}
+                />
+                <button
+                  type="button"
+                  className="text-[10px] font-semibold text-slate-500 hover:text-slate-800 shrink-0"
+                  onClick={() => {
+                    setPeoplePick(null);
+                    setPeoplePickFilter('');
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+              <div className="max-h-36 overflow-y-auto overscroll-contain">
+                {peoplePick === 'driver' && onAssignDriver && driver && (
+                  <button
+                    type="button"
+                    className="w-full px-2 py-1.5 text-left text-[10px] font-semibold text-rose-700 hover:bg-rose-50 border-b border-slate-50"
+                    onClick={() => {
+                      onAssignDriver(null);
+                      setPeoplePick(null);
+                      setPeoplePickFilter('');
+                    }}
+                  >
+                    Clear driver (send home)
+                  </button>
+                )}
+                {peoplePick === 'owner' && onClearOwner && vehicle?.homeKey && (
+                  <button
+                    type="button"
+                    className="w-full px-2 py-1.5 text-left text-[10px] font-semibold text-rose-700 hover:bg-rose-50 border-b border-slate-50"
+                    onClick={() => {
+                      onClearOwner();
+                      setPeoplePick(null);
+                      setPeoplePickFilter('');
+                    }}
+                  >
+                    Clear owner home
+                  </button>
+                )}
+                {filteredPeopleForPick.length === 0 && (
+                  <div className="px-2 py-3 text-[10px] text-slate-400 text-center">No matching people</div>
+                )}
+                {filteredPeopleForPick.map(p => {
+                  const isDriver = driver?.id === p.id;
+                  const isPassenger = passengers.some(x => x.id === p.id);
+                  const isOwnerHome = !!vehicle?.homeKey && p.homeKey === vehicle.homeKey;
+                  const aboardOther =
+                    p.location.kind === 'vehicle' && p.location.vehicleId !== vehicleId;
+                  let status = locationLabel(p.location);
+                  if (isDriver) status = 'Current driver';
+                  else if (isPassenger) status = 'Riding (click to remove)';
+                  else if (isOwnerHome && peoplePick === 'owner') status = 'Resident of owner home';
+                  else if (aboardOther) status = `In other vehicle`;
+
+                  return (
+                    <button
+                      key={p.id}
+                      type="button"
+                      className={`w-full px-2 py-1.5 text-left hover:bg-slate-50 border-b border-slate-50 last:border-0 ${
+                        isDriver || (peoplePick === 'owner' && isOwnerHome)
+                          ? 'bg-indigo-50/60'
+                          : isPassenger
+                            ? 'bg-sky-50/50'
+                            : ''
+                      }`}
+                      onClick={() => {
+                        if (peoplePick === 'driver' && onAssignDriver) {
+                          onAssignDriver(isDriver ? null : p.id);
+                          setPeoplePick(null);
+                          setPeoplePickFilter('');
+                        } else if (peoplePick === 'passenger' && onAssignPassenger) {
+                          onAssignPassenger(p.id, !isPassenger);
+                          // keep open for multi-select passengers
+                        } else if (peoplePick === 'owner' && onAssignOwnerPerson) {
+                          onAssignOwnerPerson(p.id);
+                          setPeoplePick(null);
+                          setPeoplePickFilter('');
+                        }
+                      }}
+                    >
+                      <div className="text-[10px] font-semibold text-slate-800 truncate">
+                        {personDisplayName(p)}
+                        <span className="font-normal text-slate-400"> · {formatAge(p.ageYears)}</span>
+                        {p.sex === 'm' ? ' ♂' : ' ♀'}
+                      </div>
+                      <div className="text-[9px] text-slate-500 truncate">
+                        🏠 {p.homeKey}
+                        {p.workplaceKey ? ` · 👷 ${p.workplaceKey}` : ''}
+                        {' · '}
+                        {status}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              {peoplePick === 'passenger' && (
+                <div className="px-2 py-1 border-t border-slate-100 text-[9px] text-slate-400">
+                  Click a person to board/remove · {passengers.length}/{maxPax} seats
+                </div>
+              )}
+            </div>
+          )}
+
+          {hasPeople && !driver && vehicle?.type !== 'taxi' && (
             <div className="text-[9px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-1.5 py-1">
-              No driver — board someone from the People panel (Board as driver)
+              No driver — click <span className="font-semibold">Driver</span> to assign someone
             </div>
           )}
         </div>
@@ -3615,7 +4786,7 @@ function FloatingVehicleDrivePanel({
                 <Home className="w-4 h-4 shrink-0" />
                 <span className="font-mono text-[10px] font-semibold truncate">
                   {pendingHomeAssign && isActive
-                    ? 'Click house…'
+                    ? 'Click home…'
                     : vehicle.homeKey || '—'}
                 </span>
               </button>
@@ -3629,7 +4800,7 @@ function FloatingVehicleDrivePanel({
                       onToggleHomeAssign();
                     }}
                   >
-                    {pendingHomeAssign && isActive ? 'Cancel assign' : 'Assign house…'}
+                    {pendingHomeAssign && isActive ? 'Cancel assign' : 'Assign home…'}
                   </button>
                   {onAssignRandomHomes && (
                     <button
@@ -3640,7 +4811,7 @@ function FloatingVehicleDrivePanel({
                         onAssignRandomHomes();
                       }}
                     >
-                      Random house
+                      Random home
                     </button>
                   )}
                   <button
@@ -3652,7 +4823,7 @@ function FloatingVehicleDrivePanel({
                       onClearHomes();
                     }}
                   >
-                    Clear house
+                    Clear home
                   </button>
                 </div>
               )}
@@ -3708,6 +4879,551 @@ function FloatingVehicleDrivePanel({
       </div>
     </div>
   );
+}
+
+export type FloatingPersonPanelState = {
+  personId: string;
+  x: number;
+  y: number;
+  zIndex: number;
+};
+
+/**
+ * Floating person control panel (like vehicle drive panels):
+ * 3D eye-level view + info + travel / board / home actions.
+ */
+function FloatingPersonControlPanel({
+  personId,
+  person,
+  people,
+  position,
+  zIndex,
+  isActive,
+  roomCode,
+  grid,
+  vehiclesMap,
+  traffic,
+  selectedVehicleId,
+  onActivate,
+  onClose,
+  onMove,
+  onSendHome,
+  onGoToWork,
+  onGoShop,
+  onLeaveVehicle,
+  onBoardDriver,
+  onBoardPassenger,
+  onEnterNearbyBuilding,
+  onAssignWorkplace,
+  onFocusOnMap,
+}: {
+  personId: string;
+  person: Person | undefined;
+  people?: Record<string, Person>;
+  position: Point;
+  zIndex: number;
+  isActive: boolean;
+  roomCode: string | null;
+  grid: GridData;
+  vehiclesMap: Record<string, Vehicle>;
+  traffic?: TrafficState;
+  selectedVehicleId?: string | null;
+  onActivate: () => void;
+  onClose: () => void;
+  onMove: (pos: Point) => void;
+  onSendHome: () => void;
+  onGoToWork: () => void;
+  onGoShop: () => void;
+  onLeaveVehicle: () => void;
+  onBoardDriver: () => void;
+  onBoardPassenger: () => void;
+  onEnterNearbyBuilding: () => void;
+  onAssignWorkplace: () => void;
+  onFocusOnMap: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const [localPos, setLocalPos] = useState<Point>(position);
+  const localPosRef = useRef(position);
+  const [size, setSize] = useState<PanelSize | null>(null);
+  const sizeRef = useRef<PanelSize | null>(null);
+  const onMoveRef = useRef(onMove);
+  const onActivateRef = useRef(onActivate);
+  const dragSessionRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    originX: number;
+    originY: number;
+    moved: boolean;
+  } | null>(null);
+  const resizeSessionRef = useRef<ResizeSession | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
+
+  useEffect(() => {
+    if (dragSessionRef.current || resizeSessionRef.current) return;
+    localPosRef.current = position;
+    setLocalPos(position);
+  }, [position.x, position.y]);
+  useEffect(() => {
+    onMoveRef.current = onMove;
+  }, [onMove]);
+  useEffect(() => {
+    onActivateRef.current = onActivate;
+  }, [onActivate]);
+
+  const clampPos = useCallback((x: number, y: number): Point => {
+    const w = sizeRef.current?.w ?? panelRef.current?.offsetWidth ?? 280;
+    const h = sizeRef.current?.h ?? panelRef.current?.offsetHeight ?? 200;
+    const maxX = Math.max(0, window.innerWidth - w);
+    const maxY = Math.max(0, window.innerHeight - h);
+    return {
+      x: Math.max(0, Math.min(maxX, x)),
+      y: Math.max(0, Math.min(maxY, y)),
+    };
+  }, []);
+
+  const endDragSession = useCallback((el?: HTMLElement | null, pointerId?: number) => {
+    const session = dragSessionRef.current;
+    if (!session) return;
+    if (pointerId !== undefined && session.pointerId !== pointerId) return;
+    dragSessionRef.current = null;
+    setIsDragging(false);
+    if (el && pointerId !== undefined) {
+      try {
+        if (el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
+      } catch {
+        /* ignore */
+      }
+    }
+    onMoveRef.current(localPosRef.current);
+  }, []);
+
+  const endResizeSession = useCallback((el?: HTMLElement | null, pointerId?: number) => {
+    const session = resizeSessionRef.current;
+    if (!session) return;
+    if (pointerId !== undefined && session.pointerId !== pointerId) return;
+    resizeSessionRef.current = null;
+    setIsResizing(false);
+    if (el && pointerId !== undefined) {
+      try {
+        if (el.hasPointerCapture(pointerId)) el.releasePointerCapture(pointerId);
+      } catch {
+        /* ignore */
+      }
+    }
+    onMoveRef.current(localPosRef.current);
+  }, []);
+
+  const handleHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if (resizeSessionRef.current) return;
+    e.stopPropagation();
+    e.preventDefault();
+    onActivateRef.current();
+    dragSessionRef.current = {
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      originX: localPosRef.current.x,
+      originY: localPosRef.current.y,
+      moved: false,
+    };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const handleHeaderPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const session = dragSessionRef.current;
+    if (!session || e.pointerId !== session.pointerId) return;
+    const dx = e.clientX - session.startClientX;
+    const dy = e.clientY - session.startClientY;
+    if (!session.moved && dx * dx + dy * dy < 16) return;
+    if (!session.moved) {
+      session.moved = true;
+      setIsDragging(true);
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const next = clampPos(session.originX + dx, session.originY + dy);
+    localPosRef.current = next;
+    setLocalPos(next);
+  };
+
+  const handleHeaderPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragSessionRef.current || dragSessionRef.current.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    endDragSession(e.currentTarget, e.pointerId);
+  };
+
+  const handleResizePointerDown = (edge: ResizeEdge, e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragSessionRef.current) {
+      endDragSession(headerRef.current, dragSessionRef.current.pointerId);
+    }
+    onActivateRef.current();
+    const el = panelRef.current;
+    const w = sizeRef.current?.w ?? el?.offsetWidth ?? 320;
+    const h = sizeRef.current?.h ?? el?.offsetHeight ?? 360;
+    resizeSessionRef.current = {
+      pointerId: e.pointerId,
+      edge,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      originX: localPosRef.current.x,
+      originY: localPosRef.current.y,
+      originW: w,
+      originH: h,
+    };
+    setIsResizing(true);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const handleResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const session = resizeSessionRef.current;
+    if (!session || e.pointerId !== session.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const next = computePanelResize(session, e.clientX, e.clientY);
+    localPosRef.current = next.pos;
+    sizeRef.current = next.size;
+    setLocalPos(next.pos);
+    setSize(next.size);
+  };
+
+  const handleResizePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizeSessionRef.current || resizeSessionRef.current.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    endResizeSession(e.currentTarget, e.pointerId);
+  };
+
+  if (!person) return null;
+
+  const placement = getPersonMapPlacement(person, grid, vehiclesMap, 0);
+  // When in a vehicle, use vehicle pose for camera; placement may be hidden
+  let viewGx = placement.x;
+  let viewGy = placement.y;
+  if (person.location.kind === 'vehicle') {
+    const v = vehiclesMap[person.location.vehicleId];
+    if (v) {
+      viewGx = v.x + 0.5;
+      viewGy = v.y + 0.5;
+    }
+  } else if (!placement.visible) {
+    const tile = personTileFallback(person);
+    viewGx = tile.x + 0.5;
+    viewGy = tile.y + 0.72;
+  }
+  const heading = getPersonFacingHeading(person, grid, vehiclesMap);
+  const healthEmoji =
+    person.health === 'healthy' ? '💚' : person.health === 'sick' ? '🤒' : '🩹';
+  const inVehicle = person.location.kind === 'vehicle';
+  const hasWork = !!person.workplaceKey;
+  const canBoard = !!selectedVehicleId && !!vehiclesMap[selectedVehicleId || ''];
+
+  return (
+    <div
+      ref={panelRef}
+      className={`fixed ${size ? '' : 'w-[20rem]'} bg-white/98 backdrop-blur-md rounded-2xl shadow-2xl border-2 flex flex-col overflow-hidden pointer-events-auto transition-shadow ${
+        isActive
+          ? 'border-blue-500 ring-2 ring-blue-300 shadow-xl'
+          : 'border-slate-200 opacity-95'
+      } ${isResizing ? 'select-none' : ''}`}
+      style={{
+        left: localPos.x,
+        top: localPos.y,
+        zIndex: isActive ? Math.max(zIndex, 160) : zIndex,
+        ...(size ? { width: size.w, height: size.h } : null),
+      }}
+      data-grid-control
+      onWheel={stopGridWheel}
+      onContextMenu={stopGridPropagation}
+      onClick={stopGridPropagation}
+      onDoubleClick={stopGridPropagation}
+      onMouseDown={e => {
+        stopGridPropagation(e);
+        onActivateRef.current();
+      }}
+      onMouseUp={stopGridPropagation}
+      onMouseMove={stopGridPropagation}
+      onPointerDown={e => {
+        if ((e.target as HTMLElement).closest('[data-person-panel-title]')) return;
+        if ((e.target as HTMLElement).closest('[data-resize-handle]')) return;
+        stopGridPropagation(e);
+        onActivateRef.current();
+      }}
+      onPointerUp={stopGridPropagation}
+      onPointerMove={stopGridPropagation}
+    >
+      <PanelResizeHandles
+        onPointerDown={handleResizePointerDown}
+        onPointerMove={handleResizePointerMove}
+        onPointerUp={handleResizePointerUp}
+        onLostPointerCapture={e => endResizeSession(null, e.pointerId)}
+      />
+      <div
+        ref={headerRef}
+        data-person-panel-title
+        className={`shrink-0 px-3 py-2 bg-blue-600 text-white flex items-center gap-2 select-none touch-none ${
+          isDragging ? 'cursor-grabbing' : 'cursor-grab'
+        }`}
+        onPointerDown={handleHeaderPointerDown}
+        onPointerMove={handleHeaderPointerMove}
+        onPointerUp={handleHeaderPointerUp}
+        onPointerCancel={e => {
+          if (!dragSessionRef.current || dragSessionRef.current.pointerId !== e.pointerId) return;
+          e.stopPropagation();
+          endDragSession(e.currentTarget, e.pointerId);
+        }}
+        onLostPointerCapture={e => {
+          if (!dragSessionRef.current || dragSessionRef.current.pointerId !== e.pointerId) return;
+          endDragSession(null, e.pointerId);
+        }}
+      >
+        <GripHorizontal className="w-4 h-4 opacity-80 shrink-0 pointer-events-none" />
+        <div className="min-w-0 flex-1 pointer-events-none">
+          <div className="flex items-center gap-1.5">
+            <span className="text-sm">{person.sex === 'm' ? '♂' : '♀'}</span>
+            <span className="text-xs font-bold truncate">
+              {personDisplayName(person)}
+            </span>
+          </div>
+          <div className="text-[10px] text-white/80 truncate">
+            {formatAge(person.ageYears)} · {person.activity || 'idle'} · {healthEmoji}
+          </div>
+        </div>
+        {isActive && (
+          <span className="text-[9px] font-bold uppercase tracking-wide bg-white/20 px-1.5 py-0.5 rounded shrink-0 pointer-events-none">
+            Active
+          </span>
+        )}
+        <button
+          type="button"
+          title="Close person panel"
+          onPointerDown={e => {
+            e.stopPropagation();
+            if (dragSessionRef.current) {
+              endDragSession(headerRef.current, dragSessionRef.current.pointerId);
+            }
+          }}
+          onClick={e => {
+            e.stopPropagation();
+            onClose();
+          }}
+          className="p-1 rounded-lg hover:bg-white/20 transition-colors shrink-0"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      <div
+        className={`p-3 flex flex-col gap-2 overflow-y-auto overscroll-contain ${
+          size ? 'flex-1 min-h-0' : 'max-h-[min(75vh,560px)]'
+        }`}
+      >
+        <PersonView3D
+          person={person}
+          grid={grid}
+          vehicles={vehiclesMap}
+          traffic={traffic}
+          people={people}
+          gx={viewGx}
+          gy={viewGy}
+          heading={heading}
+          width={296}
+          height={168}
+        />
+
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-2 space-y-1 text-[10px]">
+          <div className="flex justify-between gap-2">
+            <span className="text-slate-500 font-semibold">Location</span>
+            <span className="font-medium text-slate-800 truncate text-right">
+              {locationLabel(person.location)}
+            </span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-slate-500 font-semibold">Home</span>
+            <span className="font-mono text-slate-700">{person.homeKey}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-slate-500 font-semibold">Workplace</span>
+            <span className="font-mono text-slate-700">
+              {person.workplaceKey || '—'}
+            </span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-slate-500 font-semibold">Money</span>
+            <span className="text-slate-700">
+              {typeof person.money === 'number' ? `$${person.money}` : '—'}
+            </span>
+          </div>
+          {person.travelIntent && (
+            <div className="flex justify-between gap-2">
+              <span className="text-slate-500 font-semibold">Trip</span>
+              <span className="text-blue-700 truncate text-right">
+                {person.travelIntent.purpose} → {person.travelIntent.destinationKey}
+              </span>
+            </div>
+          )}
+          {person.schedule && person.schedule.length > 0 && (
+            <div className="pt-1 border-t border-slate-200">
+              <div className="text-slate-500 font-semibold mb-0.5">
+                Schedule ({person.scheduleMode || 'auto'})
+              </div>
+              <ul className="space-y-0.5 max-h-16 overflow-y-auto">
+                {person.schedule.slice(0, 6).map(e => (
+                  <li key={e.id} className="font-mono text-slate-600">
+                    {formatScheduleTime(e.startMinute)} {e.label || e.purpose}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        <div className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
+          Actions
+        </div>
+        <div className="grid grid-cols-2 gap-1.5">
+          <button
+            type="button"
+            disabled={!roomCode}
+            onClick={() => {
+              onActivate();
+              onSendHome();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-rose-600 text-white disabled:opacity-40 hover:bg-rose-700"
+          >
+            <Home className="w-3 h-3 inline mr-0.5" />
+            Send home
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode || !hasWork}
+            onClick={() => {
+              onActivate();
+              onGoToWork();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-emerald-600 text-white disabled:opacity-40 hover:bg-emerald-700"
+            title={hasWork ? 'Travel to workplace' : 'No workplace assigned'}
+          >
+            <Briefcase className="w-3 h-3 inline mr-0.5" />
+            Go to work
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode}
+            onClick={() => {
+              onActivate();
+              onGoShop();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-amber-500 text-white disabled:opacity-40 hover:bg-amber-600"
+          >
+            Go shopping
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode}
+            onClick={() => {
+              onActivate();
+              onAssignWorkplace();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-violet-600 text-white disabled:opacity-40 hover:bg-violet-700"
+          >
+            Assign work…
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode || !canBoard || inVehicle}
+            onClick={() => {
+              onActivate();
+              onBoardDriver();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-indigo-600 text-white disabled:opacity-40 hover:bg-indigo-700"
+            title="Board selected vehicle as driver"
+          >
+            Board driver
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode || !canBoard || inVehicle}
+            onClick={() => {
+              onActivate();
+              onBoardPassenger();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-sky-600 text-white disabled:opacity-40 hover:bg-sky-700"
+            title="Board selected vehicle as passenger"
+          >
+            Board rider
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode || !inVehicle}
+            onClick={() => {
+              onActivate();
+              onLeaveVehicle();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-slate-700 text-white disabled:opacity-40 hover:bg-slate-800"
+          >
+            Leave vehicle
+          </button>
+          <button
+            type="button"
+            disabled={!roomCode}
+            onClick={() => {
+              onActivate();
+              onEnterNearbyBuilding();
+            }}
+            className="py-1.5 rounded-lg text-[11px] font-bold bg-emerald-800 text-white disabled:opacity-40 hover:bg-emerald-900"
+          >
+            Enter building
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onActivate();
+              onFocusOnMap();
+            }}
+            className="col-span-2 py-1.5 rounded-lg text-[11px] font-bold bg-blue-50 text-blue-800 border border-blue-200 hover:bg-blue-100"
+          >
+            Highlight on map
+          </button>
+        </div>
+        {!canBoard && !inVehicle && (
+          <p className="text-[9px] text-slate-400 leading-snug">
+            Select a vehicle on the map to enable Board driver / rider.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function personTileFallback(person: Person): { x: number; y: number } {
+  if (person.location.kind === 'tile') return { x: person.location.x, y: person.location.y };
+  if (person.location.kind === 'walking') {
+    return { x: Math.floor(person.location.x), y: Math.floor(person.location.y) };
+  }
+  const key =
+    person.location.kind === 'home'
+      ? person.location.homeKey
+      : person.location.kind === 'building'
+        ? person.location.buildingKey
+        : person.location.kind === 'outdoor'
+          ? person.location.atKey
+          : person.homeKey;
+  const [x, y] = key.split(',').map(Number);
+  return {
+    x: Number.isFinite(x) ? x : 0,
+    y: Number.isFinite(y) ? y : 0,
+  };
 }
 
 type TrafficTool = 'stop-sign' | 'stoplight' | null;
@@ -4516,6 +6232,8 @@ function createBuildingConfig(anchorKey: string, type: string): BuildingConfig {
         : undefined,
     taxiFleetIds: role === 'taxi-station' ? [] : undefined,
     activeTaxiRides: role === 'taxi-station' ? [] : undefined,
+    busFleetIds: role === 'bus-station' ? [] : undefined,
+    busRoute: role === 'bus-station' ? [] : undefined,
   };
   return normalizeBuildingConfig(base);
 }
@@ -4565,7 +6283,11 @@ function findVehiclesInBuildingBays(
   anchorKey: string,
   grid: GridData,
   vehicles: Record<string, Vehicle>,
-  buildingType: 'building-repair-shop' | 'building-hospital' | 'building-taxi-station',
+  buildingType:
+    | 'building-repair-shop'
+    | 'building-hospital'
+    | 'building-taxi-station'
+    | 'building-bus-station',
 ): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
   const result: Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> = [];
   const seen = new Set<string>();
@@ -4611,6 +6333,496 @@ function findVehiclesInTaxiStationBays(
   vehicles: Record<string, Vehicle>,
 ): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
   return findVehiclesInBuildingBays(anchorKey, grid, vehicles, 'building-taxi-station');
+}
+
+function findVehiclesInBusStationBays(
+  anchorKey: string,
+  grid: GridData,
+  vehicles: Record<string, Vehicle>,
+): Array<{ vehicle: Vehicle; bayIndex: number; cellKey: string }> {
+  return findVehiclesInBuildingBays(anchorKey, grid, vehicles, 'building-bus-station');
+}
+
+function findBusBayCells(
+  anchorKey: string,
+  grid: GridData,
+): Array<{ key: string; bayIndex: number; x: number; y: number }> {
+  const cells: Array<{ key: string; bayIndex: number; x: number; y: number }> = [];
+  for (const [key, tiles] of Object.entries(grid)) {
+    for (const t of tiles) {
+      if (t.type !== 'building-bus-station') continue;
+      const isAnchor = t.part !== 'member' && key === anchorKey;
+      const isMember = t.part === 'member' && t.anchorKey === anchorKey;
+      if (!isAnchor && !isMember) continue;
+      if (!isBusStationBay(t)) continue;
+      const [x, y] = key.split(',').map(Number);
+      cells.push({ key, bayIndex: getBusStationBayIndex(t), x, y });
+    }
+  }
+  return cells.sort((a, b) => a.bayIndex - b.bayIndex);
+}
+
+function BusStationInspectorModal({
+  bkey,
+  cfg,
+  economy,
+  grid,
+  vehicles,
+  setEconomy,
+  setVehicles,
+  roomCode,
+  pendingBusRouteStationKey,
+  setPendingBusRouteStationKey,
+  onClose,
+}: {
+  bkey: string;
+  cfg: BuildingConfig;
+  economy: EconomyState;
+  grid: GridData;
+  vehicles: Record<string, Vehicle>;
+  setEconomy: (eco: EconomyState | ((prev: EconomyState) => EconomyState)) => void;
+  setVehicles: (vs: Record<string, Vehicle> | ((prev: Record<string, Vehicle>) => Record<string, Vehicle>)) => void;
+  roomCode: string | null;
+  pendingBusRouteStationKey: string | null;
+  setPendingBusRouteStationKey: (key: string | null) => void;
+  onClose: () => void;
+}) {
+  const fleetIds = cfg.busFleetIds || [];
+  const stationRoute = cfg.busRoute || [];
+  const bayVehicles = findVehiclesInBusStationBays(bkey, grid, vehicles);
+  const unassignedBuses = Object.values(vehicles).filter(
+    v =>
+      v.type === 'bus' &&
+      !fleetIds.includes(v.id) &&
+      (!v.busStationKey || v.busStationKey === bkey),
+  );
+  const editingRoute = pendingBusRouteStationKey === bkey;
+
+  const saveCfg = (nextCfg: BuildingConfig, nextVehicles?: Record<string, Vehicle>) => {
+    const withFleet: BuildingConfig = {
+      ...nextCfg,
+      busFleetIds: nextCfg.busFleetIds ?? [],
+      busRoute: nextCfg.busRoute ?? [],
+    };
+    const eco = {
+      ...economy,
+      buildings: { ...economy.buildings, [bkey]: withFleet },
+    };
+    setEconomy(eco);
+    if (nextVehicles) setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: eco });
+      if (nextVehicles) socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  const addBusToFleet = () => {
+    const bays = findBusBayCells(bkey, grid);
+    const occupied = new Set(bayVehicles.map(b => b.bayIndex));
+    const freeBay = bays.find(b => !occupied.has(b.bayIndex));
+    const spawn = freeBay || bays[0];
+    if (!spawn) return;
+    const id = makeVehicleId('bus');
+    const bus: Vehicle = {
+      id,
+      x: spawn.x,
+      y: spawn.y,
+      heading: 0,
+      lane: 1,
+      progress: 0.5,
+      color: SERVICE_VEHICLE_META.bus.color,
+      zIndex: 0,
+      type: 'bus',
+      isMoving: false,
+      speed: 0.9,
+      turnAroundAtDeadEnd: true,
+      randomTurning: false,
+      parkingStallIndex: spawn.bayIndex,
+      lastParkingKey: bkey,
+      busStationKey: bkey,
+      maxPassengers: getMaxPassengers('bus'),
+    };
+    const nextVehicles = { ...vehicles, [id]: bus };
+    saveCfg(
+      {
+        ...cfg,
+        busFleetIds: [...fleetIds, id],
+        busRoute: stationRoute,
+      },
+      nextVehicles,
+    );
+  };
+
+  const assignBus = (busId: string) => {
+    if (fleetIds.includes(busId)) return;
+    const v = vehicles[busId];
+    if (!v || v.type !== 'bus') return;
+    // Don't steal a bus tied to another station's fleet
+    if (v.busStationKey && v.busStationKey !== bkey) {
+      const other = economy.buildings[v.busStationKey];
+      if (other?.busFleetIds?.includes(busId)) return;
+    }
+    const nextVehicles = {
+      ...vehicles,
+      [busId]: { ...v, busStationKey: bkey },
+    };
+    saveCfg(
+      {
+        ...cfg,
+        busFleetIds: [...fleetIds, busId],
+        busRoute: stationRoute,
+      },
+      nextVehicles,
+    );
+  };
+
+  const removeBusFromFleet = (busId: string, deleteVehicle: boolean) => {
+    const nextFleet = fleetIds.filter(id => id !== busId);
+    const nextCfg: BuildingConfig = {
+      ...cfg,
+      busFleetIds: nextFleet,
+      busRoute: stationRoute,
+    };
+    if (deleteVehicle) {
+      const nextVehicles = { ...vehicles };
+      delete nextVehicles[busId];
+      saveCfg(nextCfg, nextVehicles);
+      return;
+    }
+    const v = vehicles[busId];
+    if (v) {
+      const cleared = { ...v };
+      // Keep busStationKey only if still useful for refuel; clear route assignment
+      cleared.busRoute = undefined;
+      cleared.busPhase = undefined;
+      cleared.busRouteIndex = undefined;
+      cleared.busRouteLoops = undefined;
+      cleared.isMoving = false;
+      cleared.destination = null;
+      saveCfg(nextCfg, { ...vehicles, [busId]: cleared });
+    } else {
+      saveCfg(nextCfg);
+    }
+  };
+
+  const clearStationRoute = () => {
+    saveCfg({ ...cfg, busFleetIds: fleetIds, busRoute: [] });
+  };
+
+  const removeStop = (index: number) => {
+    const next = stationRoute.filter((_, i) => i !== index);
+    saveCfg({ ...cfg, busFleetIds: fleetIds, busRoute: next });
+  };
+
+  /** Copy station route onto a bus and start service */
+  const assignBusToRouteAndStart = (busId: string) => {
+    if (!stationRoute.length || !roomCode) return;
+    const v = vehicles[busId];
+    if (!v || v.type !== 'bus') return;
+    const first = parseGridKey(stationRoute[0]);
+    const firstStop = first
+      ? getBusStopTileAt(grid, first.x, first.y)
+      : undefined;
+    const startHeading = firstStop
+      ? getBusStopApproachHeading(firstStop)
+      : v.heading;
+    const startLane = firstStop
+      ? getBusStopBayLane(firstStop, startHeading)
+      : getLegalTrafficLane(false, false);
+    const nextVehicles = {
+      ...vehicles,
+      [busId]: {
+        ...v,
+        busRoute: [...stationRoute],
+        busRouteIndex: 0,
+        busRouteLoops: 0,
+        busPhase: 'route' as const,
+        busStationKey: bkey,
+        busStopUntil: undefined,
+        busRefuelTicks: undefined,
+        destination: first,
+        isMoving: !!first,
+        // Always legal right-hand lane when starting a route
+        lane: v.lane < 0 ? startLane : Math.abs(v.lane) || startLane,
+        randomTurning: false,
+        turnAroundAtDeadEnd: true,
+        manualOverride: false,
+      },
+    };
+    // Ensure bus is in fleet
+    const nextFleet = fleetIds.includes(busId) ? fleetIds : [...fleetIds, busId];
+    saveCfg(
+      { ...cfg, busFleetIds: nextFleet, busRoute: stationRoute },
+      nextVehicles,
+    );
+    setPendingBusRouteStationKey(null);
+  };
+
+  const stopBusRoute = (busId: string) => {
+    const v = vehicles[busId];
+    if (!v) return;
+    const nextVehicles = {
+      ...vehicles,
+      [busId]: {
+        ...v,
+        busPhase: undefined,
+        busStopUntil: undefined,
+        busRefuelTicks: undefined,
+        destination: null,
+        isMoving: false,
+      },
+    };
+    setVehicles(nextVehicles);
+    if (roomCode) socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+  };
+
+  const assignAllFleetToRoute = () => {
+    if (!stationRoute.length) return;
+    let nextVehicles = { ...vehicles };
+    for (const busId of fleetIds) {
+      const v = nextVehicles[busId];
+      if (!v || v.type !== 'bus') continue;
+      const first = parseGridKey(stationRoute[0]);
+      nextVehicles[busId] = {
+        ...v,
+        busRoute: [...stationRoute],
+        busRouteIndex: 0,
+        busRouteLoops: 0,
+        busPhase: 'route',
+        busStationKey: bkey,
+        destination: first,
+        isMoving: !!first,
+        lane: v.lane < 0 ? getLegalTrafficLane(false, false) : Math.abs(v.lane) || 1,
+        randomTurning: false,
+        turnAroundAtDeadEnd: true,
+        manualOverride: false,
+      };
+    }
+    saveCfg({ ...cfg, busFleetIds: fleetIds, busRoute: stationRoute }, nextVehicles);
+    setPendingBusRouteStationKey(null);
+  };
+
+  return (
+    <FloatingWindow
+      title={
+        <span className="flex items-center gap-1.5">
+          <Bus className="w-3.5 h-3.5" />
+          {cfg.name || 'Bus Station'}
+        </span>
+      }
+      subtitle={`${bkey} · 2×2 · 2 bays · ${fleetIds.length} bus${fleetIds.length === 1 ? '' : 'es'}`}
+      headerClassName="bg-blue-600 text-white"
+      borderClassName="border-blue-300"
+      widthClassName="w-[min(32rem,calc(100vw-2rem))]"
+      maxHeightClassName="max-h-[min(85vh,680px)]"
+      onClose={() => {
+        if (pendingBusRouteStationKey === bkey) setPendingBusRouteStationKey(null);
+        onClose();
+      }}
+    >
+      <div className="p-4 space-y-4 text-xs">
+        <div className="rounded-xl border border-blue-100 bg-blue-50/80 px-2.5 py-2 space-y-0.5">
+          <div className="text-[10px] font-semibold text-blue-900 uppercase tracking-wide">
+            Route editor
+          </div>
+          <p className="text-[10px] text-slate-600 leading-snug">
+            Build a route by clicking <strong>bus-stop</strong> road tiles in order, then assign fleet buses to that route.
+            After <strong>5 loops</strong> a bus returns here for gas ({BUS_REFUEL_TICKS}s) and resumes.
+          </p>
+        </div>
+
+        {/* Station route */}
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-semibold text-slate-800">
+              Station route ({stationRoute.length} stop{stationRoute.length === 1 ? '' : 's'})
+            </div>
+            <div className="flex gap-1">
+              <button
+                type="button"
+                disabled={!roomCode}
+                onClick={() => {
+                  setPendingBusRouteStationKey(editingRoute ? null : bkey);
+                }}
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold disabled:opacity-40 ${
+                  editingRoute
+                    ? 'bg-blue-700 text-white animate-pulse'
+                    : 'bg-blue-600 text-white hover:bg-blue-700'
+                }`}
+              >
+                {editingRoute ? 'Clicking stops…' : 'Add stops on map'}
+              </button>
+              <button
+                type="button"
+                disabled={!roomCode || stationRoute.length === 0}
+                onClick={clearStationRoute}
+                className="px-2 py-1.5 rounded-lg text-[11px] font-bold bg-white border border-blue-200 text-blue-800 disabled:opacity-40"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-1 min-h-[1.5rem]">
+            {stationRoute.length === 0 && (
+              <span className="text-[10px] text-slate-400 italic">
+                No stops yet — click “Add stops on map”, then bus-stop tiles
+              </span>
+            )}
+            {stationRoute.map((stop, i) => (
+              <span
+                key={`${stop}-${i}`}
+                className="inline-flex items-center gap-0.5 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-white text-blue-800 border-blue-200"
+                title={`Stop ${i + 1}`}
+              >
+                {i + 1}. {stop}
+                <button
+                  type="button"
+                  className="ml-0.5 text-slate-400 hover:text-rose-600"
+                  title="Remove stop"
+                  onClick={() => removeStop(i)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+          {fleetIds.length > 0 && stationRoute.length > 0 && (
+            <button
+              type="button"
+              disabled={!roomCode}
+              onClick={assignAllFleetToRoute}
+              className="w-full py-1.5 rounded-lg text-[11px] font-bold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40"
+            >
+              Assign all fleet buses to route &amp; start
+            </button>
+          )}
+        </div>
+
+        {/* Fleet */}
+        <div className="flex items-center justify-between gap-2">
+          <div className="font-semibold text-slate-800">Fleet ({fleetIds.length})</div>
+          <button
+            type="button"
+            disabled={!roomCode}
+            onClick={addBusToFleet}
+            className="px-2.5 py-1.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white font-bold disabled:opacity-40"
+          >
+            + Add bus
+          </button>
+        </div>
+
+        {fleetIds.length === 0 ? (
+          <div className="text-slate-400 text-center py-3 border border-dashed border-slate-200 rounded-xl">
+            No buses yet. Add a bus to this station, or assign an existing bus below.
+          </div>
+        ) : (
+          <ul className="space-y-1.5">
+            {fleetIds.map(bid => {
+              const v = vehicles[bid];
+              const onRoute = !!(v?.busRoute && v.busRoute.length > 0);
+              return (
+                <li
+                  key={bid}
+                  className="flex flex-col gap-1.5 p-2 rounded-xl border border-slate-100 bg-slate-50"
+                >
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="w-3 h-3 rounded-full shrink-0"
+                      style={{ backgroundColor: v?.color || SERVICE_VEHICLE_META.bus.color }}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-mono text-[11px] text-slate-700 truncate">{bid}</div>
+                      <div className="text-[10px] text-slate-500">
+                        {v
+                          ? `@ ${v.x},${v.y}${v.destination ? ` → ${v.destination.x},${v.destination.y}` : ''}`
+                          : 'Missing vehicle'}
+                        {v?.busPhase ? ` · ${v.busPhase}` : ' · Idle'}
+                        {typeof v?.busRouteLoops === 'number' && onRoute
+                          ? ` · loops ${v.busRouteLoops}/${BUS_LOOPS_BEFORE_REFUEL}`
+                          : ''}
+                        {v?.busPhase === 'refueling' && typeof v.busRefuelTicks === 'number'
+                          ? ` · fuel ${v.busRefuelTicks}s`
+                          : ''}
+                      </div>
+                      {onRoute && (
+                        <div className="text-[9px] text-blue-700 font-mono truncate">
+                          Route: {(v!.busRoute || []).join(' → ')}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    <button
+                      type="button"
+                      disabled={!roomCode || stationRoute.length === 0}
+                      onClick={() => assignBusToRouteAndStart(bid)}
+                      className="px-2 py-1 rounded-lg text-[10px] font-bold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40"
+                    >
+                      {onRoute ? 'Restart on route' : 'Assign to route & start'}
+                    </button>
+                    {onRoute && (
+                      <button
+                        type="button"
+                        disabled={!roomCode}
+                        onClick={() => stopBusRoute(bid)}
+                        className="px-2 py-1 rounded-lg text-[10px] font-bold bg-white border border-slate-200 text-slate-700 disabled:opacity-40"
+                      >
+                        Stop
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={!roomCode}
+                      title="Unassign from station"
+                      onClick={() => removeBusFromFleet(bid, false)}
+                      className="px-2 py-1 rounded-lg text-[10px] font-bold bg-white border border-slate-200 text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+                    >
+                      Unassign
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!roomCode}
+                      title="Remove bus from world"
+                      onClick={() => removeBusFromFleet(bid, true)}
+                      className="px-2 py-1 rounded-lg text-[10px] font-bold bg-red-50 border border-red-100 text-red-600 hover:bg-red-100 disabled:opacity-40"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {unassignedBuses.length > 0 && (
+          <div>
+            <div className="font-semibold text-slate-700 mb-1.5">Assign existing bus</div>
+            <div className="flex flex-wrap gap-1.5">
+              {unassignedBuses.map(b => (
+                <button
+                  key={b.id}
+                  type="button"
+                  disabled={!roomCode}
+                  onClick={() => assignBus(b.id)}
+                  className="px-2 py-1 rounded-lg bg-white border border-blue-200 text-[10px] font-mono text-slate-700 hover:bg-blue-50 disabled:opacity-40"
+                >
+                  {b.id.slice(0, 14)}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {bayVehicles.length > 0 && (
+          <div className="text-[10px] text-slate-500">
+            Parked in bays:{' '}
+            {bayVehicles.map(b => `Bay ${b.bayIndex + 1}: ${b.vehicle.id.slice(0, 8)}`).join(' · ')}
+          </div>
+        )}
+      </div>
+    </FloatingWindow>
+  );
 }
 
 function findTaxiBayCells(
@@ -4697,7 +6909,7 @@ function TaxiStationInspectorModal({
     const freeBay = bays.find(b => !occupied.has(b.bayIndex));
     const spawn = freeBay || bays[0];
     if (!spawn) return;
-    const id = `taxi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const id = makeVehicleId('taxi');
     const taxi: Vehicle = {
       id,
       x: spawn.x,
@@ -5877,27 +8089,37 @@ function BuildingInspectorModal({
             </div>
 
             {(() => {
-              const staff = countEmployeesAtBuilding(economy.people, bkey);
+              const present = countEmployeesAtBuilding(economy.people, bkey);
+              const assigned = countEmployeesAssignedToBuilding(economy.people, bkey);
               const need = localRequiredEmployees;
-              const staffed = need <= 0 || staff >= need;
+              const staffed = need <= 0 || present >= need;
               const employees = Object.values(economy.people || {}).filter(p => p.workplaceKey === bkey);
               return (
                 <div className={`p-2 rounded-lg border text-xs ${staffed ? 'bg-emerald-50 border-emerald-200' : 'bg-rose-50 border-rose-200'}`}>
                   <div className="flex items-center justify-between font-medium mb-1">
                     <span className={staffed ? 'text-emerald-800' : 'text-rose-800'}>
-                      Staffing: {staff}/{need} employees
+                      On-site: {present}/{need} · Assigned: {assigned}
                     </span>
                     {!staffed && <span className="text-rose-600 text-[10px]">Production paused</span>}
                   </div>
                   {employees.length === 0 ? (
                     <p className="text-[10px] text-slate-500">
-                      No employees assigned. Select people in the People panel, then click &quot;Assign workplace&quot; and choose this building.
+                      No employees assigned. Select people in the People panel, then click &quot;Assign workplace&quot; and choose this building. Assigned people must travel here before production uses them.
                     </p>
                   ) : (
                     <ul className="text-[10px] text-slate-600 space-y-0.5 max-h-20 overflow-y-auto">
-                      {employees.map(p => (
-                        <li key={p.id}>{personDisplayName(p)} · {formatAge(p.ageYears)}</li>
-                      ))}
+                      {employees.map(p => {
+                        const onSite =
+                          p.location.kind === 'building' && p.location.buildingKey === bkey;
+                        return (
+                          <li key={p.id}>
+                            {personDisplayName(p)} · {formatAge(p.ageYears)}
+                            <span className={onSite ? ' text-emerald-600' : ' text-amber-600'}>
+                              {onSite ? ' · on-site' : ' · commuting'}
+                            </span>
+                          </li>
+                        );
+                      })}
                     </ul>
                   )}
                 </div>
@@ -6000,6 +8222,206 @@ function BuildingInspectorModal({
   );
 }
 
+/**
+ * City system clock at top of the map — HH:MM:SS AM/PM.
+ * User can set time; people schedules and city AI follow sim time.
+ */
+function CityClockBar({
+  economy,
+  setEconomy,
+  roomCode,
+}: {
+  economy: EconomyState;
+  setEconomy: (eco: EconomyState | ((prev: EconomyState) => EconomyState)) => void;
+  roomCode: string | null;
+}) {
+  const [tick, setTick] = useState(0);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [parseError, setParseError] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const iv = setInterval(() => setTick(t => t + 1), 250);
+    return () => clearInterval(iv);
+  }, []);
+
+  const simNow = getSimNow(economy, Date.now());
+  void tick;
+  const label = formatClock12h(simNow);
+
+  const applyOffset = (offsetMs: number) => {
+    const realNow = Date.now();
+    const newSim = realNow + offsetMs;
+    // Re-arm people AI for the new city time (schedules re-evaluate; activity timers reset)
+    const people = { ...(economy.people || {}) };
+    for (const id of Object.keys(people)) {
+      const p = people[id];
+      if (!p) continue;
+      people[id] = {
+        ...p,
+        activityUntil: newSim,
+        lastScheduleFireKey: undefined,
+      };
+    }
+    const nextEco: EconomyState = {
+      ...economy,
+      cityTimeOffsetMs: offsetMs,
+      people,
+    };
+    setEconomy(nextEco);
+    if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+  };
+
+  const applyDraft = () => {
+    const parsed = parseClockInput(draft);
+    if (!parsed) {
+      setParseError(true);
+      return;
+    }
+    setParseError(false);
+    applyOffset(
+      cityTimeOffsetForLocalTime(parsed.hours, parsed.minutes, parsed.seconds),
+    );
+    setEditing(false);
+  };
+
+  const nudgeHours = (delta: number) => {
+    const d = new Date(getSimNow(economy, Date.now()));
+    d.setHours(d.getHours() + delta);
+    applyOffset(
+      cityTimeOffsetForLocalTime(d.getHours(), d.getMinutes(), d.getSeconds()),
+    );
+  };
+
+  const syncToWall = () => {
+    applyOffset(0);
+    setEditing(false);
+  };
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [editing]);
+
+  return (
+    <div
+      className="absolute top-2 left-1/2 -translate-x-1/2 z-[55] flex flex-col items-center gap-1"
+      data-grid-control
+      onMouseDown={e => e.stopPropagation()}
+      onClick={e => e.stopPropagation()}
+    >
+      <div className="flex items-center gap-1.5 rounded-full border border-slate-300/90 bg-white/95 shadow-lg backdrop-blur-sm pl-2.5 pr-1.5 py-1">
+        <Clock className="w-3.5 h-3.5 text-slate-500 shrink-0" aria-hidden />
+        {editing ? (
+          <form
+            className="flex items-center gap-1"
+            onSubmit={e => {
+              e.preventDefault();
+              applyDraft();
+            }}
+          >
+            <input
+              ref={inputRef}
+              type="text"
+              value={draft}
+              onChange={e => {
+                setDraft(e.target.value);
+                setParseError(false);
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Escape') {
+                  e.stopPropagation();
+                  setParseError(false);
+                  setEditing(false);
+                }
+              }}
+              placeholder="6am, 5:20p, noon…"
+              className={`w-[8.5rem] px-1.5 py-0.5 text-xs font-mono font-bold text-slate-800 border rounded-md outline-none ${
+                parseError
+                  ? 'border-rose-400 bg-rose-50 focus:border-rose-500'
+                  : 'border-slate-200 focus:border-indigo-400'
+              }`}
+              title="Examples: 6am, 5:20P, midnight, noon, 15:45, 930am"
+              aria-invalid={parseError}
+            />
+            <button
+              type="submit"
+              className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-indigo-600 text-white hover:bg-indigo-700"
+            >
+              Set
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditing(false)}
+              className="px-1.5 py-0.5 rounded-md text-[10px] font-bold text-slate-500 hover:bg-slate-100"
+            >
+              Esc
+            </button>
+          </form>
+        ) : (
+          <>
+            <button
+              type="button"
+              disabled={!roomCode}
+              onClick={() => {
+                setDraft(formatClock12h(getSimNow(economy, Date.now())));
+                setEditing(true);
+              }}
+              className="font-mono text-sm font-bold tabular-nums text-slate-800 tracking-wide px-1 py-0.5 rounded-md hover:bg-slate-100 disabled:opacity-50"
+              title="City clock — click to set time (schedules follow this clock)"
+            >
+              {label}
+            </button>
+            <button
+              type="button"
+              disabled={!roomCode}
+              onClick={() => nudgeHours(-1)}
+              className="w-6 h-6 rounded-full text-xs font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+              title="−1 hour"
+            >
+              −1h
+            </button>
+            <button
+              type="button"
+              disabled={!roomCode}
+              onClick={() => nudgeHours(1)}
+              className="w-6 h-6 rounded-full text-xs font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+              title="+1 hour"
+            >
+              +1h
+            </button>
+            <button
+              type="button"
+              disabled={!roomCode}
+              onClick={syncToWall}
+              className="px-1.5 h-6 rounded-full text-[9px] font-bold text-slate-500 hover:bg-slate-100 disabled:opacity-40"
+              title="Sync to real wall clock"
+            >
+              Now
+            </button>
+          </>
+        )}
+      </div>
+      {editing && (
+        <div
+          className={`text-[9px] px-2 py-0.5 rounded-full border shadow-sm max-w-xs text-center ${
+            parseError
+              ? 'text-rose-700 bg-rose-50 border-rose-200'
+              : 'text-slate-500 bg-white/90 border-slate-200'
+          }`}
+        >
+          {parseError
+            ? 'Could not parse time — try 6am, 5:20p, midnight, noon…'
+            : 'Try 6am · 5:20p · midnight · noon · 15:45 · 930am'}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [grid, _setGrid] = useState<GridData>({});
   const localGridRef = useRef<GridData>({});
@@ -6065,6 +8487,10 @@ export default function App() {
       people: eco?.people && typeof eco.people === 'object' ? { ...eco.people } : {},
       families: eco?.families && typeof eco.families === 'object' ? { ...eco.families } : {},
       peoplePaused: eco?.peoplePaused ?? false,
+      cityTimeOffsetMs:
+        typeof eco?.cityTimeOffsetMs === 'number' && Number.isFinite(eco.cityTimeOffsetMs)
+          ? eco.cityTimeOffsetMs
+          : 0,
     };
   };
 
@@ -6153,6 +8579,20 @@ export default function App() {
           if (d.byUid && stamped.manualOverrideByUid !== d.byUid) {
             stamped = { ...stamped, manualOverrideByUid: d.byUid };
           }
+          // Manual override always clears autonomous turn AI + destination routing
+          if (
+            stamped.randomTurning ||
+            stamped.turnAroundAtDeadEnd !== false ||
+            stamped.destination
+          ) {
+            stamped = {
+              ...stamped,
+              randomTurning: false,
+              turnAroundAtDeadEnd: false,
+              destination: null,
+              turnIntent: null,
+            };
+          }
         } else if (stamped.manualOverrideByUid) {
           const cleared = { ...stamped };
           delete cleared.manualOverrideByUid;
@@ -6171,8 +8611,13 @@ export default function App() {
   }, []);
   const setVehicles = useCallback((next: Record<string, Vehicle> | ((prev: Record<string, Vehicle>) => Record<string, Vehicle>)) => {
     if (typeof next === 'function') {
-      _setVehicles(prev => {
-        const normalized = stampManualOverrideFlags(normalizeVehicles(next(prev)));
+      _setVehicles(reactPrev => {
+        // Prefer vehiclesRef: place/keyboard updates write the ref immediately, while
+        // React prev can lag one frame and would otherwise snap teleports back.
+        const base = vehiclesRef.current;
+        const source =
+          base && Object.keys(base).length > 0 ? base : reactPrev;
+        const normalized = stampManualOverrideFlags(normalizeVehicles(next(source)));
         vehiclesRef.current = normalized;
         return normalized;
       });
@@ -6184,6 +8629,8 @@ export default function App() {
   }, [stampManualOverrideFlags]);
   const [selectedVehicles, setSelectedVehicles] = useState<Set<string>>(new Set());
   const [isPlacingVehicles, setIsPlacingVehicles] = useState(false);
+  /** Map-click mode: place selected people (or drop a new person) on a tile */
+  const [isPlacingPeople, setIsPlacingPeople] = useState(false);
   const [showCarsPanel, setShowCarsPanel] = useState(false);
   const [showSemiTrailerPanel, setShowSemiTrailerPanel] = useState(false);
   const [showTrainPanel, setShowTrainPanel] = useState(false);
@@ -6195,6 +8642,9 @@ export default function App() {
   const gridSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [drivePanels, setDrivePanels] = useState<FloatingDrivePanelState[]>([]);
   const [activeDrivePanelId, setActiveDrivePanelId] = useState<string | null>(null);
+  const [personPanels, setPersonPanels] = useState<FloatingPersonPanelState[]>([]);
+  const [activePersonPanelId, setActivePersonPanelId] = useState<string | null>(null);
+  const personPanelZRef = useRef(140);
   const drivePanelZRef = useRef(140);
   /** Vehicle ids with an open floating drive panel (manual control — skip home AI). */
   const drivePanelIdsRef = useRef<Set<string>>(new Set());
@@ -6222,6 +8672,7 @@ export default function App() {
     people: {},
     families: {},
     peoplePaused: false,
+    cityTimeOffsetMs: 0,
   });
   const [economy, _setEconomy] = useState<EconomyState>(() => emptyEconomy());
   const localEconomyRef = useRef<EconomyState>(emptyEconomy());
@@ -6254,6 +8705,10 @@ export default function App() {
   const [inspectTrailerRef, setInspectTrailerRef] = useState<TrailerRef | null>(null);
   const [inspectRailcarRef, setInspectRailcarRef] = useState<RailcarRef | null>(null);
   const [pendingRouteVehicleId, setPendingRouteVehicleId] = useState<string | null>(null);
+  /** Bus id whose route is being edited by clicking bus-stop tiles (legacy / service panel) */
+  const [pendingBusRouteVehicleId, setPendingBusRouteVehicleId] = useState<string | null>(null);
+  /** Bus station anchor whose shared route is being edited on the map */
+  const [pendingBusRouteStationKey, setPendingBusRouteStationKey] = useState<string | null>(null);
   /** When true, next house click assigns homeKey for selected cars */
   const [pendingHomeAssign, setPendingHomeAssign] = useState(false);
   /** When true, next tree click starts a fire on that tile */
@@ -6687,8 +9142,8 @@ export default function App() {
       // (missing the field) cannot flip the checkbox off.
       const normalized = normalizeVehicles(newVehicles);
       if (isSimLeaderRef.current) {
-        // Leader owns kinematics — only adopt explicit control flags (and brand-new vehicles)
-        // from peers. Never full-replace; never drop vehicles on a stale peer snapshot.
+        // Leader owns kinematics — adopt peer control flags, new vehicles, and
+        // place/teleport poses (higher placeSeq). Never full-replace from peers.
         setVehicles(prev => {
           let changed = false;
           const next = { ...prev };
@@ -6698,25 +9153,118 @@ export default function App() {
               changed = true;
               continue;
             }
+            const local = next[id];
+            let merged = local;
+            let localChanged = false;
+
+            const peerPlaceSeq = rv.placeSeq ?? 0;
+            const localPlaceSeq = local.placeSeq ?? 0;
+            if (peerPlaceSeq > localPlaceSeq) {
+              // Peer placed/teleported this vehicle — adopt pose
+              merged = {
+                ...merged,
+                x: rv.x,
+                y: rv.y,
+                heading: rv.heading,
+                lane: rv.lane,
+                progress: rv.progress,
+                zIndex: rv.zIndex,
+                placeSeq: peerPlaceSeq,
+                destination: null,
+                turnIntent: null,
+                stepForward: false,
+                stepBackward: false,
+              };
+              delete merged.parkingStopUntil;
+              delete merged.trafficStopUntil;
+              delete merged.trafficStopReason;
+              if (merged.homeKey) {
+                merged.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+              }
+              localChanged = true;
+            }
+
             const overrideChanged =
               (rv.manualOverride === true || rv.manualOverride === false) &&
-              (prev[id].manualOverride !== rv.manualOverride ||
-                prev[id].manualOverrideByUid !== rv.manualOverrideByUid);
+              (merged.manualOverride !== rv.manualOverride ||
+                merged.manualOverrideByUid !== rv.manualOverrideByUid);
             if (overrideChanged) {
-              const merged: Vehicle = {
-                ...prev[id],
+              merged = {
+                ...merged,
                 manualOverride: rv.manualOverride,
                 manualOverrideByUid: rv.manualOverride
-                  ? rv.manualOverrideByUid || prev[id].manualOverrideByUid
+                  ? rv.manualOverrideByUid || merged.manualOverrideByUid
                   : undefined,
               };
               if (rv.manualOverride) {
                 delete merged.trafficStopUntil;
                 delete merged.trafficStopReason;
                 delete merged.nextHomeReturnAt;
+                delete merged.parkingStopUntil;
+                merged.destination = null;
+                merged.turnIntent = null;
+                merged.randomTurning = false;
+                merged.turnAroundAtDeadEnd = false;
               } else {
                 delete merged.manualOverrideByUid;
               }
+              localChanged = true;
+            }
+
+            // Peer holding manual override (or sending discrete drive inputs) owns
+            // isMoving / F-B step / speed / lane / turnIntent — adopt so non-leader
+            // keypresses actually drive the sim on the leader.
+            const peerDrives =
+              !!rv.manualOverride ||
+              !!rv.stepForward ||
+              !!rv.stepBackward ||
+              (rv.isMoving === true && !!rv.manualOverrideByUid);
+            if (peerDrives) {
+              let driveMerged = merged;
+              let driveChanged = false;
+              if (rv.isMoving !== undefined && rv.isMoving !== driveMerged.isMoving) {
+                driveMerged = { ...driveMerged, isMoving: rv.isMoving };
+                driveChanged = true;
+              }
+              if (rv.stepForward) {
+                driveMerged = {
+                  ...driveMerged,
+                  stepForward: true,
+                  stepBackward: false,
+                };
+                driveChanged = true;
+              } else if (rv.stepBackward) {
+                driveMerged = {
+                  ...driveMerged,
+                  stepBackward: true,
+                  stepForward: false,
+                };
+                driveChanged = true;
+              }
+              if (typeof rv.speed === 'number' && rv.speed !== driveMerged.speed) {
+                driveMerged = { ...driveMerged, speed: rv.speed };
+                driveChanged = true;
+              }
+              if (typeof rv.lane === 'number' && rv.lane !== driveMerged.lane) {
+                driveMerged = { ...driveMerged, lane: rv.lane };
+                driveChanged = true;
+              }
+              if (rv.turnIntent !== undefined && rv.turnIntent !== driveMerged.turnIntent) {
+                driveMerged = { ...driveMerged, turnIntent: rv.turnIntent };
+                driveChanged = true;
+              }
+              if (rv.parkingStopUntil == null && driveMerged.parkingStopUntil != null) {
+                driveMerged = { ...driveMerged };
+                delete driveMerged.parkingStopUntil;
+                driveChanged = true;
+              }
+              if (driveChanged) {
+                merged = driveMerged;
+                localChanged = true;
+              }
+            }
+
+            if (localChanged) {
               next[id] = merged;
               changed = true;
             }
@@ -7004,7 +9552,8 @@ export default function App() {
     const newIds = [];
     
     for(let i=0; i<count; i++) {
-        const id = Math.random().toString(36).substring(2, 11);
+        // Service (and all) vehicle ids start with type: bus-, cab-, fire-, police-, amb-, tow-, …
+        const id = makeVehicleId(type);
         newIds.push(id);
         const serviceMeta = isService ? SERVICE_VEHICLE_META[type as ServiceVehicleType] : null;
         const randomColor = serviceMeta
@@ -7112,6 +9661,13 @@ export default function App() {
         if (attr === 'isMoving' && newState && next.homeKey) {
           next.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
         }
+        // Manual override: random turns / U-turn-at-dead-end stay off
+        if (
+          (attr === 'randomTurning' || attr === 'turnAroundAtDeadEnd') &&
+          next.manualOverride
+        ) {
+          next[attr] = false;
+        }
         updatedVehicles[id] = next;
         anyUpdates = true;
       }
@@ -7169,11 +9725,27 @@ export default function App() {
 
   const clearSelectedDestinations = (targetIds: Iterable<string> = selectedVehicles) => {
     const ids = Array.from(targetIds);
-    const updatedVehicles = { ...vehicles };
+    // Use live map so we don't clobber concurrent sim state
+    const updatedVehicles = { ...vehiclesRef.current };
     let anyUpdates = false;
+    const now = Date.now();
     ids.forEach(id => {
-      if (updatedVehicles[id]?.destination) {
-        updatedVehicles[id] = { ...updatedVehicles[id], destination: null };
+      const v = updatedVehicles[id];
+      if (!v) return;
+      if (v.destination || v.turnIntent) {
+        const next: Vehicle = {
+          ...v,
+          destination: null,
+          turnIntent: null,
+        };
+        // Destination may have blocked home AI while nextHomeReturnAt expired.
+        // Defer home re-route so clearing dest never instantly assigns home.
+        if (next.homeKey && !next.manualOverride) {
+          next.nextHomeReturnAt = now + randomHomeTourDelayMs();
+        } else if (next.manualOverride) {
+          delete next.nextHomeReturnAt;
+        }
+        updatedVehicles[id] = next;
         anyUpdates = true;
       }
     });
@@ -7185,7 +9757,11 @@ export default function App() {
     }
   };
 
-  const activateDrivePanel = useCallback((vehicleId: string, opts?: { keepHomeAssign?: boolean }) => {
+  const activateDrivePanel = useCallback((vehicleId: string, opts?: {
+    keepHomeAssign?: boolean;
+    /** When true, leave place-on-map mode alone (MapPin / place car) */
+    keepPlacing?: boolean;
+  }) => {
     drivePanelZRef.current += 1;
     const z = drivePanelZRef.current;
     setDrivePanels(prev =>
@@ -7194,7 +9770,10 @@ export default function App() {
     setActiveDrivePanelId(vehicleId);
     setSelectedVehicles(new Set([vehicleId]));
     setPendingRouteVehicleId(prev => (prev && prev !== vehicleId ? null : prev));
-    setIsPlacingVehicles(false);
+    // Do not cancel place-car mode unless explicitly leaving it
+    if (!opts?.keepPlacing) {
+      setIsPlacingVehicles(false);
+    }
     // Keep house-assign mode when the Assign house button intentionally toggles it
     if (!opts?.keepHomeAssign) {
       setPendingHomeAssign(false);
@@ -7293,6 +9872,9 @@ export default function App() {
   }, [showCarsPanel, showSemiTrailerPanel, showTrainPanel, showServicePanel]);
 
   const handleVehicleSelect = useCallback((vehicleId: string, e: React.MouseEvent) => {
+    // While place-car mode is active, let the grid click handler place selected
+    // vehicles on this tile instead of stealing the click for selection.
+    if (isPlacingVehicles) return;
     e.stopPropagation();
     if (e.detail === 2) {
       // Double-click: open / focus drive panel for this vehicle
@@ -7321,7 +9903,7 @@ export default function App() {
         return prev;
       });
     }
-  }, [spawnDrivePanels, scrollVehicleListItemIntoView]);
+  }, [spawnDrivePanels, scrollVehicleListItemIntoView, isPlacingVehicles]);
 
   const toggleBuildingProduction = useCallback((anchorKey: string) => {
     setEconomy(prev => {
@@ -7342,17 +9924,23 @@ export default function App() {
   const toggleDestinationMode = (targetIds: Iterable<string> = selectedVehicles) => {
     const ids = Array.from(targetIds);
     if (ids.length === 0) return;
-    const haveDestination = ids.some(id => vehicles[id]?.destination);
+    const live = vehiclesRef.current;
+    // Manual override: destination routing fully disabled (no set, clear is safe/no re-route)
+    const routableIds = ids.filter(id => !live[id]?.manualOverride);
+    const haveDestination = ids.some(id => live[id]?.destination);
+    // Turning dest mode/button off: cancel pick mode and clear routes without instant home reassign
     if (pendingRouteVehicleId || haveDestination) {
       setPendingRouteVehicleId(null);
       clearSelectedDestinations(ids);
       return;
     }
+    // All targets are under manual override — do not enter pick mode
+    if (routableIds.length === 0) return;
     setIsPlacingVehicles(false);
     setPendingHomeAssign(false);
     setPendingEmployeeAssign(false);
     setPendingPersonFormPick(null);
-    setPendingRouteVehicleId(ids[0]);
+    setPendingRouteVehicleId(routableIds[0]);
   };
 
   const toggleHomeAssignMode = (targetIds: Iterable<string> = selectedVehicles) => {
@@ -7415,13 +10003,8 @@ export default function App() {
     });
     if (ids.length === 0) return;
 
-    const homeKeys: string[] = [];
     const g = gridRef.current || grid;
-    Object.entries(g).forEach(([key, tiles]) => {
-      if (tiles?.some(t => t.type === 'building-home')) {
-        homeKeys.push(key);
-      }
-    });
+    const homeKeys = listHomeKeys(g);
     if (homeKeys.length === 0) return;
 
     // Shuffle a pool of homes; reuse shuffled list if more cars than houses
@@ -7431,25 +10014,31 @@ export default function App() {
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
 
-    const updatedVehicles = { ...live };
     const now = Date.now();
-    ids.forEach((id, index) => {
-      const v = updatedVehicles[id];
-      if (!v) return;
-      const homeKey =
+    const assignments = ids.map((id, index) => ({
+      vehicleId: id,
+      homeKey:
         index < shuffled.length
           ? shuffled[index]
-          : homeKeys[Math.floor(Math.random() * homeKeys.length)];
-      updatedVehicles[id] = {
-        ...v,
-        homeKey,
-        nextHomeReturnAt: now + randomHomeTourDelayMs(),
-      };
-    });
+          : homeKeys[Math.floor(Math.random() * homeKeys.length)],
+      nextHomeReturnAt: now + randomHomeTourDelayMs(),
+    }));
 
-    setVehicles(updatedVehicles);
+    const eco = localEconomyRef.current || economy;
+    const result = assignHomesWithDrivers(
+      live,
+      eco.people || {},
+      eco.families || {},
+      assignments,
+      now,
+    );
+
+    setVehicles(result.vehicles);
+    const nextEco = { ...eco, people: result.people, families: result.families };
+    setEconomy(nextEco);
     if (roomCode) {
-      socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+      socket.emit('update-vehicles', { roomCode, vehicles: result.vehicles });
+      socket.emit('update-economy', { roomCode, economy: nextEco });
     }
     setPendingHomeAssign(false);
   };
@@ -7700,10 +10289,19 @@ export default function App() {
         ...v,
         manualOverride: true,
         manualOverrideByUid: myUid,
+        // Manual drive: no autonomous turning AI or destination routing
+        randomTurning: false,
+        turnAroundAtDeadEnd: false,
+        destination: null,
+        turnIntent: null,
       };
       delete nextVeh.trafficStopUntil;
       delete nextVeh.trafficStopReason;
       delete nextVeh.nextHomeReturnAt;
+      // Cancel parking dwell so F/B/G respond immediately
+      delete nextVeh.parkingStopUntil;
+      // Cancel in-progress "click to set destination" for this vehicle
+      setPendingRouteVehicleId(prev => (prev === vehicleId ? null : prev));
       const updatedVehicles = stampManualOverrideFlags(
         normalizeVehicles({ ...base, [vehicleId]: nextVeh })
       );
@@ -7750,24 +10348,31 @@ export default function App() {
     if (lastTimeRef.current !== 0) {
       const deltaTime = time - lastTimeRef.current;
       
+      let pendingPeopleUpdate: Record<string, Person> | null = null;
+
       setVehicles(prev => {
         let hasChanges = false;
         const nextVehicles = { ...prev };
 
         for (const [uid, v] of Object.entries(prev)) {
-          const vehicle = v as Vehicle;
+          let vehicle = v as Vehicle;
           const manualOverride = !!vehicle.manualOverride;
+          const underUserControl =
+            manualOverride || drivePanelIdsRef.current.has(vehicle.id);
           const peopleMap = localEconomyRef.current.people || {};
           const hasPeopleSim = Object.keys(peopleMap).length > 0;
-          // When people sim is active, vehicles need a driver to move
-          // Manual override: user may drive without a sim driver
-          // Robotaxis: never require a person driver
-          if (hasPeopleSim && !manualOverride) {
+          // When people sim is active, autonomous vehicles need a driver to move.
+          // Manual override OR an open drive panel: user may run Go without a person driver.
+          // Robotaxis and buses on an active route: never require a person driver.
+          if (hasPeopleSim && !underUserControl) {
             const isRobotaxi = vehicle.type === 'taxi';
-            const driverId = isRobotaxi
-              ? undefined
-              : vehicle.driverId || getDriverId(peopleMap, vehicle.id);
-            if (!driverId && !isRobotaxi) {
+            const isRoutedBus =
+              vehicle.type === 'bus' && !!vehicle.busRoute && vehicle.busRoute.length > 0;
+            const driverId =
+              isRobotaxi || isRoutedBus
+                ? undefined
+                : vehicle.driverId || getDriverId(peopleMap, vehicle.id);
+            if (!driverId && !isRobotaxi && !isRoutedBus) {
               if (vehicle.isMoving) {
                 nextVehicles[uid] = { ...vehicle, isMoving: false, driverId: undefined };
                 hasChanges = true;
@@ -7790,18 +10395,87 @@ export default function App() {
             }
           }
 
+          // Clear any stale destination under manual override; never route to it.
+          // Do not continue — stepForward/stepBackward/isMoving must still process this frame.
+          if (manualOverride && vehicle.destination) {
+            vehicle = {
+              ...vehicle,
+              destination: null,
+              turnIntent: null,
+            };
+            hasChanges = true;
+          }
+
           if (vehicle.destination && vehicle.x === vehicle.destination.x && vehicle.y === vehicle.destination.y) {
+            // Bus route service: board/alight at stops, refuel at station after 5 loops
+            if (
+              vehicle.type === 'bus' &&
+              vehicle.busRoute &&
+              vehicle.busRoute.length > 0 &&
+              !manualOverride
+            ) {
+              const peopleMapLive = pendingPeopleUpdate || localEconomyRef.current.people || {};
+              const result = processBusArrival(vehicle, peopleMapLive, currentGrid, Date.now());
+              nextVehicles[uid] = result.vehicle;
+              pendingPeopleUpdate = result.people;
+              localEconomyRef.current = {
+                ...localEconomyRef.current,
+                people: result.people,
+              };
+              hasChanges = true;
+              continue;
+            }
             const arrivalPatch = getDestinationArrivalPatch(vehicle, vehicle.x, vehicle.y);
             nextVehicles[uid] = { ...vehicle, ...arrivalPatch };
             hasChanges = true;
             continue;
           }
 
+          // Bus AI: route progression, boarding dwell, refuel countdown
+          if (
+            vehicle.type === 'bus' &&
+            vehicle.busRoute &&
+            vehicle.busRoute.length > 0 &&
+            !manualOverride
+          ) {
+            const peopleMapLive = localEconomyRef.current.people || {};
+            const adv = advanceBusService(
+              vehicle,
+              peopleMapLive,
+              currentGrid,
+              deltaTime,
+              Date.now(),
+            );
+            if (adv.handled) {
+              // Still need kinematics if moving toward destination
+              vehicle = adv.vehicle;
+              nextVehicles[uid] = vehicle;
+              hasChanges = true;
+              if (
+                vehicle.busPhase === 'boarding' ||
+                vehicle.busPhase === 'refueling' ||
+                !vehicle.isMoving
+              ) {
+                continue;
+              }
+              // Fall through to movement with updated destination
+            }
+          }
+
           if (vehicle.parkingStopUntil) {
-            if (Date.now() >= vehicle.parkingStopUntil) {
+            // F/B step or user Go (manual / drive panel) cancels parking dwell immediately
+            const userDriveIntent =
+              !!vehicle.stepForward ||
+              !!vehicle.stepBackward ||
+              (!!underUserControl && !!vehicle.isMoving);
+            if (userDriveIntent) {
+              vehicle = { ...vehicle };
+              delete vehicle.parkingStopUntil;
+              hasChanges = true;
+            } else if (Date.now() >= vehicle.parkingStopUntil) {
               const newVehicle = { ...vehicle };
               delete newVehicle.parkingStopUntil;
-              if (manualOverride) {
+              if (underUserControl) {
                 // Stay stopped — user must press Go
                 newVehicle.isMoving = false;
               } else {
@@ -7813,22 +10487,27 @@ export default function App() {
               }
               nextVehicles[uid] = newVehicle;
               hasChanges = true;
+              continue;
+            } else {
+              continue;
             }
-            continue;
           }
 
           // Cars with an assigned home occasionally set destination back home.
-          // Skip under manual override or while the floating drive panel is open.
+          // Never under manual override, drive panel, or while a route destination is active.
           const vTypeForHome = vehicle.type || 'car';
           const isCarLike =
             vTypeForHome === 'car' || isServiceVehicleType(vTypeForHome);
-          const underManualDrive = manualOverride || drivePanelIdsRef.current.has(vehicle.id);
+          const underManualDrive = underUserControl;
+          // Buses with a route manage their own destinations — skip home AI
           if (
             isCarLike &&
+            vTypeForHome !== 'bus' &&
             vehicle.homeKey &&
             !vehicle.destination &&
             vehicle.isMoving !== false &&
-            !underManualDrive
+            !underManualDrive &&
+            !manualOverride
           ) {
             const now = Date.now();
             if (!vehicle.nextHomeReturnAt) {
@@ -7915,6 +10594,20 @@ export default function App() {
           }
 
           if (!vehicle.isMoving && !vehicle.stepForward && !vehicle.stepBackward) {
+            // Pedestrian yield: resume when roadway is clear (always, even with drive panel)
+            if (vehicle.trafficStopReason === 'pedestrian' && vType !== 'train' && !manualOverride) {
+              const peopleMap = localEconomyRef.current?.people;
+              if (
+                !peopleMap ||
+                !shouldYieldToPedestrians(vehicle, peopleMap, currentGrid)
+              ) {
+                const resumed = { ...vehicle, isMoving: true };
+                delete resumed.trafficStopReason;
+                nextVehicles[uid] = resumed;
+                hasChanges = true;
+                continue;
+              }
+            }
             // Stoplight resume always applies (emergency+lights may proceed via shouldStopForLight)
             if (vehicle.trafficStopReason === 'stoplight' && vType !== 'train') {
               const tiles = currentGrid[`${vehicle.x},${vehicle.y}`];
@@ -7963,6 +10656,11 @@ export default function App() {
 
           let { x, y, heading, lane, progress, zIndex, turnIntent } = vehicle;
           const emergencyMode = isEmergencyMode(vehicle);
+          // Manual override: no autonomous random turns, U-turn-at-dead-end, or destination routing
+          const allowRandomTurning = !manualOverride && !!vehicle.randomTurning;
+          const allowUTurnAtDeadEnd = !manualOverride && vehicle.turnAroundAtDeadEnd !== false;
+          const activeDestination =
+            !manualOverride && vehicle.destination ? vehicle.destination : null;
           
           let newParkingStopUntil = vehicle.parkingStopUntil;
           let newLastParkingKey = vehicle.lastParkingKey;
@@ -7997,22 +10695,83 @@ export default function App() {
               lane = homeLane;
             }
           }
-          // Working snapshot with any emergency lane change applied
-          const activeVehicle: Vehicle = lane !== vehicle.lane ? { ...vehicle, lane } : vehicle;
+          // Buses: always legal right-hand traffic lanes; approach stops on bay curb.
+          if (vehicle.type === 'bus' && currentTile && !manualOverride) {
+            const destIsHere =
+              !!activeDestination &&
+              activeDestination.x === x &&
+              activeDestination.y === y;
+            const onStop = isBusStopTileType(currentTile.type);
+            const destStop = activeDestination
+              ? getBusStopTileAt(currentGrid, activeDestination.x, activeDestination.y)
+              : onStop
+                ? currentTile
+                : undefined;
+            const is4 = currentTile.type.includes('4lane');
+            const onRoad =
+              currentTile.type.startsWith('road') ||
+              currentTile.type === 'rail-road-crossing';
+
+            if (onStop) {
+              const approachH = getBusStopApproachHeading(currentTile);
+              const servicingHere =
+                destIsHere ||
+                vehicle.busPhase === 'boarding' ||
+                (vehicle.busRoute || []).some(k => k === currentTileKey);
+
+              if (servicingHere) {
+                // Snap to approach heading so bay is on the right (legal traffic side)
+                if (headingDiffDeg(heading, approachH) > 45) {
+                  // Wrong way on stop: reverse to approach (legal direction for bay curb)
+                  heading = approachH;
+                }
+                lane = getBusStopBayLane(currentTile, heading);
+              } else if (onRoad) {
+                // Passing through stop tile without servicing — still legal lane
+                lane = getLegalTrafficLane(is4, false);
+              }
+            } else if (onRoad) {
+              // En route: always positive (right-hand) lane; outer when heading to a stop
+              const preferOuter =
+                !!destStop &&
+                headingDiffDeg(
+                  heading,
+                  getBusStopApproachHeading(destStop),
+                ) <= 50;
+              const legal = getLegalTrafficLane(is4, preferOuter);
+              if (lane < 0 || Math.abs(lane - legal) > 0.01) {
+                // Never stay wrong-way; snap to legal traffic side
+                lane = legal;
+              }
+            }
+          }
+
+          // Working snapshot with any emergency / bus lane change applied
+          const activeVehicle: Vehicle = lane !== vehicle.lane || heading !== vehicle.heading
+            ? { ...vehicle, lane, heading }
+            : vehicle;
           
           const onBuildingBay = isBuildingParkingBay(currentTile);
           const onHome = isHouseTile(currentTile);
-          const isOwnerHome = onHome && vehicle.homeKey === currentTileKey;
-          // Auto-park is system behavior. Under manual override, only park when the user
-          // requested it via parkOnNextLot (panel Park button).
+          // Multi-tile apartments use the anchor as homeKey; match any cell of that building
+          const homeLotId = onHome
+            ? resolveHomeKeyFromTile(currentTile, currentTileKey)
+            : null;
+          const isOwnerHome = !!onHome && !!vehicle.homeKey && vehicle.homeKey === homeLotId;
+          // Auto-park is system/AI behavior only. With a drive panel open or manual
+          // override, only park when the user pressed Park (parkOnNextLot) — otherwise
+          // Go would freeze after a second or two when rolling over a lot/home/bay.
+          // Buses on a route never auto-park mid-service.
+          const busOnService =
+            vehicle.type === 'bus' && !!vehicle.busRoute && vehicle.busRoute.length > 0;
           const mayAutoPark =
-            !manualOverride || !!vehicle.parkOnNextLot;
+            (!underUserControl && !busOnService) || !!vehicle.parkOnNextLot;
           if (
             mayAutoPark &&
             currentTile &&
             (currentTile.type.startsWith('parking-') ||
               onBuildingBay ||
-              (!manualOverride && isOwnerHome) ||
+              (!underUserControl && isOwnerHome) ||
               (onHome && vehicle.parkOnNextLot))
           ) {
             const parkingLotId = currentTile.part === 'member' ? currentTile.anchorKey : currentTileKey;
@@ -8065,10 +10824,34 @@ export default function App() {
             continue;
           }
 
+          // Pedestrians always have right-of-way (including robotaxis / emergency).
+          // User manual override can still force through if they choose to keep moving.
+          if (
+            !manualOverride &&
+            vType !== 'train' &&
+            (activeVehicle.isMoving || activeVehicle.stepForward)
+          ) {
+            const peopleMap = localEconomyRef.current?.people;
+            if (peopleMap && shouldYieldToPedestrians(activeVehicle, peopleMap, currentGrid)) {
+              nextVehicles[uid] = {
+                ...activeVehicle,
+                isMoving: false,
+                trafficStopReason: 'pedestrian',
+              };
+              hasChanges = true;
+              continue;
+            }
+          }
+
           // Stoplights / stop signs: apply to all road vehicles including robotaxis.
           // Only emergency vehicles with lights on may run red/yellow.
-          // Stop signs remain skipped under manual override (user drives).
-          if (vType !== 'train' && currentTile && isRoadTile(currentTile.type)) {
+          // User control (manual override or open drive panel): skip automated traffic holds.
+          if (
+            !underUserControl &&
+            vType !== 'train' &&
+            currentTile &&
+            isRoadTile(currentTile.type)
+          ) {
             if (shouldStopForLight(activeVehicle, trafficState)) {
               nextVehicles[uid] = {
                 ...activeVehicle,
@@ -8078,18 +10861,16 @@ export default function App() {
               hasChanges = true;
               continue;
             }
-            if (!manualOverride) {
-              const signStop = shouldStopForSign(activeVehicle, currentTile, trafficState, nextVehicles, currentGrid);
-              if (signStop.stop) {
-                nextVehicles[uid] = {
-                  ...activeVehicle,
-                  isMoving: false,
-                  trafficStopUntil: signStop.minUntil,
-                  trafficStopReason: 'stop-sign',
-                };
-                hasChanges = true;
-                continue;
-              }
+            const signStop = shouldStopForSign(activeVehicle, currentTile, trafficState, nextVehicles, currentGrid);
+            if (signStop.stop) {
+              nextVehicles[uid] = {
+                ...activeVehicle,
+                isMoving: false,
+                trafficStopUntil: signStop.minUntil,
+                trafficStopReason: 'stop-sign',
+              };
+              hasChanges = true;
+              continue;
             }
           }
 
@@ -8110,8 +10891,10 @@ export default function App() {
           if (step > 0 && (activeVehicle.isMoving || activeVehicle.stepForward)) {
             newProgress = findMaxSafeProgress(activeVehicle, newProgress, nextVehicles, currentGrid);
 
-            // Never jump over a red/yellow stop line (robotaxis and all non-emergency)
+            // Never jump over a red/yellow stop line (robotaxis and all non-emergency).
+            // User control: drive through lights under the player's own control.
             if (
+              !underUserControl &&
               !emergencyMode &&
               vType !== 'train' &&
               currentTile &&
@@ -8137,7 +10920,7 @@ export default function App() {
 
             // Stop-sign approach: do not skip past the hold line in one frame
             if (
-              !manualOverride &&
+              !underUserControl &&
               !emergencyMode &&
               vType !== 'train' &&
               currentTile &&
@@ -8165,9 +10948,9 @@ export default function App() {
             }
 
             // Emergency mode never gets stuck behind traffic (collision free-pass)
-            // Under manual override: clamp progress only — don't flip isMoving (user keeps Go intent)
+            // Under user control: clamp progress only — don't flip isMoving (user keeps Go intent)
             if (activeVehicle.isMoving && newProgress <= progress + 1e-6) {
-              if (emergencyMode || manualOverride) {
+              if (emergencyMode || underUserControl) {
                 nextVehicles[uid] = { ...activeVehicle, progress };
                 hasChanges = true;
                 continue;
@@ -8239,8 +11022,15 @@ export default function App() {
                   const leftPort = (entryPort + 1) % 4;
                   const rightPort = (entryPort + 3) % 4;
 
-                  if (vehicle.destination) {
-                    const recExit = getRecommendedExit(x, y, heading, vehicle.destination, (vehicle.type || 'car') as any, currentGrid);
+                  if (activeDestination) {
+                    const recExit = getRecommendedExit(
+                      x,
+                      y,
+                      heading,
+                      activeDestination,
+                      (vehicle.type || 'car') as any,
+                      currentGrid,
+                    );
                     if (recExit !== null) {
                       exitPort = Math.round(recExit / 90) % 4;
                     } else if (turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
@@ -8307,7 +11097,14 @@ export default function App() {
                   // Robotaxi entering a road: snap travel heading onto a legal road axis
                   // so stoplights/stop signs (matched by heading) actually apply.
                   let enterHeading = exitHeading;
-                  let enterLane = vehicle.type === 'train' ? 0 : isNext4Lane ? lane : 1;
+                  let enterLane =
+                    vehicle.type === 'train'
+                      ? 0
+                      : vehicle.type === 'bus'
+                        ? getLegalTrafficLane(isNext4Lane, false)
+                        : isNext4Lane
+                          ? lane
+                          : 1;
                   if (robotaxiOntoRoad && nextPorts.length > 0) {
                     let bestPort = nextPorts[0];
                     let bestScore = -Infinity;
@@ -8315,9 +11112,9 @@ export default function App() {
                       const h = p * 90;
                       // Prefer continuing in the exit direction / toward destination
                       let score = Math.cos(((h - exitHeading) * Math.PI) / 180);
-                      if (vehicle.destination) {
-                        const tdx = vehicle.destination.x - nextX;
-                        const tdy = vehicle.destination.y - nextY;
+                      if (activeDestination) {
+                        const tdx = activeDestination.x - nextX;
+                        const tdy = activeDestination.y - nextY;
                         const fx = h === 90 ? 1 : h === 270 ? -1 : 0;
                         const fy = h === 180 ? 1 : h === 0 ? -1 : 0;
                         score += tdx * fx + tdy * fy;
@@ -8330,18 +11127,61 @@ export default function App() {
                     enterHeading = bestPort * 90;
                     enterLane = isNext4Lane ? (enterLane < 0 ? -1 : 1) : 1;
                   }
+
+                  // Bus: legal traffic lane always; approach heading + bay curb at stops
+                  if (vehicle.type === 'bus' && !manualOverride) {
+                    const destIsNext =
+                      !!activeDestination &&
+                      activeDestination.x === nextX &&
+                      activeDestination.y === nextY;
+                    const stopOnRoute = (vehicle.busRoute || []).some(
+                      k => k === `${nextX},${nextY}`,
+                    );
+                    if (isBusStopTileType(nextTile.type) && (destIsNext || stopOnRoute)) {
+                      const approachH = getBusStopApproachHeading(nextTile);
+                      const approachPort = ((approachH / 90) % 4 + 4) % 4;
+                      // Enter traveling the approach heading when the road allows
+                      // (entry from opposite side of approach port)
+                      const entryNeeded = (approachPort + 2) % 4;
+                      if (nextPorts.includes(approachPort)) {
+                        if (nextEntryPort === entryNeeded || destIsNext) {
+                          enterHeading = approachH;
+                        } else if (headingDiffDeg(enterHeading, approachH) > 90) {
+                          // Prefer approach if current enter is opposite
+                          enterHeading = approachH;
+                        }
+                      }
+                      enterLane = getBusStopBayLane(nextTile, enterHeading);
+                    } else if (nextTile.type.startsWith('road')) {
+                      // Always right-hand traffic lane on normal roads
+                      const destStop = activeDestination
+                        ? getBusStopTileAt(
+                            currentGrid,
+                            activeDestination.x,
+                            activeDestination.y,
+                          )
+                        : undefined;
+                      const preferOuter =
+                        !!destStop &&
+                        headingDiffDeg(
+                          enterHeading,
+                          getBusStopApproachHeading(destStop),
+                        ) <= 50;
+                      enterLane = getLegalTrafficLane(isNext4Lane, preferOuter);
+                    }
+                  }
                   
                   // Force vehicles strictly forward on rail crossings without turning
                   if (nextTile.type === 'rail-road-crossing') {
                      const isEnteringRailAxis = (nextEntryPort % 2 === (nextTile.rotation / 90) % 2);
                      if (vehicle.type === 'train' && !isEnteringRailAxis) {
                          // Turn around if Train entering road axis
-                         newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                         newVehicleState = allowUTurnAtDeadEnd ? { 
                            ...vehicle, heading: (exitHeading + 180) % 360, progress: 0, isMoving: true 
                          } : { ...vehicle, progress: 0.99, isMoving: false };
                      } else if (vehicle.type !== 'train' && isEnteringRailAxis) {
                          // Turn around if Car entering rail axis
-                         newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                         newVehicleState = allowUTurnAtDeadEnd ? { 
                            ...vehicle, heading: (exitHeading + 180) % 360, progress: 0, isMoving: true 
                          } : { ...vehicle, progress: 0.99, isMoving: false };
                      } else {
@@ -8367,14 +11207,14 @@ export default function App() {
                       heading: enterHeading,
                       progress: progress - 1,
                       zIndex: nextIsBridge ? 1 : 0,
-                      turnIntent: activeVehicle.destination
+                      turnIntent: activeDestination
                         ? null
-                        : (activeVehicle.randomTurning
+                        : (allowRandomTurning
                             ? (['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any)
                             : null),
-                      // Robotaxi snaps to legal road heading/lane; emergency may keep pass lane
+                      // Robotaxi / bus snap to legal heading/lane; emergency may keep pass lane
                       lane:
-                        vehicle.type === 'taxi'
+                        vehicle.type === 'taxi' || vehicle.type === 'bus'
                           ? enterLane
                           : activeVehicle.type === 'train'
                             ? 0
@@ -8388,7 +11228,7 @@ export default function App() {
                   }
                   } else {
                     // Turn around at dead end (not connected port)
-                    newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                    newVehicleState = allowUTurnAtDeadEnd ? { 
                       ...vehicle, 
                       heading: (exitHeading + 180) % 360, 
                       progress: 0, 
@@ -8397,7 +11237,7 @@ export default function App() {
                   }
                 } else {
                   // Turn around if no matching tile
-                  newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+                  newVehicleState = allowUTurnAtDeadEnd ? { 
                     ...vehicle, 
                     heading: (exitHeading + 180) % 360, 
                     progress: 0, 
@@ -8406,7 +11246,7 @@ export default function App() {
                 }
               } else {
               // Turn around if no next tile in grid
-              newVehicleState = vehicle.turnAroundAtDeadEnd !== false ? { 
+              newVehicleState = allowUTurnAtDeadEnd ? { 
                 ...vehicle, 
                 heading: (exitHeading + 180) % 360, 
                 progress: 0, 
@@ -8423,6 +11263,18 @@ export default function App() {
 
         return hasChanges ? nextVehicles : prev;
       });
+
+      if (pendingPeopleUpdate) {
+        const nextEco = { ...localEconomyRef.current, people: pendingPeopleUpdate };
+        localEconomyRef.current = nextEco;
+        setEconomy(nextEco);
+        if (roomCodeRef.current) {
+          socket.emit('update-economy', {
+            roomCode: roomCodeRef.current,
+            economy: nextEco,
+          });
+        }
+      }
     }
     lastTimeRef.current = time;
     requestRef.current = requestAnimationFrame(updateVehicleLoop);
@@ -8452,11 +11304,15 @@ export default function App() {
       const eco = localEconomyRef.current;
       if (!eco || eco.peoplePaused) return;
       if (!eco.people || Object.keys(eco.people).length === 0) return;
+      const realNow = Date.now();
+      const simNow = getSimNow(eco, realNow);
       const { economy: nextEco, vehicles: nextVs } = tickPeopleSimulation(
         eco,
         vehiclesRef.current,
         gridRef.current,
-        Date.now(),
+        simNow,
+        localTrafficRef.current,
+        { realNow },
       );
       setEconomy(nextEco);
       setVehicles(nextVs);
@@ -8467,6 +11323,38 @@ export default function App() {
     }, 2000);
     return () => clearInterval(iv);
   }, [roomCode, isSimLeader, setEconomy, setVehicles]);
+
+  // Smooth sidewalk walking (~4 steps/sec) so person icons animate between AI ticks
+  useEffect(() => {
+    if (!roomCode || !isSimLeader) return;
+    const iv = setInterval(() => {
+      const eco = localEconomyRef.current;
+      if (!eco || eco.peoplePaused || !eco.people) return;
+      const simNow = getSimNow(eco, Date.now());
+      let changed = false;
+      const peopleMap = eco.people as Record<string, Person>;
+      const nextPeople: Record<string, Person> = { ...peopleMap };
+      for (const [id, p] of Object.entries(peopleMap)) {
+        if (p.location.kind !== 'walking' && p.activity !== 'walking') continue;
+        const walked = advanceWalkingPerson(
+          p,
+          gridRef.current,
+          localTrafficRef.current,
+          simNow,
+          0.22,
+        );
+        if (walked !== p) {
+          nextPeople[id] = walked;
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      const nextEco = { ...eco, people: nextPeople };
+      setEconomy(nextEco);
+      if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+    }, 250);
+    return () => clearInterval(iv);
+  }, [roomCode, isSimLeader, setEconomy]);
 
   // Burning tree animation frame + removal after 30s
   useEffect(() => {
@@ -8967,97 +11855,126 @@ export default function App() {
             }
           }
 
-          let anyUpdated = false;
-          const updatedVehicles = { ...vehicles };
+          // Merge onto vehiclesRef so step flags aren't applied to a stale React snapshot
+          // (sim loop writes the ref every frame; state can lag one render).
+          setVehicles(prev => {
+            const base =
+              vehiclesRef.current && Object.keys(vehiclesRef.current).length > 0
+                ? vehiclesRef.current
+                : prev;
+            let anyUpdated = false;
+            const updatedVehicles = { ...base };
 
-          for (const id of controlIds) {
-            const myVehicle = updatedVehicles[id];
-            if (!myVehicle) continue;
-            let updated = false;
-            let newVehicle = { ...myVehicle };
+            for (const id of controlIds) {
+              const myVehicle = updatedVehicles[id];
+              if (!myVehicle) continue;
+              let updated = false;
+              let newVehicle = { ...myVehicle };
 
-            if (key === 'g') {
-              newVehicle.isMoving = !newVehicle.isMoving;
-              // Manual Go: don't let home-tour AI instantly assign a destination
-              if (newVehicle.isMoving && newVehicle.homeKey) {
-                newVehicle.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
-              }
-              updated = true;
-            } else if (key === 's') {
-              if (newVehicle.isMoving !== false) {
+              if (key === 'g') {
+                newVehicle.isMoving = !newVehicle.isMoving;
+                // Manual Go: don't let home-tour AI instantly assign a destination
+                if (newVehicle.isMoving && newVehicle.homeKey) {
+                  newVehicle.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+                }
+                // Cancel parking so Go isn't swallowed by dwell timer
+                if (newVehicle.isMoving && newVehicle.parkingStopUntil) {
+                  delete newVehicle.parkingStopUntil;
+                }
+                updated = true;
+              } else if (key === 's') {
+                if (newVehicle.isMoving !== false) {
+                  newVehicle.isMoving = false;
+                  updated = true;
+                }
+              } else if (key === 'f') {
                 newVehicle.isMoving = false;
+                newVehicle.stepForward = true;
+                newVehicle.stepBackward = false;
+                if (newVehicle.parkingStopUntil) delete newVehicle.parkingStopUntil;
+                if (newVehicle.trafficStopReason === 'stoplight') {
+                  delete newVehicle.trafficStopReason;
+                }
                 updated = true;
-              }
-            } else if (key === 'f') {
-              newVehicle.isMoving = false;
-              newVehicle.stepForward = true;
-              updated = true;
-            } else if (key === 'b') {
-              newVehicle.isMoving = false;
-              newVehicle.stepBackward = true;
-              updated = true;
-            } else if (e.key === 'ArrowUp') {
-              const newSpeed = Math.min((newVehicle.speed || 1) + 0.5, 5);
-              if (newVehicle.speed !== newSpeed) {
-                newVehicle.speed = newSpeed;
+              } else if (key === 'b') {
+                newVehicle.isMoving = false;
+                newVehicle.stepBackward = true;
+                newVehicle.stepForward = false;
+                if (newVehicle.parkingStopUntil) delete newVehicle.parkingStopUntil;
+                if (newVehicle.trafficStopReason === 'stoplight') {
+                  delete newVehicle.trafficStopReason;
+                }
                 updated = true;
-              }
-            } else if (e.key === 'ArrowDown') {
-              const newSpeed = Math.max((newVehicle.speed || 1) - 0.5, 0.5);
-              if (newVehicle.speed !== newSpeed) {
-                newVehicle.speed = newSpeed;
-                updated = true;
-              }
-            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
-              if ((newVehicle.type || 'car') === 'train') continue;
+              } else if (e.key === 'ArrowUp') {
+                const newSpeed = Math.min((newVehicle.speed || 1) + 0.5, 5);
+                if (newVehicle.speed !== newSpeed) {
+                  newVehicle.speed = newSpeed;
+                  updated = true;
+                }
+              } else if (e.key === 'ArrowDown') {
+                const newSpeed = Math.max((newVehicle.speed || 1) - 0.5, 0.5);
+                if (newVehicle.speed !== newSpeed) {
+                  newVehicle.speed = newSpeed;
+                  updated = true;
+                }
+              } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                if ((newVehicle.type || 'car') === 'train') continue;
 
-              const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
-              const currentTile = currentTiles?.find(t => {
-                const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
-                return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
+                const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
+                const currentTile = currentTiles?.find(t => {
+                  const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
+                  return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
+                });
+
+                if (!currentTile?.type.startsWith('road')) continue;
+
+                const is4Lane = currentTile.type.includes('4lane');
+                const nextLane = e.key === 'ArrowRight'
+                  ? shiftLaneRight(newVehicle.lane, is4Lane)
+                  : shiftLaneLeft(newVehicle.lane, is4Lane);
+                if (nextLane !== null && nextLane !== newVehicle.lane) {
+                  newVehicle.lane = nextLane;
+                  updated = true;
+                }
+              } else if (key === 'l' || key === 'r') {
+                if ((newVehicle.type || 'car') === 'train') continue;
+
+                const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
+                const currentTile = currentTiles?.find(t => {
+                  const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
+                  return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
+                });
+
+                if (!currentTile?.type.startsWith('road')) continue;
+                if (!isIntersectionTile(currentTile.type)) continue;
+
+                const intent = key === 'r' ? 'right' : 'left';
+                if (newVehicle.turnIntent !== intent) {
+                  newVehicle.turnIntent = intent;
+                  updated = true;
+                }
+              }
+
+              if (updated) {
+                updatedVehicles[id] = newVehicle;
+                anyUpdated = true;
+              }
+            }
+
+            if (!anyUpdated) return prev;
+
+            if (roomCodeRef.current) {
+              // Emit after commit; use updated map from this updater
+              queueMicrotask(() => {
+                const latest = vehiclesRef.current;
+                socket.emit('update-vehicles', {
+                  roomCode: roomCodeRef.current,
+                  vehicles: latest,
+                });
               });
-
-              if (!currentTile?.type.startsWith('road')) continue;
-
-              const is4Lane = currentTile.type.includes('4lane');
-              const nextLane = e.key === 'ArrowRight'
-                ? shiftLaneRight(newVehicle.lane, is4Lane)
-                : shiftLaneLeft(newVehicle.lane, is4Lane);
-              if (nextLane !== null && nextLane !== newVehicle.lane) {
-                newVehicle.lane = nextLane;
-                updated = true;
-              }
-            } else if (key === 'l' || key === 'r') {
-              if ((newVehicle.type || 'car') === 'train') continue;
-
-              const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
-              const currentTile = currentTiles?.find(t => {
-                const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
-                return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
-              });
-
-              if (!currentTile?.type.startsWith('road')) continue;
-              if (!isIntersectionTile(currentTile.type)) continue;
-
-              const intent = key === 'r' ? 'right' : 'left';
-              if (newVehicle.turnIntent !== intent) {
-                newVehicle.turnIntent = intent;
-                updated = true;
-              }
             }
-
-            if (updated) {
-              updatedVehicles[id] = newVehicle;
-              anyUpdated = true;
-            }
-          }
-
-          if (anyUpdated) {
-            setVehicles(updatedVehicles);
-            if (roomCode) {
-              socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
-            }
-          }
+            return updatedVehicles;
+          });
           return;
         }
       }
@@ -9100,6 +12017,10 @@ export default function App() {
         setPendingEmployeeAssign(false);
         setPendingPersonFormPick(null);
         setPendingRouteVehicleId(null);
+        setPendingBusRouteVehicleId(null);
+        setPendingBusRouteStationKey(null);
+        setIsPlacingVehicles(false);
+        setIsPlacingPeople(false);
         setInspectHomeKey(null);
       }
     };
@@ -9311,6 +12232,278 @@ export default function App() {
     };
   }, [clipboard]);
 
+  /**
+   * Place selected people on a map cell (or create a new person if none selected).
+   * Roads → sidewalk curb nearest the click.
+   */
+  const placePeopleAt = useCallback(
+    (gridX: number, gridY: number, worldX: number, worldY: number): boolean => {
+      if (!isPlacingPeople || !roomCode) return false;
+      const g = gridRef.current;
+      const key = `${gridX},${gridY}`;
+      // Allow empty grass cells by treating as outdoor even if no tile
+      const hasCell = !!g[key]?.length;
+      const localX = worldX - gridX * GRID_SIZE;
+      const localY = worldY - gridY * GRID_SIZE;
+      const relX = localX / GRID_SIZE;
+      const relY = localY / GRID_SIZE;
+      const now = getSimNow(localEconomyRef.current, Date.now());
+      let people = { ...(localEconomyRef.current.people || {}) };
+      let families = { ...(localEconomyRef.current.families || {}) };
+      const ids =
+        selectedPersonIds.size > 0
+          ? Array.from(selectedPersonIds)
+          : [];
+
+      // No selection → create a new person at this spot
+      if (ids.length === 0) {
+        const top = g[key]?.[g[key].length - 1];
+        let homeKey = listHomeKeys(g)[0] || '';
+        if (top && isResidentialHomeType(top.type)) {
+          homeKey = resolveHomeKeyFromTile(top, key);
+        } else if (!homeKey) {
+          // No homes yet — use this cell as a synthetic home address
+          homeKey = key;
+        }
+        const sex = Math.random() < 0.5 ? 'm' : 'f';
+        const person = createPerson({
+          firstName: randomFirstName(sex as 'm' | 'f'),
+          lastName: randomLastName(),
+          sex: sex as 'm' | 'f',
+          ageYears: 22 + Math.floor(Math.random() * 40),
+          homeKey,
+          money: 40 + Math.floor(Math.random() * 80),
+          now,
+          placeAtWorkplaceIfNew: false,
+        });
+        person.location = locationForMapPlacement(gridX, gridY, g, {
+          relX,
+          relY,
+          stackIndex: 0,
+        });
+        person.activity =
+          person.location.kind === 'home' ? 'home' : 'idle';
+        person.activityUntil = now + 8000;
+        // Family bookkeeping
+        const existingFam = Object.values(families).find(
+          f => f.homeKey === homeKey && f.lastName === person.lastName,
+        );
+        if (existingFam) {
+          person.familyId = existingFam.id;
+          families[existingFam.id] = {
+            ...existingFam,
+            memberIds: [...existingFam.memberIds, person.id],
+          };
+        } else {
+          families[person.familyId] = {
+            id: person.familyId,
+            lastName: person.lastName,
+            homeKey,
+            memberIds: [person.id],
+          };
+        }
+        people[person.id] = person;
+        const nextEco = { ...localEconomyRef.current, people, families };
+        setEconomy(nextEco);
+        setVehicles(vs => {
+          const next = { ...vs };
+          Object.keys(next).forEach(vid => {
+            next[vid] = syncVehicleOccupancy(next[vid], people);
+          });
+          return next;
+        });
+        setSelectedPersonIds(new Set([person.id]));
+        if (roomCode) {
+          socket.emit('update-economy', { roomCode, economy: nextEco });
+        }
+        return true;
+      }
+
+      // Place each selected person, fanning out on the same curb
+      let stack = 0;
+      for (const pid of ids) {
+        const p = people[pid];
+        if (!p) continue;
+        // Alight if currently in a vehicle
+        if (p.location.kind === 'vehicle') {
+          people = alightPerson(
+            people,
+            pid,
+            { kind: 'tile', x: gridX, y: gridY },
+            'idle',
+            now + 5000,
+          );
+        }
+        const cur = people[pid];
+        if (!cur) continue;
+        const loc = locationForMapPlacement(gridX, gridY, g, {
+          relX,
+          relY,
+          stackIndex: stack,
+        });
+        people[pid] = {
+          ...cur,
+          location: loc,
+          activity: loc.kind === 'home' ? 'home' : 'idle',
+          activityUntil: now + 8000,
+          travelIntent: undefined,
+          taxiRideId: undefined,
+          busDropoffStop: undefined,
+        };
+        stack += 1;
+      }
+
+      const nextEco = { ...localEconomyRef.current, people, families };
+      setEconomy(nextEco);
+      let nextVehicles = { ...vehiclesRef.current };
+      Object.keys(nextVehicles).forEach(vid => {
+        nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+      });
+      setVehicles(nextVehicles);
+      if (roomCode) {
+        socket.emit('update-economy', { roomCode, economy: nextEco });
+        socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+      }
+      return true;
+    },
+    [isPlacingPeople, roomCode, selectedPersonIds, setEconomy, setVehicles],
+  );
+
+  /** Teleport selected vehicles onto a grid cell (place-car / MapPin mode). */
+  const placeSelectedVehiclesAt = useCallback((
+    gridX: number,
+    gridY: number,
+    worldX: number,
+    worldY: number,
+  ): boolean => {
+    if (!isPlacingVehicles || selectedVehicles.size === 0) return false;
+    if (!hasTile(gridX, gridY)) return false;
+
+    const localX = worldX - gridX * GRID_SIZE;
+    const localY = worldY - gridY * GRID_SIZE;
+    const existingTiles = getTile(gridX, gridY)!;
+    const targetTile = existingTiles[existingTiles.length - 1];
+    if (!targetTile) return false;
+
+    // Only place on roads / rails / parking / homes / bays that match vehicle class
+    const tileType = targetTile.type;
+    const isRoad = tileType.startsWith('road') || tileType === 'rail-road-crossing';
+    const isRail = tileType.startsWith('rail');
+    const isParking = tileType.startsWith('parking-');
+    const isHome = isResidentialHomeType(tileType);
+    const isBay = isBuildingParkingBay(targetTile);
+
+    let zIndex = 0;
+    if (tileType.includes('bridge') || tileType.includes('trestle')) {
+      zIndex = 1;
+    }
+
+    let lane = 1;
+    let heading = targetTile.rotation;
+    const relX = localX / GRID_SIZE;
+    const relY = localY / GRID_SIZE;
+    const is4Lane = tileType.includes('4lane');
+    const isOneWay = tileType.includes('oneway');
+
+    if (isRail) {
+      lane = 0;
+      if (targetTile.rotation === 0 || targetTile.rotation === 180) {
+        heading = relY > 0.5 ? 0 : 180;
+      } else {
+        heading = relX < 0.5 ? 90 : 270;
+      }
+    } else if (isOneWay) {
+      heading = targetTile.rotation;
+      if (heading === 0 || heading === 180) {
+        lane = relX > 0.5 ? 1 : -1;
+        if (heading === 180) lane = -lane;
+      } else {
+        lane = relY > 0.5 ? -1 : 1;
+        if (heading === 270) lane = -lane;
+      }
+    } else if (isRoad) {
+      if (targetTile.rotation === 0 || targetTile.rotation === 180 || tileType.includes('cross')) {
+        if (relX > 0.5) {
+          heading = 0;
+          lane = is4Lane ? (relX > 0.75 ? 2.5 : 1) : 1;
+        } else {
+          heading = 180;
+          lane = is4Lane ? (relX < 0.25 ? 2.5 : 1) : 1;
+        }
+      } else {
+        if (relY > 0.5) {
+          heading = 90;
+          lane = is4Lane ? (relY > 0.75 ? 2.5 : 1) : 1;
+        } else {
+          heading = 270;
+          lane = is4Lane ? (relY < 0.25 ? 2.5 : 1) : 1;
+        }
+      }
+    } else {
+      // Parking / home / bay: keep heading from vehicle or default northbound
+      heading = 0;
+      lane = 1;
+    }
+
+    const live = vehiclesRef.current;
+    const updatedVehicles = { ...live };
+    let anyPlaced = false;
+
+    selectedVehicles.forEach(id => {
+      const v = updatedVehicles[id];
+      if (!v) return;
+      const vType = v.type || 'car';
+      // Validate tile class vs vehicle
+      if (vType === 'train') {
+        if (!isRail && tileType !== 'rail-road-crossing' && !isBay) return;
+      } else if (vType === 'semi') {
+        if (!isRoad && !isParking && !isBay && tileType !== 'rail-road-crossing') return;
+      } else {
+        // cars / service
+        if (!isRoad && !isParking && !isHome && !isBay && tileType !== 'rail-road-crossing') return;
+      }
+
+      const placeLane = vType === 'train' ? 0 : lane;
+      const placed: Vehicle = {
+        ...v,
+        x: gridX,
+        y: gridY,
+        heading: vType === 'train' && isRail ? heading : (isRoad || isRail ? heading : (v.heading || 0)),
+        lane: placeLane,
+        progress: 0.5,
+        zIndex,
+        placeSeq: (v.placeSeq || 0) + 1,
+        // Stay put after place
+        isMoving: false,
+        destination: null,
+        turnIntent: null,
+        stepForward: false,
+        stepBackward: false,
+        parkOnNextLot: false,
+      };
+      delete placed.parkingStopUntil;
+      delete placed.trafficStopUntil;
+      delete placed.trafficStopReason;
+      if (placed.homeKey && !placed.manualOverride) {
+        placed.nextHomeReturnAt = Date.now() + randomHomeTourDelayMs();
+      } else if (placed.manualOverride) {
+        delete placed.nextHomeReturnAt;
+      }
+      updatedVehicles[id] = placed;
+      anyPlaced = true;
+    });
+
+    if (!anyPlaced) return false;
+
+    setVehicles(updatedVehicles);
+    if (roomCode) {
+      lastSyncedVehicles.current = updatedVehicles;
+      socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+    }
+    // Stay in place mode so multiple cars can be positioned; user toggles MapPin off
+    return true;
+  }, [isPlacingVehicles, selectedVehicles, roomCode, getTile, hasTile]);
+
   const handleGridClick = (e: React.MouseEvent) => {
     if (isFromGridControl(e) || isPanning || isSelecting || didDragPointerRef.current) return;
 
@@ -9331,6 +12524,23 @@ export default function App() {
     const localY = worldY - gridY * GRID_SIZE;
     const relX = localX / GRID_SIZE;
     const relY = localY / GRID_SIZE;
+
+    // Place people mode — sidewalk on roads, outdoor elsewhere
+    if (isPlacingPeople) {
+      if (placePeopleAt(gridX, gridY, worldX, worldY)) {
+        return;
+      }
+      return;
+    }
+
+    // Place-car mode takes priority over traffic light taps / house inspectors
+    if (isPlacingVehicles && selectedVehicles.size > 0) {
+      if (placeSelectedVehiclesAt(gridX, gridY, worldX, worldY)) {
+        return;
+      }
+      // Invalid tile for selected vehicles — keep place mode active
+      return;
+    }
 
     // Traffic control placement / interaction
     if (hasTile(gridX, gridY)) {
@@ -9466,25 +12676,24 @@ export default function App() {
       return;
     }
 
-    // Person create/edit form: pick home (house) or workplace (building) by map click
+    // Person create/edit form: pick home (house/apartment) or workplace (building) by map click
     if (pendingPersonFormPick && peopleFormMode !== 'closed' && hasTile(gridX, gridY)) {
       const tiles = getTile(gridX, gridY) || [];
       if (pendingPersonFormPick === 'home') {
-        const house = tiles.find(t => t.type === 'building-home');
+        const house = tiles.find(t => isResidentialHomeType(t.type));
         if (house) {
-          const homeKey =
-            house.part === 'member' ? (house.anchorKey || key) : key;
+          const homeKey = resolveHomeKeyFromTile(house, key);
           setPeopleForm(f => ({ ...f, homeKey }));
           setPendingPersonFormPick(null);
           setShowPeoplePanel(true);
           return;
         }
-        // Keep pick mode active until a house is clicked
+        // Keep pick mode active until a house/apartment is clicked
         return;
       }
       if (pendingPersonFormPick === 'workplace') {
         const building = tiles.find(
-          t => t.type.startsWith('building-') && t.type !== 'building-home',
+          t => t.type.startsWith('building-') && !isResidentialHomeType(t.type),
         );
         if (building) {
           const workplaceKey =
@@ -9528,6 +12737,7 @@ export default function App() {
           nextEco.people || {},
           selectedPersonIds,
           workplaceKey,
+          { now: Date.now() },
         );
         nextEco = { ...nextEco, people };
         setEconomy(nextEco);
@@ -9540,32 +12750,42 @@ export default function App() {
       return;
     }
 
-    // Assign selected cars to a house as their owner home
+    // Assign selected cars to a house/apartment as their owner home (+ adult driver)
     if (pendingHomeAssign && selectedVehicles.size > 0 && hasTile(gridX, gridY)) {
       const tiles = getTile(gridX, gridY) || [];
-      const house = tiles.find(t => t.type === 'building-home');
+      const house = tiles.find(t => isResidentialHomeType(t.type));
       if (house) {
-        const homeKey = `${gridX},${gridY}`;
-        // Use live vehicle map so house assign never drops sim state
-        const updatedVehicles = { ...vehiclesRef.current };
-        let anyAssigned = false;
+        const homeKey = resolveHomeKeyFromTile(house, key);
+        const live = vehiclesRef.current;
+        const now = Date.now();
+        const assignments: Array<{ vehicleId: string; homeKey: string; nextHomeReturnAt: number }> = [];
         selectedVehicles.forEach(id => {
-          const v = updatedVehicles[id];
+          const v = live[id];
           if (!v) return;
           const vType = v.type || 'car';
           // Homes are for cars (and service vehicles); not trains/semis
           if (vType === 'train' || vType === 'semi') return;
-          updatedVehicles[id] = {
-            ...v,
+          assignments.push({
+            vehicleId: id,
             homeKey,
-            nextHomeReturnAt: Date.now() + randomHomeTourDelayMs(),
-          };
-          anyAssigned = true;
+            nextHomeReturnAt: now + randomHomeTourDelayMs(),
+          });
         });
-        if (anyAssigned) {
-          setVehicles(updatedVehicles);
+        if (assignments.length > 0) {
+          const eco = localEconomyRef.current || economy;
+          const result = assignHomesWithDrivers(
+            live,
+            eco.people || {},
+            eco.families || {},
+            assignments,
+            now,
+          );
+          setVehicles(result.vehicles);
+          const nextEco = { ...eco, people: result.people, families: result.families };
+          setEconomy(nextEco);
           if (roomCode) {
-            socket.emit('update-vehicles', { roomCode, vehicles: updatedVehicles });
+            socket.emit('update-vehicles', { roomCode, vehicles: result.vehicles });
+            socket.emit('update-economy', { roomCode, economy: nextEco });
           }
         }
         setPendingHomeAssign(false);
@@ -9575,15 +12795,94 @@ export default function App() {
       return;
     }
 
+    // Bus station route editing: click bus-stop tiles to append to the station route
+    if (pendingBusRouteStationKey && hasTile(gridX, gridY)) {
+      const tiles = getTile(gridX, gridY) || [];
+      const top = tiles[tiles.length - 1];
+      if (top && isBusStopTileType(top.type)) {
+        const stopKey = key;
+        const eco = localEconomyRef.current || economy;
+        const bcfg = eco.buildings[pendingBusRouteStationKey];
+        if (bcfg && bcfg.role === 'bus-station') {
+          const route = [...(bcfg.busRoute || [])];
+          if (route[route.length - 1] !== stopKey) {
+            route.push(stopKey);
+          }
+          const nextEco = {
+            ...eco,
+            buildings: {
+              ...eco.buildings,
+              [pendingBusRouteStationKey]: {
+                ...bcfg,
+                busRoute: route,
+                busFleetIds: bcfg.busFleetIds || [],
+              },
+            },
+          };
+          setEconomy(nextEco);
+          if (roomCode) {
+            socket.emit('update-economy', { roomCode, economy: nextEco });
+          }
+        }
+        return;
+      }
+      // Ignore non-stop clicks while editing (keep mode active)
+      return;
+    }
+
+    // Bus route editing (per-vehicle, service panel): click bus-stop tiles
+    if (pendingBusRouteVehicleId && hasTile(gridX, gridY)) {
+      const tiles = getTile(gridX, gridY) || [];
+      const top = tiles[tiles.length - 1];
+      if (top && isBusStopTileType(top.type)) {
+        const stopKey = key;
+        const live = vehiclesRef.current;
+        const bus = live[pendingBusRouteVehicleId];
+        if (bus && bus.type === 'bus') {
+          const route = [...(bus.busRoute || [])];
+          // Toggle: if last stop is this key, ignore duplicate consecutive; allow multi-visit otherwise
+          if (route[route.length - 1] !== stopKey) {
+            route.push(stopKey);
+          }
+          const station =
+            bus.busStationKey ||
+            findNearestBusStationKey({ x: bus.x, y: bus.y }, gridRef.current || grid);
+          const first = parseGridKey(route[0]);
+          const updated: Vehicle = {
+            ...bus,
+            busRoute: route,
+            busRouteIndex: bus.busRouteIndex ?? 0,
+            busRouteLoops: bus.busRouteLoops ?? 0,
+            busPhase: bus.busPhase || 'route',
+            busStationKey: station || bus.busStationKey,
+            destination: bus.destination || first,
+            isMoving: bus.isMoving || !!first,
+            randomTurning: false,
+          };
+          const nextVs = { ...live, [pendingBusRouteVehicleId]: updated };
+          setVehicles(nextVs);
+          if (roomCode) {
+            socket.emit('update-vehicles', { roomCode, vehicles: nextVs });
+          }
+        }
+        return;
+      }
+      // Click non-stop while editing — keep mode active
+      return;
+    }
+
     // Destination assignment — highest priority (works even with palette tile selected)
     if (pendingRouteVehicleId && selectedVehicles.size > 0 && hasTile(gridX, gridY)) {
       const currentGrid = gridRef.current || grid;
       const updatedVehicles = { ...vehicles };
       let anyAssigned = false;
 
+      const now = Date.now();
       selectedVehicles.forEach(id => {
         const v = updatedVehicles[id];
         if (!v) return;
+        // Manual override: ignore destination assignment
+        if (v.manualOverride) return;
         const vType = v.type || 'car';
         const dest = resolveDestinationPoint(gridX, gridY, currentGrid, vType);
         if (!dest) return;
@@ -9593,6 +12892,10 @@ export default function App() {
           isMoving: true,
           turnIntent: null,
           randomTurning: false,
+          // Keep home-tour timer fresh so it doesn't fire the moment dest is cleared
+          ...(v.homeKey
+            ? { nextHomeReturnAt: now + randomHomeTourDelayMs() }
+            : {}),
         };
         anyAssigned = true;
       });
@@ -9626,89 +12929,12 @@ export default function App() {
     }
 
     if (!selectedTile) {
-      // Handle placing selected vehicles if mode is active
-      if (isPlacingVehicles && selectedVehicles.size > 0 && hasTile(gridX, gridY)) {
-        const localX = worldX - gridX * GRID_SIZE;
-        const localY = worldY - gridY * GRID_SIZE;
-        const existingTiles = getTile(gridX, gridY)!;
-        const targetTile = existingTiles[existingTiles.length - 1];
-        
-        let zIndex = 0;
-        if (targetTile.type.includes('bridge') || targetTile.type.includes('trestle')) {
-          zIndex = 1;
-        }
-
-        let lane = 1;
-        let heading = targetTile.rotation;
-        
-        const relX = localX / GRID_SIZE;
-        const relY = localY / GRID_SIZE;
-        
-        const is4Lane = targetTile.type.includes('4lane');
-        const isOneWay = targetTile.type.includes('oneway');
-        const isRail = targetTile.type.startsWith('rail');
-
-        if (isRail) {
-          lane = 0;
-          if (targetTile.rotation === 0 || targetTile.rotation === 180) {
-            heading = relY > 0.5 ? 0 : 180;
-          } else {
-            heading = relX < 0.5 ? 90 : 270;
-          }
-        } else if (isOneWay) {
-          heading = targetTile.rotation;
-          if (heading === 0 || heading === 180) {
-            lane = relX > 0.5 ? 1 : -1;
-            if (heading === 180) lane = -lane;
-          } else {
-            lane = relY > 0.5 ? -1 : 1;
-            if (heading === 270) lane = -lane;
-          }
-        } else {
-          if (targetTile.rotation === 0 || targetTile.rotation === 180 || targetTile.type.includes('cross')) {
-            if (relX > 0.5) {
-              heading = 0;
-              lane = is4Lane ? (relX > 0.75 ? 2.5 : 1) : 1;
-            } else {
-              heading = 180;
-              lane = is4Lane ? (relX < 0.25 ? 2.5 : 1) : 1;
-            }
-          } else {
-            if (relY > 0.5) {
-              heading = 90;
-              lane = is4Lane ? (relY > 0.75 ? 2.5 : 1) : 1;
-            } else {
-              heading = 270;
-              lane = is4Lane ? (relY < 0.25 ? 2.5 : 1) : 1;
-            }
-          }
-        }
-
-        const updatedVehicles = { ...vehicles };
-        selectedVehicles.forEach(id => {
-          if (updatedVehicles[id]) {
-            updatedVehicles[id] = {
-              ...updatedVehicles[id],
-              x: gridX,
-              y: gridY,
-              heading,
-              lane,
-              progress: 0.5,
-              zIndex
-            };
-          }
-        });
-
-        setVehicles(updatedVehicles);
-        return;
-      }
-
-      // Click house → open people / family details
-      if (!selectedTile && hasTile(gridX, gridY)) {
+      // Click house/apartment → open people / family details
+      if (hasTile(gridX, gridY)) {
         const tilesHere = getTile(gridX, gridY)!;
         const top = tilesHere[tilesHere.length - 1];
-        if (top.type === 'building-home') {
-          setInspectHomeKey(key);
+        if (isResidentialHomeType(top.type)) {
+          setInspectHomeKey(resolveHomeKeyFromTile(top, key));
           setInspectBuildingKey(null);
           return;
         }
@@ -9745,7 +12971,7 @@ export default function App() {
           topTile.type === 'building-large-park' || topTile.type === 'building-warehouse-large' ||
           topTile.type === 'building-factory-large' || topTile.type === 'building-train-station-large' ||
           topTile.type === 'building-repair-shop' || topTile.type === 'building-hospital' ||
-          topTile.type === 'building-taxi-station';
+          topTile.type === 'building-taxi-station' || topTile.type === 'building-bus-station';
         if (isMulti) {
           const anchorKey = topTile.part === 'member' ? topTile.anchorKey : key;
           if (anchorKey) {
@@ -9785,7 +13011,7 @@ export default function App() {
         selectedTile === 'building-large-park' || selectedTile === 'building-warehouse-large' ||
         selectedTile === 'building-factory-large' || selectedTile === 'building-train-station-large' ||
         selectedTile === 'building-repair-shop' || selectedTile === 'building-hospital' ||
-        selectedTile === 'building-taxi-station';
+        selectedTile === 'building-taxi-station' || selectedTile === 'building-bus-station';
       if (isMultiTile) {
         const { w, h } = getMultiTileDimensions(selectedTile);
         const cells = getMultiTileCells(selectedTile, rotation);
@@ -10525,23 +13751,101 @@ export default function App() {
     setPeopleFormMode('create');
   };
 
+  const spawnPersonPanel = useCallback((personId: string) => {
+    if (!economy.people?.[personId] && !localEconomyRef.current.people?.[personId]) return;
+    personPanelZRef.current += 1;
+    const z = personPanelZRef.current;
+    setPersonPanels(prev => {
+      const existing = prev.find(p => p.personId === personId);
+      if (existing) {
+        return prev.map(p =>
+          p.personId === personId ? { ...p, zIndex: z } : p,
+        );
+      }
+      const n = prev.length;
+      return [
+        ...prev,
+        {
+          personId,
+          x: 56 + (n % 5) * 32,
+          y: 96 + (n % 5) * 28,
+          zIndex: z,
+        },
+      ];
+    });
+    setActivePersonPanelId(personId);
+  }, [economy.people]);
+
+  const closePersonPanel = useCallback((personId: string) => {
+    setPersonPanels(prev => prev.filter(p => p.personId !== personId));
+    setActivePersonPanelId(prev => (prev === personId ? null : prev));
+  }, []);
+
+  const movePersonPanel = useCallback((personId: string, pos: Point) => {
+    setPersonPanels(prev =>
+      prev.map(p => (p.personId === personId ? { ...p, x: pos.x, y: pos.y } : p)),
+    );
+  }, []);
+
+  const activatePersonPanel = useCallback((personId: string) => {
+    personPanelZRef.current += 1;
+    const z = personPanelZRef.current;
+    setPersonPanels(prev =>
+      prev.map(p => (p.personId === personId ? { ...p, zIndex: z } : p)),
+    );
+    setActivePersonPanelId(personId);
+    setSelectedPersonIds(new Set([personId]));
+  }, []);
+
+  /** Select a person on the map + People panel (blue highlight / list row) + control panel. */
+  const selectPerson = useCallback(
+    (personId: string, opts?: { openEdit?: boolean; openPanel?: boolean; openControl?: boolean }) => {
+      const p = economy.people?.[personId];
+      if (!p) return;
+      setSelectedPersonIds(new Set([personId]));
+      if (opts?.openPanel !== false) setShowPeoplePanel(true);
+      if (opts?.openControl !== false) spawnPersonPanel(personId);
+      if (opts?.openEdit) {
+        setPendingPersonFormPick(null);
+        setPeopleForm({
+          firstName: p.firstName,
+          lastName: p.lastName,
+          sex: p.sex,
+          ageYears: Math.floor(p.ageYears),
+          homeKey: p.homeKey,
+          workplaceKey: p.workplaceKey || '',
+          money: p.money ?? 0,
+          health: p.health,
+        });
+        setPeopleFormMode('edit');
+      }
+      // Scroll list row into view after panel paints
+      requestAnimationFrame(() => {
+        const el = document.querySelector(`[data-person-row="${personId}"]`);
+        if (el && 'scrollIntoView' in el) {
+          (el as HTMLElement).scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+      });
+    },
+    [economy.people, spawnPersonPanel],
+  );
+
+  // Drop person panels when person is deleted
+  useEffect(() => {
+    const people = economy.people || {};
+    setPersonPanels(prev => {
+      const next = prev.filter(p => !!people[p.personId]);
+      return next.length === prev.length ? prev : next;
+    });
+    if (activePersonPanelId && !people[activePersonPanelId]) {
+      setActivePersonPanelId(null);
+    }
+  }, [economy.people, activePersonPanelId]);
+
   const openEditPersonForm = (personId?: string) => {
     const id = personId || Array.from(selectedPersonIds)[0];
-    const p = id ? economy.people?.[id] : undefined;
-    if (!p) return;
-    setSelectedPersonIds(new Set([p.id]));
-    setPendingPersonFormPick(null);
-    setPeopleForm({
-      firstName: p.firstName,
-      lastName: p.lastName,
-      sex: p.sex,
-      ageYears: Math.floor(p.ageYears),
-      homeKey: p.homeKey,
-      workplaceKey: p.workplaceKey || '',
-      money: p.money ?? 0,
-      health: p.health,
-    });
-    setPeopleFormMode('edit');
+    if (!id) return;
+    selectPerson(id, { openEdit: true, openPanel: true });
   };
 
   const startPersonFormMapPick = (field: 'home' | 'workplace') => {
@@ -10591,28 +13895,64 @@ export default function App() {
           memberIds: [person.id],
         };
       }
+      // Auto schedule for new citizens (user can regenerate / override later)
+      if (!person.schedule?.length) {
+        person.schedule = generatePersonSchedule(person, {
+          stores: listStoreKeys(gridRef.current, economy.buildings || {}),
+        });
+        person.scheduleMode = 'auto';
+      }
       people[person.id] = person;
       setSelectedPersonIds(new Set([person.id]));
     } else if (peopleFormMode === 'edit') {
       const id = Array.from(selectedPersonIds)[0];
       const prev = id ? people[id] : undefined;
       if (!prev) return;
-      people[id] = {
+      const nextWorkplace = peopleForm.workplaceKey.trim() || undefined;
+      const homeKey = peopleForm.homeKey.trim() || prev.homeKey;
+      let nextPerson: Person = {
         ...prev,
         firstName: peopleForm.firstName.trim() || prev.firstName,
         lastName: peopleForm.lastName.trim() || prev.lastName,
         sex: peopleForm.sex,
         ageYears: Math.max(0, Math.min(100, peopleForm.ageYears)),
         ageUpdatedAt: now,
-        homeKey: peopleForm.homeKey.trim() || prev.homeKey,
-        workplaceKey: peopleForm.workplaceKey.trim() || undefined,
+        homeKey,
+        workplaceKey: nextWorkplace,
         money: peopleForm.money,
         health: peopleForm.health,
+        // Never teleport an existing person when home/workplace fields change
         location:
           prev.location.kind === 'home'
-            ? { kind: 'home', homeKey: peopleForm.homeKey.trim() || prev.homeKey }
+            ? { kind: 'home', homeKey }
             : prev.location,
       };
+      // New workplace assignment → queue commute from current location
+      if (nextWorkplace && nextWorkplace !== prev.workplaceKey) {
+        const alreadyThere =
+          prev.location.kind === 'building' && prev.location.buildingKey === nextWorkplace;
+        if (alreadyThere) {
+          nextPerson = {
+            ...nextPerson,
+            activity: 'working',
+            activityUntil: now + 45_000,
+            travelIntent: undefined,
+          };
+        } else {
+          nextPerson = {
+            ...nextPerson,
+            travelIntent: { purpose: 'work', destinationKey: nextWorkplace },
+            activity:
+              prev.location.kind === 'vehicle'
+                ? 'commuting'
+                : prev.activity === 'working'
+                  ? 'idle'
+                  : prev.activity || 'idle',
+            activityUntil: now,
+          };
+        }
+      }
+      people[id] = nextPerson;
     }
 
     const nextEco = { ...economy, people, families };
@@ -10711,6 +14051,145 @@ export default function App() {
     }
   };
 
+  /** Sync occupancy on all vehicles after people location changes. */
+  const applyPeopleVehicleSync = (
+    people: Record<string, Person>,
+    baseVehicles?: Record<string, Vehicle>,
+  ) => {
+    const live = baseVehicles || vehiclesRef.current;
+    const nextVehicles = { ...live };
+    Object.keys(nextVehicles).forEach(vid => {
+      nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+    });
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  /** Drive panel: assign / clear driver from existing people. */
+  const assignVehicleDriver = (vehicleId: string, personId: string | null) => {
+    const live = vehiclesRef.current;
+    const v = live[vehicleId];
+    if (!v || v.type === 'taxi') return;
+    let people = { ...(economy.people || {}) };
+    const now = Date.now();
+    const currentDriver = getDriverId(people, vehicleId);
+
+    if (!personId) {
+      if (!currentDriver) return;
+      const d = people[currentDriver];
+      if (d) {
+        people = alightPerson(
+          people,
+          currentDriver,
+          { kind: 'home', homeKey: d.homeKey },
+          'home',
+          now + 15_000,
+        );
+      }
+      applyPeopleVehicleSync(people);
+      return;
+    }
+
+    const person = people[personId];
+    if (!person) return;
+    // Free the seat if another driver is aboard
+    if (currentDriver && currentDriver !== personId) {
+      const d = people[currentDriver];
+      if (d) {
+        people = alightPerson(
+          people,
+          currentDriver,
+          { kind: 'home', homeKey: d.homeKey },
+          'home',
+          now + 15_000,
+        );
+      }
+    }
+    if (canBoardAsDriver(person, v, people)) return;
+    people = boardPerson(people, personId, vehicleId, 'driver');
+    applyPeopleVehicleSync(people);
+  };
+
+  /** Drive panel: board or remove a passenger. */
+  const assignVehiclePassenger = (vehicleId: string, personId: string, board: boolean) => {
+    const live = vehiclesRef.current;
+    const v = live[vehicleId];
+    if (!v) return;
+    let people = { ...(economy.people || {}) };
+    const person = people[personId];
+    if (!person) return;
+    const now = Date.now();
+
+    if (!board) {
+      // Only alight if they are currently a passenger on this vehicle
+      if (
+        person.location.kind === 'vehicle' &&
+        person.location.vehicleId === vehicleId &&
+        person.location.seat === 'passenger'
+      ) {
+        people = alightPerson(
+          people,
+          personId,
+          { kind: 'home', homeKey: person.homeKey },
+          'home',
+          now + 15_000,
+        );
+        applyPeopleVehicleSync(people);
+      }
+      return;
+    }
+
+    // If they are the driver of this vehicle, demote: alight then re-board as passenger
+    if (
+      person.location.kind === 'vehicle' &&
+      person.location.vehicleId === vehicleId &&
+      person.location.seat === 'driver'
+    ) {
+      people = alightPerson(
+        people,
+        personId,
+        { kind: 'home', homeKey: person.homeKey },
+        'idle',
+        now,
+      );
+    }
+    if (canBoardAsPassenger(person, v, people)) return;
+    people = boardPerson(people, personId, vehicleId, 'passenger');
+    applyPeopleVehicleSync(people);
+  };
+
+  /** Drive panel: set vehicle owner house from a person's homeKey. */
+  const assignVehicleOwnerFromPerson = (vehicleId: string, personId: string) => {
+    const live = vehiclesRef.current;
+    const v = live[vehicleId];
+    const person = economy.people?.[personId];
+    if (!v || !person?.homeKey) return;
+    const vType = v.type || 'car';
+    if (vType === 'train' || vType === 'semi') return;
+
+    const now = Date.now();
+    const eco = localEconomyRef.current || economy;
+    const result = assignHomesWithDrivers(
+      live,
+      eco.people || {},
+      eco.families || {},
+      [{ vehicleId, homeKey: person.homeKey, nextHomeReturnAt: now + randomHomeTourDelayMs() }],
+      now,
+    );
+    setVehicles(result.vehicles);
+    const nextEco = { ...eco, people: result.people, families: result.families };
+    setEconomy(nextEco);
+    if (roomCode) {
+      socket.emit('update-vehicles', { roomCode, vehicles: result.vehicles });
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+    }
+  };
+
   const alightSelectedPeople = (dest: 'home' | 'here') => {
     if (selectedPersonIds.size === 0) return;
     let people = { ...(economy.people || {}) };
@@ -10752,11 +14231,17 @@ export default function App() {
   const sendSelectedPeopleHome = () => {
     if (selectedPersonIds.size === 0) return;
     let people = { ...(economy.people || {}) };
-    const now = Date.now();
+    const now = getSimNow(economy, Date.now());
     for (const pid of selectedPersonIds) {
       const person = people[pid];
       if (!person) continue;
       people = alightPerson(people, pid, { kind: 'home', homeKey: person.homeKey }, 'home', now + 20_000);
+      people[pid] = {
+        ...people[pid],
+        travelIntent: { purpose: 'home', destinationKey: person.homeKey, transport: 'auto' },
+        activity: people[pid].location.kind === 'vehicle' ? 'commuting' : 'idle',
+        activityUntil: now,
+      };
     }
     let nextVehicles = { ...vehicles };
     Object.keys(nextVehicles).forEach(vid => {
@@ -10769,6 +14254,122 @@ export default function App() {
       socket.emit('update-economy', { roomCode, economy: nextEco });
       socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
     }
+  };
+
+  /** Queue a trip for one person (city AI picks walk/car/taxi next tick). */
+  const queuePersonTravel = (
+    personId: string,
+    purpose: 'work' | 'shop' | 'home' | 'care',
+    destinationKey: string,
+  ) => {
+    const people = { ...(economy.people || {}) };
+    const p = people[personId];
+    if (!p) return;
+    const now = getSimNow(economy, Date.now());
+    people[personId] = {
+      ...p,
+      travelIntent: { purpose, destinationKey, transport: 'auto' },
+      activity:
+        p.location.kind === 'vehicle'
+          ? purpose === 'care'
+            ? 'seeking_care'
+            : 'commuting'
+          : 'idle',
+      activityUntil: now,
+      taxiRideId: purpose === 'home' ? undefined : p.taxiRideId,
+    };
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+  };
+
+  const boardOnePerson = (personId: string, seat: 'driver' | 'passenger') => {
+    const vehicleId =
+      (activeDrivePanelId && vehiclesRef.current[activeDrivePanelId]
+        ? activeDrivePanelId
+        : null) ||
+      Array.from(selectedVehicles)[0] ||
+      null;
+    if (!vehicleId) return;
+    setSelectedPersonIds(new Set([personId]));
+    const live = vehiclesRef.current;
+    const v = live[vehicleId];
+    if (!v) return;
+    let people = { ...(economy.people || {}) };
+    const person = people[personId];
+    if (!person) return;
+    if (seat === 'driver') {
+      if (canBoardAsDriver(person, v, people)) return;
+    } else {
+      if (canBoardAsPassenger(person, v, people)) return;
+    }
+    people = boardPerson(people, personId, vehicleId, seat);
+    let nextVehicles = { ...live };
+    nextVehicles[vehicleId] = syncVehicleOccupancy(nextVehicles[vehicleId], people);
+    Object.keys(nextVehicles).forEach(vid => {
+      if (vid !== vehicleId) {
+        nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
+      }
+    });
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    setVehicles(nextVehicles);
+    if (roomCode) {
+      socket.emit('update-economy', { roomCode, economy: nextEco });
+      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+    }
+  };
+
+  const alightOnePerson = (personId: string) => {
+    const people = { ...(economy.people || {}) };
+    const p = people[personId];
+    if (!p || p.location.kind !== 'vehicle') return;
+    const now = getSimNow(economy, Date.now());
+    const v = vehiclesRef.current[p.location.vehicleId];
+    const loc =
+      v
+        ? ({ kind: 'tile' as const, x: Math.floor(v.x), y: Math.floor(v.y) })
+        : ({ kind: 'home' as const, homeKey: p.homeKey });
+    const nextPeople = alightPerson(people, personId, loc, 'idle', now + 15_000);
+    applyPeopleVehicleSync(nextPeople);
+  };
+
+  const enterBuildingOnePerson = (personId: string) => {
+    setSelectedPersonIds(new Set([personId]));
+    // Reuse batch helper after ensuring selection
+    let buildingKey = inspectBuildingKey;
+    if (!buildingKey && selectedVehicles.size > 0) {
+      const v = vehicles[Array.from(selectedVehicles)[0]];
+      if (v) {
+        const key = `${v.x},${v.y}`;
+        const tiles = gridRef.current[key];
+        const bld = tiles?.find(t => t.type.startsWith('building-'));
+        if (bld) buildingKey = bld.part === 'member' ? bld.anchorKey || key : key;
+      }
+    }
+    // Near person tile
+    if (!buildingKey) {
+      const p = economy.people?.[personId];
+      if (p) {
+        const place = getPersonMapPlacement(p, gridRef.current, vehiclesRef.current, 0);
+        const tx = Math.floor(place.x);
+        const ty = Math.floor(place.y);
+        for (const [dx, dy] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const key = `${tx + dx},${ty + dy}`;
+          const tiles = gridRef.current[key];
+          const bld = tiles?.find(t => t.type.startsWith('building-'));
+          if (bld) {
+            buildingKey = bld.part === 'member' ? bld.anchorKey || key : key;
+            break;
+          }
+        }
+      }
+    }
+    if (!buildingKey) return;
+    const now = getSimNow(economy, Date.now());
+    let people = { ...(economy.people || {}) };
+    people = alightPerson(people, personId, { kind: 'building', buildingKey }, 'idle', now + 20_000);
+    applyPeopleVehicleSync(people);
   };
 
   const enterSelectedBuildingWithPeople = () => {
@@ -11265,7 +14866,23 @@ export default function App() {
       {/* Main Viewport */}
       <div 
         ref={containerRef}
-        className={`flex-1 relative overflow-hidden cursor-${isPanning ? 'grabbing' : pendingRouteVehicleId || pendingHomeAssign || pendingFireStart || pendingEmployeeAssign || pendingPersonFormPick || trafficTool ? 'crosshair' : selectedTile ? 'crosshair' : 'grab'}`}
+        className={`flex-1 relative overflow-hidden cursor-${
+          isPanning
+            ? 'grabbing'
+            : isPlacingVehicles ||
+                isPlacingPeople ||
+                pendingRouteVehicleId ||
+                pendingBusRouteVehicleId ||
+                pendingBusRouteStationKey ||
+                pendingHomeAssign ||
+                pendingFireStart ||
+                pendingEmployeeAssign ||
+                pendingPersonFormPick ||
+                trafficTool ||
+                selectedTile
+              ? 'crosshair'
+              : 'grab'
+        }`}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
@@ -11290,34 +14907,56 @@ export default function App() {
             <PanelLeftOpen className="w-5 h-5" />
           </button>
         )}
+
+        {/* City system clock (HH:MM:SS AM/PM) — drives people schedules */}
+        <CityClockBar economy={economy} setEconomy={setEconomy} roomCode={roomCode} />
+
         {pendingRouteVehicleId && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-red-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-red-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
             Click a road tile to set destination
           </div>
         )}
         {pendingHomeAssign && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-rose-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
-            Click a Home tile to assign as owner house
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-rose-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click a house or apartment to assign as owner home
           </div>
         )}
         {pendingFireStart && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-orange-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-orange-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
             Click a tree to start a fire (burns 30s)
           </div>
         )}
         {pendingPersonFormPick === 'home' && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-rose-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
-            Click a house to set this person&apos;s home (Esc to cancel)
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-rose-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click a house or apartment to set this person&apos;s home (Esc to cancel)
           </div>
         )}
         {pendingPersonFormPick === 'workplace' && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-emerald-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-emerald-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
             Click a building to set this person&apos;s workplace (Esc to cancel)
           </div>
         )}
         {pendingEmployeeAssign && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-violet-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-violet-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
             Click a building to assign {selectedPersonIds.size} employee{selectedPersonIds.size === 1 ? '' : 's'} (Esc to cancel)
+          </div>
+        )}
+        {isPlacingPeople && (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-violet-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            {selectedPersonIds.size > 0
+              ? `Click map to place ${selectedPersonIds.size} person${selectedPersonIds.size === 1 ? '' : 's'} (roads → sidewalk) · Esc to cancel`
+              : 'Click map to drop a new person (roads → sidewalk) · Esc to cancel'}
+          </div>
+        )}
+        {pendingBusRouteStationKey && (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-blue-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click bus-stop tiles for station route (
+            {economy.buildings[pendingBusRouteStationKey]?.busRoute?.length || 0} stops) · Esc to finish
+          </div>
+        )}
+        {pendingBusRouteVehicleId && !pendingBusRouteStationKey && (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-blue-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
+            Click bus-stop tiles to build route ({vehicles[pendingBusRouteVehicleId]?.busRoute?.length || 0} stops) · Esc to finish
           </div>
         )}
         {/* Outside canvas backdrop */}
@@ -11400,25 +15039,33 @@ export default function App() {
                       stopSignScale={traffic.stopSignSizeScale}
                       stoplightScale={traffic.stoplightSizeScale}
                       selectedIds={selectedTrafficIds}
-                      onSignClick={!trafficTool ? (ctrl) => {
-                        if (ctrl.kind !== 'stop-sign') return;
-                        setSelectedTrafficIds(new Set([trafficControlKey(ctrl)]));
-                        setShowTrafficPanel(true);
-                      } : undefined}
-                      onLightClick={!trafficTool ? (ctrl) => {
-                        if (ctrl.kind !== 'stoplight') return;
-                        emitTraffic(prev => ({
-                          ...prev,
-                          controls: {
-                            ...prev.controls,
-                            [trafficControlKey(ctrl)]: {
-                              ...ctrl,
-                              phase: cycleLightPhase(ctrl.phase),
-                              phaseStartedAt: Date.now(),
-                            },
-                          },
-                        }));
-                      } : undefined}
+                      onSignClick={
+                        !trafficTool && !isPlacingVehicles
+                          ? (ctrl) => {
+                              if (ctrl.kind !== 'stop-sign') return;
+                              setSelectedTrafficIds(new Set([trafficControlKey(ctrl)]));
+                              setShowTrafficPanel(true);
+                            }
+                          : undefined
+                      }
+                      onLightClick={
+                        !trafficTool && !isPlacingVehicles
+                          ? (ctrl) => {
+                              if (ctrl.kind !== 'stoplight') return;
+                              emitTraffic(prev => ({
+                                ...prev,
+                                controls: {
+                                  ...prev.controls,
+                                  [trafficControlKey(ctrl)]: {
+                                    ...ctrl,
+                                    phase: cycleLightPhase(ctrl.phase),
+                                    phaseStartedAt: Date.now(),
+                                  },
+                                },
+                              }));
+                            }
+                          : undefined
+                      }
                     />
                   );
                 })()}
@@ -11448,12 +15095,14 @@ export default function App() {
             );
           })()}
 
-          {/* Home occupancy badges */}
+          {/* Home occupancy badges (houses + apartment anchors) */}
           {economy.showHomeBadges !== false &&
             Object.entries(grid).map(([homeKey, homeTiles]) => {
               if (!homeTiles?.length) return null;
               const top = homeTiles[homeTiles.length - 1];
-              if (top.type !== 'building-home') return null;
+              if (!isResidentialHomeType(top.type)) return null;
+              // Multi-tile apartments: badge only on the anchor cell
+              if (top.part === 'member') return null;
               const residents = peopleResidingAt(economy.people, homeKey);
               const atHome = peopleAtHome(economy.people || {}, homeKey);
               if (residents.length === 0 && atHome.length === 0) return null;
@@ -11471,6 +15120,57 @@ export default function App() {
                 </div>
               );
             })}
+
+          {/* Restroom-style person icons (standing outside homes/buildings, walking, waiting) */}
+          {economy.showPersonIcons !== false &&
+            economy.people &&
+            (() => {
+              // Stack index per anchor tile for fan-out
+              const stackCounts: Record<string, number> = {};
+              const placements: Array<{
+                person: Person;
+                gx: number;
+                gy: number;
+                crossing?: boolean;
+                waiting?: boolean;
+              }> = [];
+              const peopleMap = economy.people as Record<string, Person>;
+              for (const p of Object.values(peopleMap)) {
+                const tileKey =
+                  p.location.kind === 'home'
+                    ? p.location.homeKey
+                    : p.location.kind === 'building'
+                      ? p.location.buildingKey
+                      : p.location.kind === 'outdoor'
+                        ? p.location.atKey
+                        : p.location.kind === 'walking'
+                          ? `${Math.floor(p.location.x)},${Math.floor(p.location.y)}`
+                          : p.location.kind === 'tile'
+                            ? `${p.location.x},${p.location.y}`
+                            : p.id;
+                const stack = stackCounts[tileKey] || 0;
+                stackCounts[tileKey] = stack + 1;
+                const place = getPersonMapPlacement(p, grid, vehicles, stack);
+                if (!place.visible) continue;
+                placements.push({
+                  person: p,
+                  gx: place.x,
+                  gy: place.y,
+                  crossing: place.crossing,
+                  waiting: place.waiting,
+                });
+              }
+              return placements.map(pl => (
+                <PersonMapIcon
+                  key={`person-icon-${pl.person.id}`}
+                  placement={pl}
+                  selected={selectedPersonIds.has(pl.person.id)}
+                  onClick={() => {
+                    selectPerson(pl.person.id, { openEdit: true, openPanel: true });
+                  }}
+                />
+              ));
+            })()}
 
           {/* Seedling growth % badges */}
           {economy.showSeedlingBadges !== false &&
@@ -12554,7 +16254,7 @@ export default function App() {
                     <span>🏠</span> Assign owner house
                   </div>
                   <p className="text-[10px] text-slate-500">
-                    Set which Home tile owns the selected cars. Residents of that house are shown as owners on the drive panel. Cars tour town, then return home to park for 10s.
+                    Set which home (house or apartment) owns the selected cars. Residents of that home are shown as owners on the drive panel. Cars tour town, then return home to park for 10s.
                   </p>
                   <div className="flex gap-1.5">
                     <button
@@ -12567,14 +16267,14 @@ export default function App() {
                           : 'bg-rose-50 text-rose-700 hover:bg-rose-100 border border-rose-200'
                       }`}
                     >
-                      {pendingHomeAssign ? 'Click a house…' : 'Assign house'}
+                      {pendingHomeAssign ? 'Click a home…' : 'Assign home'}
                     </button>
                     <button
                       type="button"
                       disabled={carsFilteredSelection.size === 0 || !roomCode}
                       onClick={() => assignSelectedCarsToRandomHomes(carsFilteredSelection)}
                       className="flex-1 py-1.5 rounded-lg text-[11px] font-semibold bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 disabled:opacity-40"
-                      title="Assign each selected car to a random house on the map"
+                      title="Assign each selected car to a random house or apartment on the map"
                     >
                       Random homes
                     </button>
@@ -12594,7 +16294,7 @@ export default function App() {
                   </div>
                   {pendingHomeAssign && (
                     <div className="text-[10px] text-rose-600 font-medium">
-                      Click a Home tile on the map to set ownership.
+                      Click a house or apartment tile on the map to set ownership.
                     </div>
                   )}
                 </div>
@@ -12637,7 +16337,11 @@ export default function App() {
                   onTogglePlacing={() => {
                     const next = !isPlacingVehicles;
                     setIsPlacingVehicles(next);
-                    if (next) setPendingRouteVehicleId(null);
+                    if (next) {
+                      setPendingRouteVehicleId(null);
+                      setPendingHomeAssign(false);
+                      setSelectedTile(null);
+                    }
                   }}
                 />
               </div>
@@ -13149,6 +16853,60 @@ export default function App() {
                   <div className="flex items-center gap-1 shrink-0">
                     <button
                       type="button"
+                      onClick={() => {
+                        const busId =
+                          Array.from(serviceFilteredSelection).find(
+                            id => vehicles[id]?.type === 'bus',
+                          ) || null;
+                        const bus = busId ? vehicles[busId] : null;
+                        const stationKey =
+                          bus?.busStationKey ||
+                          (bus
+                            ? findNearestBusStationKey(
+                                { x: bus.x, y: bus.y },
+                                gridRef.current || grid,
+                              )
+                            : null) ||
+                          Object.entries(economy.buildings || {}).find(
+                            ([, b]) => b.role === 'bus-station',
+                          )?.[0] ||
+                          null;
+                        if (!stationKey) return;
+                        // Ensure config exists
+                        if (!economy.buildings[stationKey]) {
+                          const tiles = grid[stationKey];
+                          const top = tiles?.[tiles.length - 1];
+                          if (top?.type === 'building-bus-station') {
+                            const initCfg = createBuildingConfig(stationKey, top.type);
+                            const nextEco = {
+                              ...economy,
+                              buildings: { ...economy.buildings, [stationKey]: initCfg },
+                            };
+                            setEconomy(nextEco);
+                            if (roomCode) {
+                              socket.emit('update-economy', { roomCode, economy: nextEco });
+                            }
+                          }
+                        }
+                        setInspectBuildingKey(stationKey);
+                        setPendingBusRouteVehicleId(null);
+                        setPendingRouteVehicleId(null);
+                        setIsPlacingVehicles(false);
+                        setSelectedTile(null);
+                      }}
+                      disabled={
+                        !Object.values(economy.buildings || {}).some(b => b.role === 'bus-station') &&
+                        !Object.values(grid).some(tiles =>
+                          tiles?.some(t => t.type === 'building-bus-station' && t.part !== 'member'),
+                        )
+                      }
+                      className="disabled:opacity-30 disabled:pointer-events-none p-1 rounded-md transition-colors text-blue-600 hover:text-blue-700 bg-blue-50 hover:bg-blue-100"
+                      title="Open bus station — edit route & assign buses"
+                    >
+                      <Bus className="w-5 h-5" />
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => spawnDrivePanels(serviceFilteredSelection)}
                       disabled={serviceFilteredSelection.size === 0}
                       className="text-sky-600 hover:text-sky-700 disabled:opacity-30 disabled:pointer-events-none p-1 bg-sky-50 hover:bg-sky-100 rounded-md transition-colors"
@@ -13174,6 +16932,14 @@ export default function App() {
                       No service vehicles active
                     </div>
                   )}
+                </div>
+
+                <div className="text-[10px] text-slate-500 bg-blue-50 border border-blue-100 rounded-lg p-2 space-y-1">
+                  <p>
+                    <strong>Buses:</strong> open a <strong>Bus Station</strong> on the map to edit the station route,
+                    add buses to the fleet, and assign them to the route. After 5 loops they refuel at the station for{' '}
+                    {BUS_REFUEL_TICKS}s.
+                  </p>
                 </div>
 
                 <div className="text-[10px] text-slate-500 bg-orange-50 border border-orange-100 rounded-lg p-2 space-y-1">
@@ -13329,6 +17095,17 @@ export default function App() {
                     />
                     Show home occupancy badges
                   </label>
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={economy.showPersonIcons !== false}
+                      onChange={e => setEconomyBadgeFlag('showPersonIcons', e.target.checked)}
+                    />
+                    Show person icons on map
+                  </label>
+                  <p className="text-[9px] text-slate-500 leading-snug">
+                    Restroom-style icons stand outside homes, buildings, and bus stops. People walk sidewalks and cross at stop signs / signals. Vehicles yield.
+                  </p>
                 </div>
 
                 <div className="grid grid-cols-2 gap-1.5">
@@ -13352,6 +17129,37 @@ export default function App() {
                   </button>
                   <button
                     type="button"
+                    disabled={!roomCode}
+                    onClick={() => {
+                      const next = !isPlacingPeople;
+                      setIsPlacingPeople(next);
+                      if (next) {
+                        setIsPlacingVehicles(false);
+                        setPendingEmployeeAssign(false);
+                        setPendingHomeAssign(false);
+                        setPendingFireStart(false);
+                        setPendingRouteVehicleId(null);
+                        setPendingPersonFormPick(null);
+                        setSelectedTile(null);
+                        setTrafficTool(null);
+                      }
+                    }}
+                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold border disabled:opacity-40 ${
+                      isPlacingPeople
+                        ? 'bg-violet-600 text-white border-violet-700 animate-pulse'
+                        : 'bg-sky-50 text-sky-800 border-sky-200 hover:bg-sky-100'
+                    }`}
+                    title={
+                      selectedPersonIds.size > 0
+                        ? 'Click the map to place selected people (roads → sidewalk)'
+                        : 'Click the map to drop a new person (roads → sidewalk)'
+                    }
+                  >
+                    <MapPin className="w-3 h-3" />
+                    {isPlacingPeople ? 'Clicking map…' : 'Place on map'}
+                  </button>
+                  <button
+                    type="button"
                     disabled={!roomCode || selectedPersonIds.size === 0}
                     onClick={deleteSelectedPeople}
                     className="flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-40"
@@ -13363,7 +17171,7 @@ export default function App() {
                     type="button"
                     disabled={!roomCode || selectedPersonIds.size === 0}
                     onClick={startAssignEmployees}
-                    className={`flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold border disabled:opacity-40 ${
+                    className={`col-span-2 flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold border disabled:opacity-40 ${
                       pendingEmployeeAssign
                         ? 'bg-violet-600 text-white border-violet-700 animate-pulse'
                         : 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
@@ -13431,7 +17239,7 @@ export default function App() {
                         />
                       </label>
                       <div className="col-span-2 space-y-1">
-                        <div className="text-[10px] text-slate-500">Home (click house on map)</div>
+                        <div className="text-[10px] text-slate-500">Home (click house or apartment on map)</div>
                         <div className="flex items-center gap-1.5">
                           <div
                             className={`flex-1 min-w-0 px-2 py-1 rounded border text-xs font-mono truncate ${
@@ -13452,9 +17260,9 @@ export default function App() {
                                 ? 'bg-rose-600 text-white border-rose-700 animate-pulse'
                                 : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'
                             }`}
-                            title="Click a house on the map"
+                            title="Click a house or apartment on the map"
                           >
-                            {pendingPersonFormPick === 'home' ? 'Click house…' : 'Pick house'}
+                            {pendingPersonFormPick === 'home' ? 'Click home…' : 'Pick home'}
                           </button>
                           {peopleForm.homeKey && (
                             <button
@@ -13529,6 +17337,159 @@ export default function App() {
                         </select>
                       </label>
                     </div>
+                    {peopleFormMode === 'edit' && selectedPersonIds.size === 1 && (() => {
+                      const pid = Array.from(selectedPersonIds)[0];
+                      const sp = economy.people?.[pid];
+                      if (!sp) return null;
+                      const sched = sp.schedule || [];
+                      return (
+                        <div className="bg-slate-50 border border-slate-200 rounded-lg p-2 space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <div className="text-[10px] font-semibold text-slate-700 uppercase tracking-wide">
+                              Daily schedule
+                              <span className="ml-1 font-normal text-slate-400 normal-case">
+                                ({sp.scheduleMode === 'manual' ? 'user' : 'auto'})
+                              </span>
+                            </div>
+                            <div className="flex gap-1">
+                              <button
+                                type="button"
+                                disabled={!roomCode}
+                                className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-violet-100 text-violet-800 border border-violet-200 hover:bg-violet-200 disabled:opacity-40"
+                                title="System-generate a schedule from age / workplace"
+                                onClick={() => {
+                                  const stores = listStoreKeys(gridRef.current, economy.buildings || {});
+                                  const next = {
+                                    ...sp,
+                                    schedule: generatePersonSchedule(
+                                      { ...sp, workplaceKey: peopleForm.workplaceKey.trim() || sp.workplaceKey },
+                                      { stores },
+                                    ),
+                                    scheduleMode: 'auto' as const,
+                                    lastScheduleFireKey: undefined,
+                                  };
+                                  const people = { ...(economy.people || {}), [pid]: next };
+                                  const nextEco = { ...economy, people };
+                                  setEconomy(nextEco);
+                                  if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                                }}
+                              >
+                                Auto-generate
+                              </button>
+                              <button
+                                type="button"
+                                disabled={!roomCode || sched.length === 0}
+                                className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-100 text-slate-600 border border-slate-200 hover:bg-slate-200 disabled:opacity-40"
+                                onClick={() => {
+                                  const next = {
+                                    ...sp,
+                                    schedule: [],
+                                    scheduleMode: 'manual' as const,
+                                    lastScheduleFireKey: undefined,
+                                  };
+                                  const people = { ...(economy.people || {}), [pid]: next };
+                                  const nextEco = { ...economy, people };
+                                  setEconomy(nextEco);
+                                  if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                                }}
+                              >
+                                Clear
+                              </button>
+                            </div>
+                          </div>
+                          {sched.length === 0 ? (
+                            <p className="text-[9px] text-slate-400">No schedule — AI acts opportunistically.</p>
+                          ) : (
+                            <ul className="space-y-0.5 max-h-28 overflow-y-auto">
+                              {sched.map(e => (
+                                <li
+                                  key={e.id}
+                                  className="flex items-center gap-1.5 text-[10px] text-slate-700 font-mono"
+                                >
+                                  <span className="text-violet-700 font-bold w-10 shrink-0">
+                                    {formatScheduleTime(e.startMinute)}
+                                  </span>
+                                  <span className="truncate">
+                                    {e.label || e.purpose}
+                                    {e.destinationKey ? ` → ${e.destinationKey}` : ''}
+                                    {e.transport && e.transport !== 'auto' ? ` (${e.transport})` : ''}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="ml-auto shrink-0 text-slate-400 hover:text-rose-600 px-1"
+                                    title="Remove entry"
+                                    onClick={() => {
+                                      const nextSched = (sp.schedule || []).filter(x => x.id !== e.id);
+                                      const next = {
+                                        ...sp,
+                                        schedule: nextSched,
+                                        scheduleMode: 'manual' as const,
+                                      };
+                                      const people = { ...(economy.people || {}), [pid]: next };
+                                      const nextEco = { ...economy, people };
+                                      setEconomy(nextEco);
+                                      if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                                    }}
+                                  >
+                                    ×
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                          <div className="flex flex-wrap gap-1 pt-0.5">
+                            {(
+                              [
+                                { purpose: 'work' as const, label: '+ Work', hour: 8 },
+                                { purpose: 'shop' as const, label: '+ Shop', hour: 12 },
+                                { purpose: 'home' as const, label: '+ Home', hour: 17 },
+                              ] as const
+                            ).map(btn => (
+                              <button
+                                key={btn.purpose}
+                                type="button"
+                                disabled={!roomCode}
+                                className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+                                onClick={() => {
+                                  const dest =
+                                    btn.purpose === 'home'
+                                      ? sp.homeKey
+                                      : btn.purpose === 'work'
+                                        ? peopleForm.workplaceKey.trim() || sp.workplaceKey
+                                        : listStoreKeys(gridRef.current, economy.buildings || {})[0];
+                                  if (!dest && btn.purpose !== 'home') return;
+                                  const entry = {
+                                    id: `sched-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+                                    startMinute: btn.hour * 60,
+                                    purpose: btn.purpose,
+                                    destinationKey: dest || sp.homeKey,
+                                    transport: 'auto' as const,
+                                    label: btn.label.replace('+ ', ''),
+                                  };
+                                  const nextSched = [...(sp.schedule || []), entry].sort(
+                                    (a, b) => a.startMinute - b.startMinute,
+                                  );
+                                  const next = {
+                                    ...sp,
+                                    schedule: nextSched,
+                                    scheduleMode: 'manual' as const,
+                                  };
+                                  const people = { ...(economy.people || {}), [pid]: next };
+                                  const nextEco = { ...economy, people };
+                                  setEconomy(nextEco);
+                                  if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+                                }}
+                              >
+                                {btn.label}
+                              </button>
+                            ))}
+                          </div>
+                          <p className="text-[9px] text-slate-400 leading-snug">
+                            Times use real wall-clock. Short trips walk; longer use car/taxi. Vehicles always yield to pedestrians.
+                          </p>
+                        </div>
+                      );
+                    })()}
                     <div className="flex gap-2">
                       <button
                         type="button"
@@ -13586,17 +17547,21 @@ export default function App() {
                   {filteredPeople.map(p => {
                     const fam = economy.families?.[p.familyId];
                     const healthEmoji = p.health === 'healthy' ? '💚' : p.health === 'sick' ? '🤒' : '🩹';
+                    const isSelected = selectedPersonIds.has(p.id);
                     return (
                       <div
                         key={p.id}
-                        className={`flex gap-2 p-2.5 border-b border-slate-50 hover:bg-violet-50/50 ${
-                          selectedPersonIds.has(p.id) ? 'bg-violet-50' : ''
+                        data-person-row={p.id}
+                        className={`flex gap-2 p-2.5 border-b border-slate-50 hover:bg-sky-50/60 ${
+                          isSelected
+                            ? 'bg-blue-50 ring-2 ring-inset ring-blue-500 border-l-4 border-l-blue-500'
+                            : ''
                         }`}
                       >
                         <input
                           type="checkbox"
-                          className="mt-1"
-                          checked={selectedPersonIds.has(p.id)}
+                          className="mt-1 accent-blue-600"
+                          checked={isSelected}
                           onChange={e => {
                             const next = new Set(selectedPersonIds);
                             if (e.target.checked) next.add(p.id);
@@ -13608,8 +17573,7 @@ export default function App() {
                           type="button"
                           className="min-w-0 flex-1 text-left"
                           onClick={() => {
-                            setSelectedPersonIds(new Set([p.id]));
-                            openEditPersonForm(p.id);
+                            selectPerson(p.id, { openEdit: true, openPanel: true });
                           }}
                         >
                           <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-800">
@@ -13625,6 +17589,9 @@ export default function App() {
                           <div className="text-[10px] text-violet-600 truncate">
                             {locationLabel(p.location)} · {p.activity || 'idle'}
                             {typeof p.money === 'number' ? ` · $${p.money}` : ''}
+                            {p.schedule?.length
+                              ? ` · 📅 ${p.schedule.length} slots`
+                              : ''}
                           </div>
                         </button>
                       </div>
@@ -13635,7 +17602,7 @@ export default function App() {
                 <div className="bg-violet-50 border border-violet-100 rounded-xl p-3 space-y-2">
                   <div className="text-xs font-semibold text-violet-900">Control selected people</div>
                   <p className="text-[10px] text-slate-500">
-                    Assign workplace by clicking a building tile. Factories need enough employees to produce.
+                    Assign workplace by clicking a building tile. Existing people keep their current place and travel to work; only newly created people can start at a workplace. Production needs staff on-site.
                     Board vehicles from Cars/Service selection.
                   </p>
                   <div className="grid grid-cols-2 gap-1.5">
@@ -13686,6 +17653,19 @@ export default function App() {
                     </button>
                     <button
                       type="button"
+                      disabled={selectedPersonIds.size === 0}
+                      onClick={() => {
+                        for (const id of selectedPersonIds) {
+                          spawnPersonPanel(id);
+                        }
+                      }}
+                      className="py-1.5 rounded-lg text-[11px] font-bold bg-blue-600 text-white disabled:opacity-40"
+                      title="Open floating person control panel(s)"
+                    >
+                      Control panel
+                    </button>
+                    <button
+                      type="button"
                       disabled={selectedPersonIds.size === 0 || !roomCode}
                       onClick={sendSelectedPeopleHome}
                       className="py-1.5 rounded-lg text-[11px] font-bold bg-rose-600 text-white disabled:opacity-40"
@@ -13707,6 +17687,69 @@ export default function App() {
             </motion.div>
           )}
         </AnimatePresence>
+
+          {/* Floating per-person control panels */}
+          {personPanels.map(panel => {
+            const person = economy.people?.[panel.personId];
+            if (!person) return null;
+            return (
+              <FloatingPersonControlPanel
+                key={panel.personId}
+                personId={panel.personId}
+                person={person}
+                people={economy.people}
+                position={{ x: panel.x, y: panel.y }}
+                zIndex={panel.zIndex}
+                isActive={activePersonPanelId === panel.personId}
+                roomCode={roomCode}
+                grid={grid}
+                vehiclesMap={vehicles}
+                traffic={traffic}
+                selectedVehicleId={
+                  (activeDrivePanelId && vehicles[activeDrivePanelId]
+                    ? activeDrivePanelId
+                    : null) ||
+                  Array.from(selectedVehicles)[0] ||
+                  null
+                }
+                onActivate={() => activatePersonPanel(panel.personId)}
+                onClose={() => closePersonPanel(panel.personId)}
+                onMove={pos => movePersonPanel(panel.personId, pos)}
+                onSendHome={() => {
+                  setSelectedPersonIds(new Set([panel.personId]));
+                  queuePersonTravel(panel.personId, 'home', person.homeKey);
+                }}
+                onGoToWork={() => {
+                  if (!person.workplaceKey) return;
+                  queuePersonTravel(panel.personId, 'work', person.workplaceKey);
+                }}
+                onGoShop={() => {
+                  const stores = listStoreKeys(gridRef.current, economy.buildings || {});
+                  if (!stores.length) return;
+                  queuePersonTravel(
+                    panel.personId,
+                    'shop',
+                    stores[Math.floor(Math.random() * stores.length)],
+                  );
+                }}
+                onLeaveVehicle={() => alightOnePerson(panel.personId)}
+                onBoardDriver={() => boardOnePerson(panel.personId, 'driver')}
+                onBoardPassenger={() => boardOnePerson(panel.personId, 'passenger')}
+                onEnterNearbyBuilding={() => enterBuildingOnePerson(panel.personId)}
+                onAssignWorkplace={() => {
+                  setSelectedPersonIds(new Set([panel.personId]));
+                  startAssignEmployees();
+                }}
+                onFocusOnMap={() => {
+                  selectPerson(panel.personId, {
+                    openEdit: false,
+                    openPanel: true,
+                    openControl: false,
+                  });
+                }}
+              />
+            );
+          })}
 
           {/* Floating per-vehicle drive control panels */}
           {drivePanels.map(panel => (
@@ -13731,6 +17774,9 @@ export default function App() {
               pendingRouteVehicleId={pendingRouteVehicleId}
               isPlacingVehicles={isPlacingVehicles}
               pendingHomeAssign={pendingHomeAssign}
+              grid={grid}
+              vehiclesMap={vehicles}
+              traffic={traffic}
               onActivate={() => activateDrivePanel(panel.vehicleId)}
               onClose={() => closeDrivePanel(panel.vehicleId)}
               onMove={(pos) => moveDrivePanel(panel.vehicleId, pos)}
@@ -13759,10 +17805,15 @@ export default function App() {
                 unparkSelectedVehicles([panel.vehicleId]);
               }}
               onTogglePlacing={() => {
-                activateDrivePanel(panel.vehicleId);
+                // keepPlacing so activate does not immediately cancel place mode
+                activateDrivePanel(panel.vehicleId, { keepPlacing: true });
                 const next = !isPlacingVehicles || activeDrivePanelId !== panel.vehicleId;
                 setIsPlacingVehicles(next);
-                if (next) setPendingRouteVehicleId(null);
+                if (next) {
+                  setPendingRouteVehicleId(null);
+                  setPendingHomeAssign(false);
+                  setSelectedTile(null);
+                }
               }}
               onToggleEmergencyLights={() => {
                 activateDrivePanel(panel.vehicleId);
@@ -13789,6 +17840,22 @@ export default function App() {
                 activateDrivePanel(panel.vehicleId);
                 setVehicleManualOverride(panel.vehicleId, enabled);
               }}
+              onAssignDriver={(personId) => {
+                activateDrivePanel(panel.vehicleId);
+                assignVehicleDriver(panel.vehicleId, personId);
+              }}
+              onAssignPassenger={(personId, board) => {
+                activateDrivePanel(panel.vehicleId);
+                assignVehiclePassenger(panel.vehicleId, personId, board);
+              }}
+              onAssignOwnerPerson={(personId) => {
+                activateDrivePanel(panel.vehicleId);
+                assignVehicleOwnerFromPerson(panel.vehicleId, personId);
+              }}
+              onClearOwner={() => {
+                activateDrivePanel(panel.vehicleId);
+                clearSelectedHomes([panel.vehicleId]);
+              }}
             />
           ))}
 
@@ -13801,8 +17868,7 @@ export default function App() {
                 vehicles={vehicles}
                 onClose={() => setInspectHomeKey(null)}
                 onSelectPerson={(personId) => {
-                  setSelectedPersonIds(new Set([personId]));
-                  setShowPeoplePanel(true);
+                  selectPerson(personId, { openEdit: true, openPanel: true });
                   setInspectHomeKey(null);
                 }}
               />
@@ -13822,6 +17888,20 @@ export default function App() {
                   setEconomy={setEconomy}
                   setVehicles={setVehicles}
                   roomCode={roomCode}
+                  onClose={() => setInspectBuildingKey(null)}
+                />
+              ) : economy.buildings[inspectBuildingKey].role === 'bus-station' ? (
+                <BusStationInspectorModal
+                  bkey={inspectBuildingKey}
+                  cfg={economy.buildings[inspectBuildingKey]}
+                  economy={economy}
+                  grid={grid}
+                  vehicles={vehicles}
+                  setEconomy={setEconomy}
+                  setVehicles={setVehicles}
+                  roomCode={roomCode}
+                  pendingBusRouteStationKey={pendingBusRouteStationKey}
+                  setPendingBusRouteStationKey={setPendingBusRouteStationKey}
                   onClose={() => setInspectBuildingKey(null)}
                 />
               ) : (

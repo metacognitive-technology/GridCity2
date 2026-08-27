@@ -735,6 +735,108 @@ export const Tile: React.FC<TileProps> = ({
             <path d={`M ${svgN(DIVIDER_RIGHT)} 40 L ${svgN(DIVIDER_RIGHT)} 56`} stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
           </>
         );
+      case 'road-bus-stop':
+      case 'road-4lane-bus-stop': {
+        // N–S travel art; rotation handles orientation. Bus bay sits on the east (right) curb.
+        const is4 = type === 'road-4lane-bus-stop';
+        const rW = is4 ? ROAD_WIDTH_4L : ROAD_WIDTH_2L;
+        const rX = is4 ? ROAD_INSET_4L : ROAD_INSET_2L;
+        const bayX = is4 ? ROAD_OUTER_4L : ROAD_OUTER_2L;
+        const bayW = is4 ? Math.max(10, 64 - bayX - 2) : Math.max(12, 64 - bayX - 4);
+        return (
+          <>
+            {/* Main carriageway */}
+            <rect x={rX} y="0" width={rW} height="64" fill={color} />
+            {/* Bus pull-out bay on right */}
+            <rect x={bayX} y="12" width={bayW} height="40" fill={color} />
+            <path
+              d={`M ${bayX} 12 L ${bayX + bayW} 16 L ${bayX + bayW} 48 L ${bayX} 52 Z`}
+              fill="#4b5563"
+              opacity="0.35"
+            />
+            {/* Curb cut dashes */}
+            <line
+              x1={bayX}
+              y1="12"
+              x2={bayX}
+              y2="52"
+              stroke="#fbbf24"
+              strokeWidth="2"
+              strokeDasharray="4,3"
+            />
+            {/* Lane markings */}
+            {is4 ? (
+              <>
+                <rect x={TILE_CENTER - 1} y="0" width="2" height="64" fill="#fbbf24" />
+                <line x1={svgN(DIVIDER_LEFT)} y1="0" x2={svgN(DIVIDER_LEFT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+                <line x1={svgN(DIVIDER_RIGHT)} y1="0" x2={svgN(DIVIDER_RIGHT)} y2="64" stroke={stripeColor} strokeWidth="1" strokeDasharray="4,4" opacity="0.6" />
+              </>
+            ) : (
+              <>
+                <rect x={TILE_CENTER - 1} y="8" width="2" height="12" fill={stripeColor} />
+                <rect x={TILE_CENTER - 1} y="44" width="2" height="12" fill={stripeColor} />
+              </>
+            )}
+            {/* Bus bay wordmark + stop bar */}
+            <rect x={bayX + 1} y="28" width={Math.max(8, bayW - 2)} height="8" fill="#fbbf24" opacity="0.9" rx="1" />
+            <text
+              x={bayX + bayW / 2}
+              y="34.5"
+              fill="#1e293b"
+              fontSize="6"
+              textAnchor="middle"
+              fontWeight="bold"
+            >
+              BUS
+            </text>
+            {/* Shelter on far curb */}
+            <rect x={Math.min(60, bayX + bayW - 3)} y="20" width="3" height="24" fill="#64748b" />
+            <rect x={Math.min(58, bayX + bayW - 5)} y="18" width="7" height="3" fill="#94a3b8" />
+            <circle cx={Math.min(61, bayX + bayW - 1)} cy="16" r="1.5" fill="#3b82f6" />
+          </>
+        );
+      }
+      case 'building-bus-station': {
+        // 2×2: terminal row (localY 0) + two bus bays (localY 1)
+        const bay = (localY ?? 0) >= 1;
+        const bayNum = (localX ?? 0) + 1;
+        return (
+          <>
+            {bay ? (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#1e3a5f" />
+                <rect x="2" y="2" width="60" height="60" fill="#334155" />
+                <line x1="32" y1="4" x2="32" y2="60" stroke="#fbbf24" strokeWidth="1.5" strokeDasharray="5 4" />
+                <rect x="8" y="6" width="48" height="12" fill="#0f172a" opacity="0.5" />
+                <text x="32" y="30" fill="#e2e8f0" fontSize="10" textAnchor="middle" fontWeight="bold">
+                  BAY {bayNum}
+                </text>
+                <text x="32" y="44" fill="#93c5fd" fontSize="7" textAnchor="middle">
+                  BUS
+                </text>
+                {/* Platform edge toward terminal (north) */}
+                <rect x="0" y="0" width="64" height="5" fill="#64748b" />
+              </>
+            ) : (
+              <>
+                <rect x="0" y="0" width="64" height="64" fill="#dbeafe" />
+                <rect x="4" y="10" width="56" height="40" fill="#3b82f6" stroke="#1e40af" strokeWidth="2" />
+                <rect x="10" y="16" width="18" height="12" fill="#93c5fd" />
+                <rect x="36" y="16" width="18" height="12" fill="#93c5fd" />
+                <rect x="24" y="34" width="16" height="12" fill="#1e3a8a" />
+                {(localX ?? 0) === 0 && (
+                  <text x="32" y="8" fill="#1e3a8a" fontSize="6" textAnchor="middle" fontWeight="bold">
+                    BUS STN
+                  </text>
+                )}
+                <text x="32" y="28" fill="#eff6ff" fontSize="7" textAnchor="middle" fontWeight="bold">
+                  TERMINAL
+                </text>
+              </>
+            )}
+          </>
+        );
+      }
       case 'building-home':
         return (
           <>

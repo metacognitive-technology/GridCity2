@@ -44,6 +44,8 @@ export const TILE_CONNECTIONS: Record<string, number[]> = {
   'road-roundabout': [0, 1, 2, 3],
   'road-end': [2],
   'road-4lane-end': [2],
+  'road-bus-stop': [0, 2],
+  'road-4lane-bus-stop': [0, 2],
   // Driveable bays / lots — full 4-way access (robotaxis exit onto any adjacent road)
   'parking-1x1': [0, 1, 2, 3],
   'parking-1x2': [0, 1, 2, 3],
@@ -54,12 +56,15 @@ export const TILE_CONNECTIONS: Record<string, number[]> = {
   'building-repair-shop': [0, 1, 2, 3],
   'building-hospital': [0, 1, 2, 3],
   'building-taxi-station': [0, 1, 2, 3],
+  'building-bus-station': [0, 1, 2, 3],
   'building-home': [0, 1, 2, 3],
+  'building-apartment': [0, 1, 2, 3],
 };
 
 const STRAIGHT_ROAD_TYPES = new Set([
   'road-straight', 'road-bridge', 'road-oneway-straight', 'road-oneway-bridge',
   'road-4lane-straight', 'road-4lane-bridge', 'road-transition-2to4',
+  'road-bus-stop', 'road-4lane-bus-stop',
 ]);
 
 export function isRoadTile(type: string): boolean {

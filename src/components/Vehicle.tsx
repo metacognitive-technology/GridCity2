@@ -35,11 +35,19 @@ interface VehicleProps {
   tileH?: number;
   parkingStopUntil?: number;
   trafficStopUntil?: number;
-  trafficStopReason?: 'stop-sign' | 'stoplight' | 'yield' | 'vehicle';
+  trafficStopReason?: 'stop-sign' | 'stoplight' | 'yield' | 'vehicle' | 'pedestrian';
   parkingStallIndex?: number;
   lastParkingKey?: string;
   /** When false, service vehicle light bar is dark (default true for service types). */
   emergencyLightsOn?: boolean;
+  /** Bus route service phase (boarding at stop / refueling at station) */
+  busPhase?: 'route' | 'boarding' | 'to-station' | 'refueling';
+  /** Wall-clock ms when boarding dwell ends */
+  busStopUntil?: number;
+  /** Whole seconds of refuel remaining at station */
+  busRefuelTicks?: number;
+  /** Accumulator ms toward next refuel second */
+  busRefuelAccumMs?: number;
   onSelect?: (e: React.MouseEvent) => void;
   onTrailerSelect?: (trailerIndex: number, e: React.MouseEvent) => void;
   onRailcarSelect?: (railcarIndex: number, e: React.MouseEvent) => void;
@@ -50,7 +58,7 @@ interface VehicleProps {
   showCargoLabels?: boolean;
   /** Railcar cargo badges (trains); falls back to showCargoLabels when omitted */
   showRailcarCargoLabels?: boolean;
-  /** Parking / traffic stop countdown badge */
+  /** Parking / traffic / bus dwell countdown badge */
   showStopTimerBadge?: boolean;
   itemEmojiResolver?: (itemId: string) => string;
 }
@@ -125,8 +133,8 @@ export function getParkingStallOffset(
     offsetX = 32;
     offsetY = 32;
     localRot = 0;
-  } else if (tileType === 'building-home') {
-    // Driveway parking in front of the house
+  } else if (tileType === 'building-home' || tileType === 'building-apartment') {
+    // Driveway / curb parking at house or apartment
     offsetX = 32;
     offsetY = 50;
     localRot = 0;
@@ -449,6 +457,7 @@ export const Vehicle: React.FC<VehicleProps> = ({
   tileType, tileRotation, tilePart, tileLocalX = 0, tileLocalY = 0, tileW = 1, tileH = 1,
   parkingStopUntil, trafficStopUntil, trafficStopReason, parkingStallIndex = 0, lastParkingKey,
   emergencyLightsOn,
+  busPhase, busStopUntil, busRefuelTicks, busRefuelAccumMs,
   onSelect, onTrailerSelect, onRailcarSelect,
   trailerCargos, railcarCargos, selectedRailcarIndex, showCargoLabels,
   showRailcarCargoLabels, showStopTimerBadge = true, itemEmojiResolver
@@ -456,25 +465,60 @@ export const Vehicle: React.FC<VehicleProps> = ({
   const showRailCargo = showRailcarCargoLabels ?? showCargoLabels;
   const targetHeading = exitHeading !== undefined ? exitHeading : heading;
   
-  const stopUntil = parkingStopUntil || trafficStopUntil;
+  // Parking / traffic wall-clock end, or bus boarding dwell end
+  const stopUntil = parkingStopUntil || trafficStopUntil || busStopUntil;
   const [timeLeft, setTimeLeft] = React.useState<number | null>(null);
+  /** bus | park | traffic — drives badge icon / color */
+  const [timerKind, setTimerKind] = React.useState<'boarding' | 'refuel' | 'park' | 'traffic' | null>(null);
 
   React.useEffect(() => {
-    if (stopUntil) {
-      const update = () => {
-        const remainingMs = stopUntil - Date.now();
-        if (remainingMs <= 0) {
-          setTimeLeft(null);
+    let raf = 0;
+    const tick = () => {
+      // Bus boarding: absolute deadline
+      if (busPhase === 'boarding' && busStopUntil) {
+        const remainingMs = busStopUntil - Date.now();
+        if (remainingMs > 0) {
+          setTimeLeft(Math.max(1, Math.ceil(remainingMs / 1000)));
+          setTimerKind('boarding');
+          raf = requestAnimationFrame(tick);
           return;
         }
-        setTimeLeft(Math.max(1, Math.ceil(remainingMs / 1000)));
-        requestAnimationFrame(update);
-      };
-      update();
-    } else {
+      }
+      // Bus refueling at station: whole-second ticks + partial accum
+      if (busPhase === 'refueling' && typeof busRefuelTicks === 'number' && busRefuelTicks > 0) {
+        const frac = Math.min(0.999, Math.max(0, (busRefuelAccumMs || 0) / 1000));
+        const secs = Math.max(1, Math.ceil(busRefuelTicks - frac));
+        setTimeLeft(secs);
+        setTimerKind('refuel');
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      // Generic parking / traffic stop
+      if (stopUntil && busPhase !== 'boarding' && busPhase !== 'refueling') {
+        const remainingMs = stopUntil - Date.now();
+        if (remainingMs > 0) {
+          setTimeLeft(Math.max(1, Math.ceil(remainingMs / 1000)));
+          setTimerKind(trafficStopUntil && !parkingStopUntil ? 'traffic' : 'park');
+          raf = requestAnimationFrame(tick);
+          return;
+        }
+      }
       setTimeLeft(null);
-    }
-  }, [stopUntil]);
+      setTimerKind(null);
+    };
+    tick();
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [
+    stopUntil,
+    parkingStopUntil,
+    trafficStopUntil,
+    busPhase,
+    busStopUntil,
+    busRefuelTicks,
+    busRefuelAccumMs,
+  ]);
 
   const { posX: standardX, posY: standardY, rotation: standardRot } = getTrajectory(x, y, heading, targetHeading, lane, progress);
 
@@ -499,7 +543,10 @@ export const Vehicle: React.FC<VehicleProps> = ({
     (tileType.startsWith('parking-') ||
       tileType === 'building-repair-shop' ||
       tileType === 'building-hospital' ||
-      tileType === 'building-home');
+      tileType === 'building-home' ||
+      tileType === 'building-apartment' ||
+      tileType === 'building-taxi-station' ||
+      tileType === 'building-bus-station');
   if (isParkedCell) {
     const stall = parkingStallIndex ?? 0;
     const { posX: parkedX, posY: parkedY, rotation: parkedRot } = getParkingStallWorldPosition(
@@ -846,8 +893,18 @@ export const Vehicle: React.FC<VehicleProps> = ({
             left: posX,
             top: posY - baseHeight - 12,
             transform: 'translate(-50%, -50%)',
-            backgroundColor: 'rgba(15, 23, 42, 0.95)',
-            border: '1.5px solid #fbbf24',
+            backgroundColor:
+              timerKind === 'boarding'
+                ? 'rgba(37, 99, 235, 0.95)'
+                : timerKind === 'refuel'
+                  ? 'rgba(180, 83, 9, 0.95)'
+                  : 'rgba(15, 23, 42, 0.95)',
+            border:
+              timerKind === 'boarding'
+                ? '1.5px solid #93c5fd'
+                : timerKind === 'refuel'
+                  ? '1.5px solid #fcd34d'
+                  : '1.5px solid #fbbf24',
             color: '#ffffff',
             borderRadius: '12px',
             padding: '2px 6px',
@@ -859,13 +916,31 @@ export const Vehicle: React.FC<VehicleProps> = ({
             display: 'flex',
             alignItems: 'center',
             gap: '2px',
+            whiteSpace: 'nowrap',
           }}
           initial={{ scale: 0, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
           exit={{ scale: 0, opacity: 0 }}
+          title={
+            timerKind === 'boarding'
+              ? 'Boarding at bus stop'
+              : timerKind === 'refuel'
+                ? 'Refueling at bus station'
+                : undefined
+          }
         >
           <span style={{ fontSize: '8px' }}>
-            {trafficStopReason === 'stop-sign' ? '🛑' : trafficStopReason === 'stoplight' ? '🚦' : '🅿️'}
+            {timerKind === 'boarding'
+              ? '🚌'
+              : timerKind === 'refuel'
+                ? '⛽'
+                : trafficStopReason === 'stop-sign'
+                  ? '🛑'
+                  : trafficStopReason === 'stoplight'
+                    ? '🚦'
+                    : trafficStopReason === 'pedestrian'
+                      ? '🚶'
+                      : '🅿️'}
           </span>
           <span>{timeLeft}s</span>
         </motion.div>

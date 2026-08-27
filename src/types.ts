@@ -17,6 +17,10 @@ export type TileType =
   | 'road-roundabout'
   | 'road-end'
   | 'road-4lane-end'
+  /** 2-lane road with curbside bus stop bay */
+  | 'road-bus-stop'
+  /** 4-lane road with curbside bus stop bay */
+  | 'road-4lane-bus-stop'
   | 'rail-straight'
   | 'rail-curve'
   | 'rail-t'
@@ -46,6 +50,8 @@ export type TileType =
   | 'building-repair-shop'
   | 'building-hospital'
   | 'building-taxi-station'
+  /** 4×4 bus terminal with parking bays */
+  | 'building-bus-station'
   | 'grass-plain'
   | 'grass-tall'
   | 'grass-flowers'
@@ -141,7 +147,7 @@ export interface Vehicle {
   randomTurning?: boolean;
   parkingStopUntil?: number;
   trafficStopUntil?: number;
-  trafficStopReason?: 'stop-sign' | 'stoplight' | 'yield' | 'vehicle';
+  trafficStopReason?: 'stop-sign' | 'stoplight' | 'yield' | 'vehicle' | 'pedestrian';
   /** `${gridKey}:${signId}` — stop sign already satisfied on current tile traversal */
   satisfiedStopSignKey?: string;
   lastParkingKey?: string;
@@ -169,6 +175,8 @@ export interface Vehicle {
   passengerIds?: string[];
   /** Max passengers excluding driver (defaults by vehicle type) */
   maxPassengers?: number;
+  /** Bus passenger: grid key of the stop they want to alight at */
+  // (stored on Person — see busDropoffStop)
   /**
    * When true, only the controlling user's direct actions may operate this vehicle.
    * Home AI, auto park/resume, stop signs, people routing, etc. are skipped.
@@ -182,6 +190,33 @@ export interface Vehicle {
    * Only that station's fleet may dispatch it.
    */
   taxiOwnerId?: string;
+  /**
+   * Monotonic counter bumped on user place/teleport.
+   * Sim leader adopts peer kinematics when peer placeSeq is higher.
+   */
+  placeSeq?: number;
+  // ——— Bus route service ———
+  /** Ordered bus-stop tile keys (e.g. "12,5") the bus cycles through */
+  busRoute?: string[];
+  /** Index of the next stop in busRoute */
+  busRouteIndex?: number;
+  /** Completed full loops of the route (resets after refuel) */
+  busRouteLoops?: number;
+  /**
+   * route — driving between stops
+   * boarding — dwelling at a stop for pick-up/drop-off
+   * to-station — heading home to bus station for fuel
+   * refueling — parked at station for busRefuelTicks seconds
+   */
+  busPhase?: 'route' | 'boarding' | 'to-station' | 'refueling';
+  /** Wall-clock ms when boarding dwell ends */
+  busStopUntil?: number;
+  /** Seconds of refuel remaining at station (counts down ~1/sec) */
+  busRefuelTicks?: number;
+  /** Accumulator ms toward next refuel tick */
+  busRefuelAccumMs?: number;
+  /** Anchor key of assigned building-bus-station */
+  busStationKey?: string;
 }
 
 export type PersonSex = 'm' | 'f';
@@ -196,14 +231,35 @@ export type PersonActivity =
   | 'shopping'
   | 'seeking_care'
   | 'in_care'
-  | 'waiting_taxi';
+  | 'waiting_taxi'
+  | 'walking';
 
 export type TravelPurpose = 'work' | 'shop' | 'home' | 'care';
+
+/** How a person prefers to travel for a trip */
+export type TravelTransport = 'auto' | 'walk' | 'car' | 'taxi' | 'bus';
 
 /** Planned destination for vehicle-based travel (no teleport). */
 export interface PersonTravelIntent {
   purpose: TravelPurpose;
   destinationKey: string;
+  /** Preferred transport; auto picks walk for short trips else car/taxi */
+  transport?: TravelTransport;
+}
+
+/**
+ * One daily schedule slot. Times use wall-clock local time (minutes from midnight).
+ * User-assigned or system-generated.
+ */
+export interface PersonScheduleEntry {
+  id: string;
+  /** Minutes from midnight 0–1439 */
+  startMinute: number;
+  purpose: TravelPurpose | 'idle';
+  /** Destination building/home key (defaults by purpose: homeKey / workplaceKey) */
+  destinationKey?: string;
+  transport?: TravelTransport;
+  label?: string;
 }
 
 /** Where a person currently is */
@@ -211,7 +267,25 @@ export type PersonLocation =
   | { kind: 'home'; homeKey: string }
   | { kind: 'building'; buildingKey: string }
   | { kind: 'vehicle'; vehicleId: string; seat: 'driver' | 'passenger' }
-  | { kind: 'tile'; x: number; y: number };
+  | { kind: 'tile'; x: number; y: number }
+  /** Standing outside a home, building, or bus-stop (next to a road when possible) */
+  | { kind: 'outdoor'; atKey: string; /** continuous grid offset 0–1 within tile */ ox?: number; oy?: number }
+  /**
+   * Walking on sidewalks / crossing roads.
+   * x,y are continuous grid coordinates (tile center = n+0.5).
+   * path holds remaining integer tile waypoints including current.
+   */
+  | {
+      kind: 'walking';
+      x: number;
+      y: number;
+      path: Array<{ x: number; y: number }>;
+      pathIndex: number;
+      /** True while crossing the roadway (vehicles must yield) */
+      crossing?: boolean;
+      /** Destination key this walk is heading toward */
+      destKey?: string;
+    };
 
 export interface Person {
   id: string;
@@ -237,6 +311,17 @@ export interface Person {
   travelIntent?: PersonTravelIntent;
   /** Active taxi ride id (on a taxi-station building) */
   taxiRideId?: string;
+  /** When riding a bus: bus-stop tile key where they want to get off */
+  busDropoffStop?: string;
+  /**
+   * Daily schedule (sorted by startMinute). When set, life AI follows it;
+   * otherwise behavior is opportunistic. User may assign or system may generate.
+   */
+  schedule?: PersonScheduleEntry[];
+  /** 'manual' = user-owned schedule (do not auto-regenerate); 'auto' = system may refresh */
+  scheduleMode?: 'auto' | 'manual';
+  /** Last schedule entry id applied this wall day (YYYY-MM-DD:entryId) */
+  lastScheduleFireKey?: string;
 }
 
 /** In-progress taxi job tracked on a taxi station */
@@ -331,7 +416,7 @@ export interface ActivePatient {
 export interface BuildingConfig {
   anchorKey: string;
   name?: string;
-  role: 'warehouse' | 'factory' | 'store' | 'lumbermill' | 'repair-shop' | 'hospital' | 'taxi-station' | 'none';
+  role: 'warehouse' | 'factory' | 'store' | 'lumbermill' | 'repair-shop' | 'hospital' | 'taxi-station' | 'bus-station' | 'none';
   inventory: Record<ItemId, number>;
   /** Max stored quantity per item type */
   inventoryCapacity?: Record<ItemId, number>;
@@ -342,7 +427,7 @@ export interface BuildingConfig {
   recipeOutputs?: Array<{ item: ItemId; amount: number }>;
   cycleTimeSec?: number;
   productionEnabled?: boolean;
-  /** Minimum assigned employees (people with workplaceKey = this building) required for recipe production */
+  /** Minimum on-site employees (present at this building) required for recipe production */
   requiredEmployees?: number;
   // internal sim state
   processAccum?: number; // seconds accumulator for current cycle
@@ -364,6 +449,14 @@ export interface BuildingConfig {
   taxiFleetIds?: string[];
   /** Live rides currently served by this station */
   activeTaxiRides?: ActiveTaxiRide[];
+  // Bus station
+  /** Vehicle ids (buses) assigned to this station’s fleet */
+  busFleetIds?: string[];
+  /**
+   * Shared ordered bus-stop tile keys for this station’s route.
+   * Assigned fleet buses receive a copy when started on the route.
+   */
+  busRoute?: string[];
 }
 
 export interface PlantGrowthSettings {
@@ -426,6 +519,8 @@ export interface EconomyState {
   showRailcarCargoLabels?: boolean;
   /** Home occupancy badges on houses (People panel) */
   showHomeBadges?: boolean;
+  /** Restroom-style person icons on the map (People panel) */
+  showPersonIcons?: boolean;
   /** Destination bullseye markers for routed vehicles (Cars / Service) */
   showDestinationMarkers?: boolean;
   /** Parking / traffic stop countdown badges on vehicles */
@@ -438,6 +533,12 @@ export interface EconomyState {
   people?: Record<string, Person>;
   families?: Record<string, Family>;
   peoplePaused?: boolean;
+  /**
+   * City / simulation clock offset from wall time.
+   * simNow = Date.now() + cityTimeOffsetMs
+   * Set when the user changes the top-of-grid clock; schedules and city AI use simNow.
+   */
+  cityTimeOffsetMs?: number;
 }
 
 /** Saved layout: tiles plus economy state for buildings in the selection */
