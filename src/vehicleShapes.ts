@@ -1,6 +1,6 @@
 import { getTrajectory } from './vehicleTrajectory';
-import { getGroundRoadTile, TILE_CONNECTIONS } from './traffic';
-import { GridData, Vehicle } from './types';
+import { driveExitPorts, getGroundRoadTile, getOneWayTravel, isRoundabout4Way, TILE_CONNECTIONS, type SignalContext } from './traffic';
+import { GridData, GridTile, Point, Vehicle } from './types';
 
 /** Visual body sizes — keep in sync with Vehicle.tsx rendering. */
 export const VEHICLE_DIMS = {
@@ -44,30 +44,185 @@ export interface VehicleCollisionBody {
   rotationDeg: number;
 }
 
-export function computeExitHeading(vehicle: Vehicle, grid: GridData): number {
-  const tiles = grid[`${vehicle.x},${vehicle.y}`];
-  const currentTile = getGroundRoadTile(tiles, vehicle.zIndex);
-  if (!currentTile) return vehicle.heading;
+type RouteExitFn = (
+  cx: number,
+  cy: number,
+  entryHeading: number,
+  dest: Point,
+  vType: string,
+  grid: GridData,
+) => number | null;
 
-  const ports = (ALL_TILE_CONNECTIONS[currentTile.type] || []).map(
-    p => (p + currentTile.rotation / 90) % 4
+let recommendExit: RouteExitFn | null = null;
+
+/** App owns the BFS router. Bind it so pose and collision use the same exit. */
+export function bindRouteExit(fn: RouteExitFn): void {
+  recommendExit = fn;
+}
+
+function isDriveBay(tile: GridTile | undefined | null): boolean {
+  if (!tile) return false;
+  if (tile.type === 'building-taxi-station' || tile.type === 'building-bus-station') {
+    return (tile.localY ?? 0) >= 1;
+  }
+  if (tile.type === 'building-repair-shop') return (tile.localY ?? 0) >= 3;
+  if (tile.type === 'building-hospital') return (tile.localY ?? 0) >= 2;
+  return false;
+}
+
+/** Tile the vehicle is driving on (ground, or bridge/trestle when elevated). */
+export function findVehicleTile(tiles: GridTile[] | undefined, zIndex = 0): GridTile | undefined {
+  if (!tiles?.length) return undefined;
+  return tiles.find(t => {
+    const elevated = t.type.includes('bridge') || t.type.includes('trestle');
+    return (zIndex === 1 && elevated) || (zIndex === 0 && !elevated);
+  });
+}
+
+function stepOf(heading: number): { dx: number; dy: number } {
+  const h = ((Math.round(heading / 90) % 4) + 4) % 4;
+  if (h === 1) return { dx: 1, dy: 0 };
+  if (h === 2) return { dx: 0, dy: 1 };
+  if (h === 3) return { dx: -1, dy: 0 };
+  return { dx: 0, dy: -1 };
+}
+
+function tileAcceptsVehicle(vehicle: Vehicle, tile: GridTile, exitHeading: number): boolean {
+  const ty = tile.type;
+  const vType = vehicle.type || 'car';
+  let ok = false;
+  if (vType === 'train') {
+    ok = ty.startsWith('rail') || ty === 'rail-road-crossing' || isDriveBay(tile);
+  } else if (vType === 'semi') {
+    ok = ty.startsWith('road') || ty === 'parking-2x4' || ty === 'parking-4x4' || ty === 'rail-road-crossing' || isDriveBay(tile);
+  } else {
+    ok =
+      ty.startsWith('road') ||
+      ty.startsWith('parking-') ||
+      ty === 'rail-road-crossing' ||
+      isDriveBay(tile) ||
+      ty === 'building-home' ||
+      ty === 'building-apartment';
+  }
+  if (!ok) return false;
+  const oneWay = getOneWayTravel(tile);
+  if (!oneWay) return true;
+  const entryPort = (Math.round(exitHeading / 90) + 2) % 4;
+  return entryPort === oneWay.enterPort;
+}
+
+function canLeaveToward(vehicle: Vehicle, grid: GridData, exitHeading: number): boolean {
+  const step = stepOf(exitHeading);
+  const tiles = grid[`${vehicle.x + step.dx},${vehicle.y + step.dy}`];
+  if (!tiles?.length) return false;
+  return tiles.some(t => tileAcceptsVehicle(vehicle, t, exitHeading));
+}
+
+/**
+ * Exit heading the simulator will take at the end of this tile.
+ * Routed vehicles follow the destination, not "straight unless turnIntent".
+ * A dead end (cul-de-sac, road that runs out) leaves back through the entry
+ * so the turn can be a curve instead of a pivot at the edge.
+ */
+export function resolveVehicleExit(
+  vehicle: Vehicle,
+  tile: GridTile,
+  grid: GridData,
+): number {
+  const heading = vehicle.heading;
+  const allowUTurn = !vehicle.manualOverride && vehicle.turnAroundAtDeadEnd !== false;
+  const isRobotaxi = vehicle.type === 'taxi';
+  const onBay = isRobotaxi && isDriveBay(tile);
+  const basePorts = onBay ? [0, 1, 2, 3] : (ALL_TILE_CONNECTIONS[tile.type] || []);
+  const ports = basePorts.map(p =>
+    onBay ? p : (p + (tile.rotation || 0) / 90) % 4,
   );
-  const entryPort = (vehicle.heading / 90 + 2) % 4;
-  const otherPorts = ports.filter(p => p !== entryPort);
-  if (!otherPorts.length) return vehicle.heading;
+  const entryPort = (heading / 90 + 2) % 4;
+  const oneWayFlow = getOneWayTravel(tile);
+  const roundabout = isRoundabout4Way(tile.type);
+  let otherPorts = driveExitPorts(
+    tile.type,
+    ports,
+    entryPort,
+    oneWayFlow ? oneWayFlow.exitPort : null,
+  );
 
-  let exitPort = otherPorts[0];
-  if (otherPorts.length > 1) {
-    const straightPort = (entryPort + 2) % 4;
-    const leftPort = (entryPort + 1) % 4;
-    const rightPort = (entryPort + 3) % 4;
-
-    if (vehicle.turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
-    else if (vehicle.turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
-    else if (otherPorts.includes(straightPort)) exitPort = straightPort;
+  if (onBay && otherPorts.length > 1) {
+    const roadExits = otherPorts.filter(exitPort => {
+      const step = stepOf(exitPort * 90);
+      const nt = grid[`${vehicle.x + step.dx},${vehicle.y + step.dy}`];
+      return !!nt?.some(t => t.type.startsWith('road'));
+    });
+    if (roadExits.length > 0) otherPorts = roadExits;
   }
 
-  return exitPort * 90;
+  if (tile.type === 'rail-road-crossing') {
+    const straightPort = (entryPort + 2) % 4;
+    otherPorts = otherPorts.includes(straightPort) ? [straightPort] : [];
+  }
+
+  let exitHeading = heading;
+  if (otherPorts.length > 0) {
+    let exitPort = otherPorts[0];
+    if (otherPorts.length > 1) {
+      const straightPort = (entryPort + 2) % 4;
+      const leftPort = (entryPort + 1) % 4;
+      const rightPort = (entryPort + 3) % 4;
+      const uTurnPort = entryPort;
+      const wantUTurn = roundabout && vehicle.turnIntent === 'uturn' && otherPorts.includes(uTurnPort);
+      const dest = !vehicle.manualOverride ? vehicle.destination : null;
+      if (dest && recommendExit) {
+        const rec = recommendExit(
+          vehicle.x,
+          vehicle.y,
+          heading,
+          dest,
+          vehicle.type || 'car',
+          grid,
+        );
+        if (rec !== null) exitPort = Math.round(rec / 90) % 4;
+        else if (vehicle.turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
+        else if (vehicle.turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
+        else if (wantUTurn) exitPort = uTurnPort;
+        else if (otherPorts.includes(straightPort)) exitPort = straightPort;
+      } else if (vehicle.turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
+      else if (vehicle.turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
+      else if (wantUTurn) exitPort = uTurnPort;
+      else if (otherPorts.includes(straightPort)) exitPort = straightPort;
+    }
+    exitHeading = ((exitPort % 4) + 4) % 4 * 90;
+  } else if (allowUTurn) {
+    exitHeading = (heading + 180) % 360;
+  }
+
+  if (allowUTurn && !canLeaveToward(vehicle, grid, exitHeading)) {
+    const back = (heading + 180) % 360;
+    if (back !== exitHeading && canLeaveToward(vehicle, grid, back)) {
+      exitHeading = back;
+    }
+  }
+
+  return exitHeading;
+}
+
+/** Tile, grid, and the exit the sim will actually take — one context for signal holds. */
+export function signalHoldContext(
+  vehicle: Vehicle,
+  tile: GridTile | null | undefined,
+  grid: GridData,
+): SignalContext {
+  return {
+    tile,
+    grid,
+    exitHeading: tile ? resolveVehicleExit(vehicle, tile, grid) : vehicle.heading,
+  };
+}
+
+export function computeExitHeading(vehicle: Vehicle, grid: GridData): number {
+  const tiles = grid[`${vehicle.x},${vehicle.y}`];
+  const currentTile = findVehicleTile(tiles, vehicle.zIndex) || getGroundRoadTile(tiles, vehicle.zIndex);
+  if (!currentTile) return vehicle.heading;
+  return resolveVehicleExit(vehicle, currentTile, grid);
 }
 
 export function getVehiclePose(
@@ -75,13 +230,15 @@ export function getVehiclePose(
   grid: GridData
 ): { posX: number; posY: number; rotation: number } {
   const exitHeading = computeExitHeading(vehicle, grid);
+  const tile = findVehicleTile(grid[`${vehicle.x},${vehicle.y}`], vehicle.zIndex);
   const { posX, posY, rotation } = getTrajectory(
     vehicle.x,
     vehicle.y,
     vehicle.heading,
     exitHeading,
     vehicle.lane,
-    vehicle.progress
+    vehicle.progress,
+    tile?.type,
   );
   return { posX, posY, rotation };
 }

@@ -15,8 +15,14 @@ export type TileType =
   | 'road-4lane-bridge'
   | 'road-transition-2to4'
   | 'road-roundabout'
+  /** Horizontal mirror of road-roundabout (ring on the SW corner, spur from the east). */
+  | 'road-roundabout-reverse'
+  /** One tile: 2-lane arms on all four sides, one-lane counterclockwise circle. */
+  | 'road-roundabout-4way'
   | 'road-end'
   | 'road-4lane-end'
+  /** 2-lane dead-end bulb; one road connection (same port family as road-end) */
+  | 'road-cul-de-sac'
   /** 2-lane road with curbside bus stop bay */
   | 'road-bus-stop'
   /** 4-lane road with curbside bus stop bay */
@@ -140,7 +146,7 @@ export interface Vehicle {
   railcars?: RailcarType[];
   isMoving?: boolean;
   speed?: number;
-  turnIntent?: 'left' | 'right' | 'straight' | null;
+  turnIntent?: 'left' | 'right' | 'straight' | 'uturn' | null;
   stepForward?: boolean;
   stepBackward?: boolean;
   turnAroundAtDeadEnd?: boolean;
@@ -198,6 +204,8 @@ export interface Vehicle {
   // ——— Bus route service ———
   /** Ordered bus-stop tile keys (e.g. "12,5") the bus cycles through */
   busRoute?: string[];
+  /** Id of the station route (BuildingConfig.busRoutes) this bus is assigned to */
+  busRouteId?: string;
   /** Index of the next stop in busRoute */
   busRouteIndex?: number;
   /** Completed full loops of the route (resets after refuel) */
@@ -217,6 +225,13 @@ export interface Vehicle {
   busRefuelAccumMs?: number;
   /** Anchor key of assigned building-bus-station */
   busStationKey?: string;
+  /**
+   * Tow truck: id of the vehicle currently hooked behind this truck.
+   * Only valid when type === 'tow-truck'.
+   */
+  towedVehicleId?: string;
+  /** Set on a vehicle that is hooked to a tow truck (that truck's id). */
+  towedById?: string;
 }
 
 export type PersonSex = 'm' | 'f';
@@ -232,19 +247,49 @@ export type PersonActivity =
   | 'seeking_care'
   | 'in_care'
   | 'waiting_taxi'
+  | 'waiting_bus'
+  | 'waiting_train'
   | 'walking';
 
 export type TravelPurpose = 'work' | 'shop' | 'home' | 'care';
 
-/** How a person prefers to travel for a trip */
-export type TravelTransport = 'auto' | 'walk' | 'car' | 'taxi' | 'bus';
+/** How a single trip is being carried (taxi is the robotaxi). */
+export type TravelTransport = 'auto' | 'walk' | 'car' | 'taxi' | 'bus' | 'train';
+
+/**
+ * Lasting choice on the person. Mutually exclusive.
+ * Unset keeps the older rule: drive the owned car when there is one, otherwise walk.
+ */
+export type TravelPreference = 'car' | 'bus' | 'robotaxi' | 'train' | 'walk';
+
+/** Where a multi-leg trip is right now. destinationKey stays the final goal. */
+export type TravelLeg =
+  | 'to-bus-stop'
+  | 'bus-ride'
+  | 'from-bus'
+  | 'to-train-station'
+  | 'train-ride'
+  | 'from-train';
 
 /** Planned destination for vehicle-based travel (no teleport). */
 export interface PersonTravelIntent {
   purpose: TravelPurpose;
   destinationKey: string;
-  /** Preferred transport; auto picks walk for short trips else car/taxi */
+  /** Mode for this trip. auto picks walk for short trips else car/taxi */
   transport?: TravelTransport;
+  /**
+   * Walk to this vehicle first, then drive to destinationKey.
+   * Used when the person owns a car that is not next to them.
+   */
+  pickupVehicleId?: string;
+  /**
+   * Interim stop: bus stop to board, or train station to board.
+   * The final goal remains destinationKey.
+   */
+  viaKey?: string;
+  leg?: TravelLeg;
+  /** Bus stop or train station where the current ride ends */
+  alightKey?: string;
 }
 
 /**
@@ -318,6 +363,15 @@ export interface Person {
    * otherwise behavior is opportunistic. User may assign or system may generate.
    */
   schedule?: PersonScheduleEntry[];
+  /**
+   * How this person travels when a trip starts.
+   * car: walk to their car, drive, park at the destination.
+   * robotaxi: wait to be picked up and dropped off.
+   * bus: walk to the nearest stop, ride, alight at the stop nearest the destination.
+   * train: reach the nearest station by another mode, ride, alight at the station nearest the destination, then continue.
+   * walk: sidewalks the whole way.
+   */
+  travelPreference?: TravelPreference;
   /** 'manual' = user-owned schedule (do not auto-regenerate); 'auto' = system may refresh */
   scheduleMode?: 'auto' | 'manual';
   /** Last schedule entry id applied this wall day (YYYY-MM-DD:entryId) */
@@ -413,6 +467,14 @@ export interface ActivePatient {
   patientLabel?: string;
 }
 
+/** Named stop list defined at a bus station. Fleet buses are assigned by id. */
+export interface BusRoute {
+  id: string;
+  name: string;
+  /** Ordered bus-stop tile keys */
+  stops: string[];
+}
+
 export interface BuildingConfig {
   anchorKey: string;
   name?: string;
@@ -421,7 +483,8 @@ export interface BuildingConfig {
   /** Max stored quantity per item type */
   inventoryCapacity?: Record<ItemId, number>;
   // Store
-  consumptionRates?: Record<ItemId, number>; // units per second
+  /** Units per second per customer currently shopping in the store */
+  consumptionRates?: Record<ItemId, number>;
   // Factory
   recipeInputs?: Array<{ item: ItemId; amount: number }>;
   recipeOutputs?: Array<{ item: ItemId; amount: number }>;
@@ -453,8 +516,12 @@ export interface BuildingConfig {
   /** Vehicle ids (buses) assigned to this station’s fleet */
   busFleetIds?: string[];
   /**
-   * Shared ordered bus-stop tile keys for this station’s route.
-   * Assigned fleet buses receive a copy when started on the route.
+   * Named routes for this station. Each fleet bus is assigned to one route.
+   */
+  busRoutes?: BusRoute[];
+  /**
+   * Legacy single shared route. Migrated into busRoutes on load.
+   * New writes mirror the first route's stops.
    */
   busRoute?: string[];
 }

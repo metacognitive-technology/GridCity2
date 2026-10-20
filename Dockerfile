@@ -9,8 +9,9 @@ RUN apk add --no-cache python3 make g++
 COPY package*.json ./
 RUN npm install
 
-# Copy source and build
+# Copy source and build (host already bumped APP_VERSION; do not bump again in-image)
 COPY . .
+ENV GRIDCITY_SKIP_VERSION_BUMP=1
 RUN npm run build
 
 # Production Stage

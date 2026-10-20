@@ -38,6 +38,14 @@ export const ROAD_HALF_WIDTH = (BASE_ROAD_WIDTH_2L / 2) * LANE_SIZE_SCALE;
 /** Lateral offset per lane unit (±1, ±2.5) used by vehicles and traffic controls. */
 export const LANE_OFFSET_UNIT = BASE_LANE_OFFSET_UNIT * LANE_SIZE_SCALE;
 
+/**
+ * Single-tile 4-way roundabout, in tile pixels.
+ * 2-lane mouths meet a one-lane counterclockwise ring around a center island.
+ */
+export const ROUNDABOUT_ISLAND_R = 8;
+export const ROUNDABOUT_OUTER_R = 24;
+export const ROUNDABOUT_LANE_R = (ROUNDABOUT_ISLAND_R + ROUNDABOUT_OUTER_R) / 2;
+
 /** Scale a coordinate relative to tile center. */
 export function sc(value: number): number {
   return TILE_CENTER + (value - TILE_CENTER) * LANE_SIZE_SCALE;

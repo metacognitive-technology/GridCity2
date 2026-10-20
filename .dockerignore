@@ -5,3 +5,9 @@ dist
 .env
 gridcity.db
 *.log
+e2e
+playwright-report
+test-results
+playwright.config.ts
+playwright/.cache
+

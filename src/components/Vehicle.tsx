@@ -25,6 +25,8 @@ interface VehicleProps {
   tileRotation?: number;
   turnIntent?: 'left' | 'right' | null;
   exitHeading?: number;
+  isMoving?: boolean;
+  destination?: { x: number; y: number } | null;
   type?: 'car' | 'train' | 'semi' | 'fire-truck' | 'police' | 'ambulance' | 'tow-truck' | 'taxi' | 'bus';
   trailers?: number;
   railcars?: RailcarType[];
@@ -48,6 +50,8 @@ interface VehicleProps {
   busRefuelTicks?: number;
   /** Accumulator ms toward next refuel second */
   busRefuelAccumMs?: number;
+  towedVehicleId?: string;
+  towedById?: string;
   onSelect?: (e: React.MouseEvent) => void;
   onTrailerSelect?: (trailerIndex: number, e: React.MouseEvent) => void;
   onRailcarSelect?: (railcarIndex: number, e: React.MouseEvent) => void;
@@ -169,7 +173,7 @@ export function getParkingStallWorldPosition(
   };
 }
 
-import { getTrajectory } from '../vehicleTrajectory';
+import { curveBetweenPoses, getTrajectory, type VehiclePose } from '../vehicleTrajectory';
 
 export { getTrajectory };
 
@@ -211,6 +215,19 @@ function sampleHistory(history: {x: number, y: number, r: number, d: number}[], 
   }
   return history[0];
 }
+
+/** Pose tracks the simulation. A spring on left/top draws a straight chord through curves. */
+const POSE_TRANSITION = {
+  left: { duration: 0 },
+  top: { duration: 0 },
+  rotate: { duration: 0 },
+  x: { duration: 0 },
+  y: { duration: 0 },
+  scaleX: { duration: 0 },
+  scaleY: { duration: 0 },
+  opacity: { type: 'spring' as const, stiffness: 300, damping: 30 },
+  scale: { type: 'spring' as const, stiffness: 300, damping: 30 },
+};
 
 const vehicleSelectHandlers = (onSelect?: (e: React.MouseEvent) => void) =>
   onSelect
@@ -267,7 +284,7 @@ export const TrailerVisual: React.FC<{
         scaleY: zIndex > 0 ? 1.1 : 1,
       }}
       exit={{ opacity: 0, scale: 0.5 }}
-      transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+      transition={POSE_TRANSITION}
       {...vehicleSelectHandlers(onSelect)}
     >
       {selected && (
@@ -402,7 +419,7 @@ const Railcar: React.FC<{
         scaleY: zIndex > 0 ? 1.1 : 1,
       }}
       exit={{ opacity: 0, scale: 0.5 }}
-      transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+      transition={POSE_TRANSITION}
       {...vehicleSelectHandlers(onSelect)}
     >
       {selected && (
@@ -452,12 +469,14 @@ const Railcar: React.FC<{
 };
 
 export const Vehicle: React.FC<VehicleProps> = ({ 
-  x, y, heading, lane, progress, color, zIndex, exitHeading, 
+  id, x, y, heading, lane, progress, color, zIndex, exitHeading,
+  isMoving, destination,
   type = 'car', trailers = 0, railcars = [],
   tileType, tileRotation, tilePart, tileLocalX = 0, tileLocalY = 0, tileW = 1, tileH = 1,
   parkingStopUntil, trafficStopUntil, trafficStopReason, parkingStallIndex = 0, lastParkingKey,
   emergencyLightsOn,
   busPhase, busStopUntil, busRefuelTicks, busRefuelAccumMs,
+  towedVehicleId, towedById,
   onSelect, onTrailerSelect, onRailcarSelect,
   trailerCargos, railcarCargos, selectedRailcarIndex, showCargoLabels,
   showRailcarCargoLabels, showStopTimerBadge = true, itemEmojiResolver
@@ -520,26 +539,11 @@ export const Vehicle: React.FC<VehicleProps> = ({
     busRefuelAccumMs,
   ]);
 
-  const { posX: standardX, posY: standardY, rotation: standardRot } = getTrajectory(x, y, heading, targetHeading, lane, progress);
-
-  // Normalize rotation to avoid 360 -> 0 spin
-  // We can use a ref to keep track of the continuous rotation
-  const prevRotationRef = React.useRef(standardRot);
-  
-  let diff = (standardRot - prevRotationRef.current) % 360;
-  if (diff > 180) diff -= 360;
-  if (diff < -180) diff += 360;
-  
-  const standardDisplayRotation = prevRotationRef.current + diff;
-
-  // Calculate parking spot position and interpolate if vehicle is parked/parking
-  let posX = standardX;
-  let posY = standardY;
-  let displayRotation = standardDisplayRotation;
+  const roadPose = getTrajectory(x, y, heading, targetHeading, lane, progress, tileType);
 
   const isParkedCell =
-    tileType &&
-    lastParkingKey &&
+    !!tileType &&
+    !!lastParkingKey &&
     (tileType.startsWith('parking-') ||
       tileType === 'building-repair-shop' ||
       tileType === 'building-hospital' ||
@@ -547,47 +551,49 @@ export const Vehicle: React.FC<VehicleProps> = ({
       tileType === 'building-apartment' ||
       tileType === 'building-taxi-station' ||
       tileType === 'building-bus-station');
+  const dwelling = !!(parkingStopUntil && parkingStopUntil > Date.now());
+  const heldInStall =
+    isParkedCell &&
+    !trafficStopReason &&
+    (dwelling || (isMoving === false && !destination));
+
+  const stallHoldRef = React.useRef<{ stall: VehiclePose; p0: number } | null>(null);
+  let pose = roadPose;
   if (isParkedCell) {
-    const stall = parkingStallIndex ?? 0;
-    const { posX: parkedX, posY: parkedY, rotation: parkedRot } = getParkingStallWorldPosition(
-      x, y, tileType, tileRotation || 0, tileLocalX ?? 0, tileLocalY ?? 0, tileW ?? 1, tileH ?? 1, stall
+    const stallIndex = parkingStallIndex ?? 0;
+    const stall = getParkingStallWorldPosition(
+      x, y, tileType!, tileRotation || 0, tileLocalX ?? 0, tileLocalY ?? 0, tileW ?? 1, tileH ?? 1, stallIndex,
     );
-
-    if (progress <= 0.5) {
-      const t = progress / 0.5;
-      posX = standardX * (1 - t) + parkedX * t;
-      posY = standardY * (1 - t) + parkedY * t;
-
-      let rDiff = (parkedRot - standardRot) % 360;
-      if (rDiff > 180) rDiff -= 360;
-      if (rDiff < -180) rDiff += 360;
-      const targetDisplayRot = standardRot + rDiff * t;
-      
-      let continuousDiff = (targetDisplayRot - prevRotationRef.current) % 360;
-      if (continuousDiff > 180) continuousDiff -= 360;
-      if (continuousDiff < -180) continuousDiff += 360;
-      displayRotation = prevRotationRef.current + continuousDiff;
+    if (heldInStall) {
+      stallHoldRef.current = { stall, p0: progress };
+      pose = stall;
+    } else if (stallHoldRef.current && progress + 1e-4 >= stallHoldRef.current.p0) {
+      const { stall: from, p0 } = stallHoldRef.current;
+      const span = 1 - p0;
+      if (span < 0.08) {
+        stallHoldRef.current = null;
+      } else {
+        const exitPose = getTrajectory(x, y, heading, targetHeading, lane, 1, tileType);
+        const u = Math.min(1, Math.max(0, (progress - p0) / span));
+        // One curve out of the stall onto the exit heading. A two-segment lerp is a 2-point turn.
+        pose = curveBetweenPoses(from, exitPose, u);
+        if (u >= 1) stallHoldRef.current = null;
+      }
     } else {
-      const t = (progress - 0.5) / 0.5;
-      posX = parkedX * (1 - t) + standardX * t;
-      posY = parkedY * (1 - t) + standardY * t;
-
-      let rDiff = (standardRot - parkedRot) % 360;
-      if (rDiff > 180) rDiff -= 360;
-      if (rDiff < -180) rDiff += 360;
-      const targetDisplayRot = parkedRot + rDiff * t;
-      
-      let continuousDiff = (targetDisplayRot - prevRotationRef.current) % 360;
-      if (continuousDiff > 180) continuousDiff -= 360;
-      if (continuousDiff < -180) continuousDiff += 360;
-      displayRotation = prevRotationRef.current + continuousDiff;
+      stallHoldRef.current = null;
     }
   } else {
-    posX = standardX;
-    posY = standardY;
-    displayRotation = standardDisplayRotation;
+    stallHoldRef.current = null;
   }
+
+  const prevRotationRef = React.useRef(pose.rotation);
+  let diff = (pose.rotation - prevRotationRef.current) % 360;
+  if (diff > 180) diff -= 360;
+  if (diff < -180) diff += 360;
+  const displayRotation = prevRotationRef.current + diff;
   prevRotationRef.current = displayRotation;
+  const posX = pose.posX;
+  const posY = pose.posY;
 
   // History tracking for trailers
   const traveledRef = React.useRef(0);
@@ -649,6 +655,7 @@ export const Vehicle: React.FC<VehicleProps> = ({
   return (
     <>
       <motion.div
+        data-testid={`vehicle-sprite-${id}`}
         style={{
           position: 'absolute',
           width: baseWidth,
@@ -660,7 +667,7 @@ export const Vehicle: React.FC<VehicleProps> = ({
           pointerEvents: onSelect ? 'auto' : 'none',
           cursor: onSelect ? 'pointer' : undefined,
           // Allow emergency light glow to show outside the body
-          overflow: isService ? 'visible' : 'hidden',
+          overflow: isService || towedById || towedVehicleId ? 'visible' : 'hidden',
         }}
         initial={{ opacity: 0, scale: 0.5 }}
         animate={{
@@ -675,7 +682,7 @@ export const Vehicle: React.FC<VehicleProps> = ({
           scaleY: zIndex > 0 ? 1.1 : 1,
         }}
         exit={{ opacity: 0, scale: 0.5 }}
-        transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+        transition={POSE_TRANSITION}
         {...vehicleSelectHandlers(onSelect)}
       >
         {/* Windshield */}
@@ -782,6 +789,21 @@ export const Vehicle: React.FC<VehicleProps> = ({
         {type === 'tow-truck' && (
           <>
             <div style={{ position: 'absolute', bottom: '5%', left: '20%', right: '20%', height: '18%', backgroundColor: '#57534e', borderRadius: 1 }} />
+            {towedVehicleId && (
+              <div
+                title="Hook connected"
+                style={{
+                  position: 'absolute',
+                  bottom: '-6%',
+                  left: '40%',
+                  right: '40%',
+                  height: '12%',
+                  backgroundColor: '#a16207',
+                  borderRadius: 1,
+                  boxShadow: '0 0 4px #fbbf24',
+                }}
+              />
+            )}
             <div className="emergency-light-bar" style={{ top: '2%', height: '14%' }}>
               {lightsFlashing ? (
                 <>
@@ -804,6 +826,22 @@ export const Vehicle: React.FC<VehicleProps> = ({
         {/* Headlights */}
         <div style={{ position: 'absolute', top: isEmergency ? '16%' : type === 'bus' || type === 'taxi' ? '2%' : '0', left: '15%', width: '20%', height: type === 'semi' || isService ? '12%' : '10%', backgroundColor: '#fef3c7', borderRadius: '50%' }} />
         <div style={{ position: 'absolute', top: isEmergency ? '16%' : type === 'bus' || type === 'taxi' ? '2%' : '0', right: '15%', width: '20%', height: type === 'semi' || isService ? '12%' : '10%', backgroundColor: '#fef3c7', borderRadius: '50%' }} />
+        {towedById && (
+          <div
+            title="On tow hook"
+            style={{
+              position: 'absolute',
+              top: '-10px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              fontSize: 9,
+              lineHeight: 1,
+              pointerEvents: 'none',
+            }}
+          >
+            🪝
+          </div>
+        )}
       </motion.div>
       
       {type === 'semi' && Array.from({ length: trailers }).map((_, i) => {

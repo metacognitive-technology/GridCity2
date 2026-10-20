@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import JSZip from 'jszip';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -58,6 +58,7 @@ import {
   Cross,
   Wrench,
   Siren,
+  Bot,
   Bus,
   CarTaxiFront,
   Users,
@@ -66,11 +67,26 @@ import {
   UserMinus,
   Pencil,
   Briefcase,
+  Building2,
+  CircleOff,
   Joystick,
   GripHorizontal,
   ShipWheel,
   Clock,
+  CircleHelp,
 } from 'lucide-react';
+import {
+  BotPanel,
+  type BotContext,
+  type BotPickMode,
+  type BotPickResult,
+} from './components/BotPanel';
+import {
+  BOT_ACTION_LIMITS,
+  expandActions,
+  type BotAction,
+  type BotAsk,
+} from './botActions';
 import { Tile } from './components/Tile';
 import { Vehicle as VehicleComponent, ParkedTrailerVisual } from './components/Vehicle';
 import { DriverView3D, PersonView3D } from './components/DriverView3D';
@@ -82,8 +98,27 @@ import {
   LayoutSnapshot, ServiceVehicleType, SERVICE_VEHICLE_TYPES, isServiceVehicleType,
   hasEmergencyLights,
   RepairRecipe, ActiveRepair, IllnessRecipe, ActivePatient,
-  Person, Family, ActiveTaxiRide,
+  Person, Family, ActiveTaxiRide, TravelPreference, BusRoute,
 } from './types';
+import {
+  addBusRoute,
+  appendBusRouteStop,
+  assignBusToRoute,
+  busRoutesOf,
+  clearVehicleRoute,
+  deleteBusRoute,
+  findBusRoute,
+  makeBusRouteId,
+  releaseBusesFromRoute,
+  removeBusRouteStopAt,
+  renameBusRoute,
+  resolveBusRouteId,
+  stampRouteIds,
+  syncAssignedBuses,
+  withBusRoutes,
+  type PendingBusRouteEdit,
+} from './busRoutes';
+import { traceBusRouteCells } from './busRouteOverlay';
 import {
   populateHomes,
   tickPeopleSimulation,
@@ -102,7 +137,9 @@ import {
   peopleResidingAt,
   familiesAtHome,
   peopleInBuilding,
+  peopleShoppingAt,
   syncVehicleOccupancy,
+  exchangeBusPassengers,
   isAdult,
   MS_PER_AGE_YEAR,
   countEmployeesAtBuilding,
@@ -127,8 +164,27 @@ import {
   cityTimeOffsetForLocalTime,
   parseClockInput,
   locationForMapPlacement,
+  startPersonTravel,
+  commuteIntentForPerson,
+  applyPeopleSimPatch,
+  personNearVehicle,
+  toOutdoorLocation,
+  TRAVEL_PREFERENCE_OPTIONS,
+  travelPreferenceLabel,
+  preferenceToTransport,
+  releaseDeletedTaxis,
 } from './people';
 import { PersonMapIcon } from './components/PersonMarker';
+import { formatAppVersion } from './version';
+import {
+  BUS_LOOPS_BEFORE_REFUEL,
+  BUS_REFUEL_TICKS,
+  applyBusRefuelParking,
+  findBusBayCells,
+  findBusStationRefuelPoint,
+  findNearestBusStationKey,
+  isBusRefuelStall,
+} from './bus';
 import {
   DEFAULT_TRAFFIC_STATE,
   normalizeTraffic,
@@ -157,6 +213,13 @@ import {
   isEmergencyMode,
   getEmergencyHomeLane,
   getEmergencyPassLane,
+  isOneWayTileType,
+  oneWayKeepLane,
+  taxiLaneEnteringTile,
+  getOneWayTravel,
+  isRoundabout4Way,
+  driveExitPorts,
+  routeStepCost,
 } from './traffic';
 import {
   canResumeAfterVehicleStop,
@@ -164,6 +227,16 @@ import {
   hasVehicleBlockingAhead,
   isLaneClearForEmergency,
 } from './vehicleCollision';
+import { bindRouteExit, resolveVehicleExit, signalHoldContext } from './vehicleShapes';
+import { roundaboutYieldLimit } from './roundaboutYield';
+import { headingWhenEnteringTile, roundaboutTravelFactor } from './vehicleTrajectory';
+import {
+  connectTowHook,
+  disconnectTowHook,
+  findTowTargetBehind,
+  isTowTruck,
+  snapTowedVehicle,
+} from './tow';
 import socket from './socket';
 
 const GRID_SIZE = 64;
@@ -192,6 +265,33 @@ const WORDS = [
 ];
 const SIDEBAR_WIDTH = 288;
 const MAX_HISTORY = 50;
+/** Gap between the overview minimap and the right dock / tool menu. */
+const RIGHT_HUD_GAP_PX = 16;
+/** Matches Tailwind w-80 / w-96 / w-[26rem] on the right dock panels. */
+const RIGHT_DOCK_WIDTH_PX = {
+  people: 416,
+  wide: 384,
+  narrow: 320,
+} as const;
+
+function openRightDockWidthPx(flags: {
+  people: boolean;
+  logistics: boolean;
+  plant: boolean;
+  traffic: boolean;
+  cars: boolean;
+  semi: boolean;
+  train: boolean;
+  service: boolean;
+  bot: boolean;
+}): number {
+  return Math.max(
+    flags.people ? RIGHT_DOCK_WIDTH_PX.people : 0,
+    flags.logistics || flags.bot ? RIGHT_DOCK_WIDTH_PX.wide : 0,
+    flags.semi || flags.train || flags.service ? RIGHT_DOCK_WIDTH_PX.wide : 0,
+    flags.plant || flags.traffic || flags.cars ? RIGHT_DOCK_WIDTH_PX.narrow : 0,
+  );
+}
 
 const isWithinGridCanvas = (x: number, y: number) =>
   x >= GRID_CANVAS_MIN && x <= GRID_CANVAS_MAX &&
@@ -263,8 +363,11 @@ const TILE_CONNECTIONS: Record<string, number[]> = {
   'road-4lane-bridge': [0, 2],
   'road-transition-2to4': [0, 2],
   'road-roundabout': [0, 1, 2, 3],
+  'road-roundabout-reverse': [0, 1, 2, 3],
+  'road-roundabout-4way': [0, 1, 2, 3],
   'road-end': [2],
   'road-4lane-end': [2],
+  'road-cul-de-sac': [2],
   'road-bus-stop': [0, 2],
   'road-4lane-bus-stop': [0, 2],
   'rail-straight': [0, 2],
@@ -1036,8 +1139,8 @@ function normalizeBuildingConfig(cfg: BuildingConfig): BuildingConfig {
     if (!next.activeTaxiRides) next = { ...next, activeTaxiRides: [] };
   }
   if (next.role === 'bus-station') {
-    if (!next.busFleetIds) next = { ...next, busFleetIds: [] };
-    if (!next.busRoute) next = { ...next, busRoute: [] };
+    const routes = busRoutesOf({ ...next, busFleetIds: next.busFleetIds || [] });
+    next = withBusRoutes({ ...next, busFleetIds: next.busFleetIds || [] }, routes);
   }
   const inventory = { ...(next.inventory || {}) };
   Object.keys(inventory).forEach(itemId => {
@@ -1958,10 +2061,7 @@ function randomHomeTourDelayMs(): number {
 }
 
 /** Bus route service constants */
-const BUS_LOOPS_BEFORE_REFUEL = 5;
-const BUS_REFUEL_TICKS = 20; // ~1 tick/sec while parked at station
 const BUS_BOARDING_MS = 3500;
-const BUS_BOARD_RADIUS = 2; // tiles
 
 export function isBusStopTileType(type: string | undefined): boolean {
   return type === 'road-bus-stop' || type === 'road-4lane-bus-stop';
@@ -2048,39 +2148,6 @@ function parseGridKey(key: string | undefined): Point | null {
   return { x, y };
 }
 
-function findNearestBusStationKey(from: Point, grid: GridData): string | null {
-  let best: string | null = null;
-  let bestD = Infinity;
-  Object.entries(grid).forEach(([key, tiles]) => {
-    const top = tiles?.[tiles.length - 1];
-    if (!top || top.type !== 'building-bus-station') return;
-    // Prefer anchor cells
-    if (top.part === 'member') return;
-    const p = parseGridKey(key);
-    if (!p) return;
-    const d = Math.abs(p.x - from.x) + Math.abs(p.y - from.y);
-    if (d < bestD) {
-      bestD = d;
-      best = key;
-    }
-  });
-  // Fallback: any bay cell as station key
-  if (!best) {
-    Object.entries(grid).forEach(([key, tiles]) => {
-      const top = tiles?.[tiles.length - 1];
-      if (!top || top.type !== 'building-bus-station') return;
-      const p = parseGridKey(key);
-      if (!p) return;
-      const d = Math.abs(p.x - from.x) + Math.abs(p.y - from.y);
-      if (d < bestD) {
-        bestD = d;
-        best = top.anchorKey || key;
-      }
-    });
-  }
-  return best;
-}
-
 function busStopKeyAt(x: number, y: number, grid: GridData): string | null {
   const tiles = grid[`${x},${y}`];
   const top = tiles?.[tiles.length - 1];
@@ -2104,41 +2171,11 @@ function processBusArrival(
   const hereKey = `${v.x},${v.y}`;
   const phase = v.busPhase || 'route';
 
-  // Arrived at station for fuel
-  const hereTop = grid[hereKey]?.[(grid[hereKey]?.length || 1) - 1];
-  const onBusStation =
-    hereTop?.type === 'building-bus-station' ||
-    (!!v.busStationKey &&
-      (hereKey === v.busStationKey || hereTop?.anchorKey === v.busStationKey));
-  if (phase === 'to-station' && onBusStation) {
-    v = {
-      ...v,
-      busPhase: 'refueling',
-      busRefuelTicks: BUS_REFUEL_TICKS,
-      busRefuelAccumMs: 0,
-      destination: null,
-      isMoving: false,
-      turnIntent: null,
-      progress: 0.5,
-      randomTurning: false,
-    };
-    // Alight all bus passengers at station
-    const pax = getPassengerIds(nextPeople, v.id);
-    for (const pid of pax) {
-      const p = nextPeople[pid];
-      if (!p) continue;
-      nextPeople = alightPerson(
-        nextPeople,
-        pid,
-        { kind: 'building', buildingKey: v.busStationKey || hereKey },
-        'idle',
-        now + 15_000,
-      );
-      const np = nextPeople[pid];
-      if (np) {
-        nextPeople[pid] = { ...np, busDropoffStop: undefined };
-      }
-    }
+  // Arrived at station for fuel — park in a bay or the station's parking lot
+  const onRefuelStall = isBusRefuelStall(v.x, v.y, v.busStationKey, grid);
+  if (phase === 'to-station' && onRefuelStall) {
+    v = applyBusRefuelParking(v, grid);
+    // Riders stay aboard through the depot and step off at their stop later.
     v = syncVehicleOccupancy(v, nextPeople);
     return { vehicle: v, people: nextPeople };
   }
@@ -2160,80 +2197,9 @@ function processBusArrival(
     };
   }
 
-  // Drop off passengers for this stop
-  const passengers = getPassengerIds(nextPeople, v.id);
-  for (const pid of passengers) {
-    const p = nextPeople[pid];
-    if (!p) continue;
-    if (p.busDropoffStop === stopKey || p.busDropoffStop === hereKey) {
-      nextPeople = alightPerson(
-        nextPeople,
-        pid,
-        { kind: 'tile', x: v.x, y: v.y },
-        'idle',
-        now + 20_000,
-      );
-      const np = nextPeople[pid];
-      if (np) nextPeople[pid] = { ...np, busDropoffStop: undefined };
-    }
-  }
-
-  // Pick up people near the stop who are not already on a vehicle
-  const maxPax = v.maxPassengers ?? getMaxPassengers(v.type);
-  let aboard = getPassengerIds(nextPeople, v.id).length;
-  const stopPt = parseGridKey(stopKey) || { x: v.x, y: v.y };
-  const candidates = Object.values(nextPeople)
-    .filter(p => {
-      if (p.location.kind === 'vehicle') return false;
-      if (p.activity === 'working' || p.activity === 'in_care') return false;
-      // Near stop (homes, buildings, outdoor stands, sidewalks, tiles)
-      let px = stopPt.x;
-      let py = stopPt.y;
-      if (p.location.kind === 'tile') {
-        px = p.location.x;
-        py = p.location.y;
-      } else if (p.location.kind === 'home') {
-        const hp = parseGridKey(p.location.homeKey);
-        if (!hp) return false;
-        px = hp.x;
-        py = hp.y;
-      } else if (p.location.kind === 'building') {
-        const bp = parseGridKey(p.location.buildingKey);
-        if (!bp) return false;
-        px = bp.x;
-        py = bp.y;
-      } else if (p.location.kind === 'outdoor') {
-        const op = parseGridKey(p.location.atKey);
-        if (!op) return false;
-        px = op.x;
-        py = op.y;
-      } else if (p.location.kind === 'walking') {
-        px = Math.floor(p.location.x);
-        py = Math.floor(p.location.y);
-      }
-      return Math.abs(px - stopPt.x) + Math.abs(py - stopPt.y) <= BUS_BOARD_RADIUS;
-    })
-    .sort((a, b) => personDisplayName(a).localeCompare(personDisplayName(b)));
-
-  for (const p of candidates) {
-    if (aboard >= maxPax) break;
-    if (canBoardAsPassenger(p, v, nextPeople)) continue;
-    // Drop off at a different stop on the route when possible
-    const otherStops = route.filter(k => k !== stopKey);
-    const dropoff =
-      otherStops.length > 0
-        ? otherStops[Math.floor(Math.random() * otherStops.length)]
-        : stopKey;
-    nextPeople = boardPerson(nextPeople, p.id, v.id, 'passenger');
-    nextPeople[p.id] = {
-      ...nextPeople[p.id],
-      busDropoffStop: dropoff,
-      activity: 'commuting',
-      travelIntent: undefined,
-    };
-    aboard += 1;
-  }
-
+  // Alight at the route stop nearest each rider's destination, then board
+  // people waiting here. Late arrivals are picked up again during the dwell.
+  nextPeople = exchangeBusPassengers(nextPeople, v, grid, now);
   v = syncVehicleOccupancy(v, nextPeople);
 
   // Advance route index; count loop when wrapping
@@ -2243,12 +2209,12 @@ function processBusArrival(
     loops += 1;
   }
 
-  // After 5 loops → station for gas
+  // After 5 loops → station for gas (park in the lot / bay, never the office)
   if (loops >= BUS_LOOPS_BEFORE_REFUEL) {
     const station =
       v.busStationKey ||
       findNearestBusStationKey({ x: v.x, y: v.y }, grid);
-    const stationPt = parseGridKey(station || undefined);
+    const stallPt = findBusStationRefuelPoint(station, { x: v.x, y: v.y }, grid);
     v = {
       ...v,
       busRouteIndex: 0,
@@ -2256,8 +2222,8 @@ function processBusArrival(
       busPhase: 'to-station',
       busStationKey: station || v.busStationKey,
       busStopUntil: undefined,
-      destination: stationPt,
-      isMoving: !!stationPt,
+      destination: stallPt,
+      isMoving: !!stallPt,
       turnIntent: null,
       progress: 0.5,
       randomTurning: false,
@@ -2350,8 +2316,13 @@ function advanceBusService(
     return { vehicle: v, people: nextPeople, handled: true };
   }
 
-  // Boarding dwell at stop
+  // Boarding dwell at stop — keep picking up people who reach the stop while it sits
   if (v.busPhase === 'boarding') {
+    const exchanged = exchangeBusPassengers(nextPeople, v, grid, now);
+    if (exchanged !== nextPeople) {
+      nextPeople = exchanged;
+      v = syncVehicleOccupancy(v, nextPeople);
+    }
     if (v.busStopUntil && now < v.busStopUntil) {
       return {
         vehicle: { ...v, isMoving: false, destination: null },
@@ -2377,10 +2348,18 @@ function advanceBusService(
 
   // Ensure destination while on route / to-station
   if (v.busPhase === 'to-station') {
-    if (!v.destination) {
+    // Already sitting in the station lot / bay → start fueling even if dest was the office
+    if (isBusRefuelStall(v.x, v.y, v.busStationKey, grid)) {
+      const arrived = processBusArrival(v, nextPeople, grid, now);
+      return { vehicle: arrived.vehicle, people: arrived.people, handled: true };
+    }
+    const destIsStall =
+      !!v.destination &&
+      isBusRefuelStall(v.destination.x, v.destination.y, v.busStationKey, grid);
+    if (!v.destination || !destIsStall) {
       const station =
         v.busStationKey || findNearestBusStationKey({ x: v.x, y: v.y }, grid);
-      const pt = parseGridKey(station || undefined);
+      const pt = findBusStationRefuelPoint(station, { x: v.x, y: v.y }, grid);
       if (pt) {
         v = {
           ...v,
@@ -2408,8 +2387,8 @@ function advanceBusService(
         randomTurning: false,
         turnAroundAtDeadEnd: true,
       };
-    } else if (pt && !v.isMoving && !v.busStopUntil) {
-      // Was stopped but should be en route
+    } else if (pt && !v.isMoving && !v.busStopUntil && !v.trafficStopReason) {
+      // Was stopped but should be en route. Do not clear a signal / yield hold.
       v = { ...v, isMoving: true, destination: pt, randomTurning: false };
     }
     return { vehicle: v, people: nextPeople, handled: true };
@@ -2540,7 +2519,13 @@ export function getRecommendedExit(
     p => (p + (startTile?.rotation || 0) / 90) % 4,
   );
   const entryPort = (entryHeading / 90 + 2) % 4;
-  const possibleExits = startPorts.filter(p => p !== entryPort);
+  const startOneWay = getOneWayTravel(startTile);
+  const possibleExits = driveExitPorts(
+    startTile?.type || '',
+    startPorts,
+    entryPort,
+    startOneWay ? startOneWay.exitPort : null,
+  );
 
   if (possibleExits.length === 0) return null;
 
@@ -2559,7 +2544,8 @@ export function getRecommendedExit(
     if (!visited.has(nkey)) {
       visited.add(nkey);
       queue.push({
-        x: nx, y: ny, heading: exitH, cost: 1,
+        x: nx, y: ny, heading: exitH,
+        cost: routeStepCost(startTile?.type, entryPort, exitPort),
         firstExit: exitH,
         prev: { x: cx, y: cy, heading: entryHeading, exit: exitH },
       });
@@ -2613,7 +2599,14 @@ export function getRecommendedExit(
       (p: number) => (p + (curTile.rotation || 0) / 90) % 4,
     );
     const entP = (node.heading / 90 + 2) % 4;
-    const nextExits = ports.filter((p: number) => p !== entP);
+    const curOneWay = getOneWayTravel(curTile);
+    if (curOneWay && entP !== curOneWay.enterPort) continue;
+    const nextExits = driveExitPorts(
+      curTile.type,
+      ports,
+      entP,
+      curOneWay ? curOneWay.exitPort : null,
+    );
 
     // Type filters
     if (vType === 'train') {
@@ -2633,8 +2626,10 @@ export function getRecommendedExit(
       if (!nextTiles?.length) continue;
       const nextRoad = getRoutingRoadTile(nextTiles);
       if (!nextRoad && vType !== 'train') continue;
+      const nextOw = nextRoad ? getOneWayTravel(nextRoad) : null;
+      if (nextOw && (exH / 90 + 2) % 4 !== nextOw.enterPort) continue;
 
-      let stepCost = 1;
+      let stepCost = routeStepCost(curTile.type, entP, exP);
       // Soft bias: when bus destination has a known approach, prefer headings aligned
       // with that approach as we get close (helps set up the final approach leg)
       if (isBus && busApproach != null) {
@@ -2682,6 +2677,8 @@ export function getRecommendedExit(
   }
   return bestExit;
 }
+
+bindRouteExit(getRecommendedExit);
 
 const parseCoordKey = (key: string): Point | null => {
   const parts = key.split(',');
@@ -3476,6 +3473,9 @@ const PALETTE_TILES: { type: TileType; label: string; category: 'road' | 'rail' 
   { type: 'road-4lane-bridge', label: '4-Lane Bridge', category: 'road' },
   { type: 'road-transition-2to4', label: '2-4 Transition', category: 'road' },
   { type: 'road-roundabout', label: 'Roundabout', category: 'road' },
+  { type: 'road-roundabout-reverse', label: 'Roundabout Mirror', category: 'road' },
+  { type: 'road-roundabout-4way', label: '4-Way Roundabout', category: 'road' },
+  { type: 'road-cul-de-sac', label: 'Cul-de-sac', category: 'road' },
   { type: 'road-bus-stop', label: 'Bus Stop (2-Lane)', category: 'road' },
   { type: 'road-4lane-bus-stop', label: 'Bus Stop (4-Lane)', category: 'road' },
   { type: 'rail-straight', label: 'Straight Rail', category: 'rail' },
@@ -3946,6 +3946,116 @@ function formatControllerLabel(uid: string | undefined): string {
   return uid.length > 10 ? uid.slice(0, 10) : uid;
 }
 
+function PeopleIconBtn({
+  title,
+  disabled,
+  onClick,
+  active,
+  className,
+  testId,
+  children,
+}: {
+  title: string;
+  disabled?: boolean;
+  onClick: () => void;
+  active?: boolean;
+  className: string;
+  testId: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      aria-label={title}
+      data-testid={testId}
+      disabled={disabled}
+      onClick={onClick}
+      className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-lg text-white disabled:opacity-35 disabled:pointer-events-none ${className} ${
+        active ? 'animate-pulse ring-2 ring-white/70' : 'hover:brightness-110'
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function TowHookToggle({
+  tow,
+  vehicles,
+  grid,
+  roomCode,
+  onToggle,
+}: {
+  tow: Vehicle;
+  vehicles: Record<string, Vehicle>;
+  grid: GridData;
+  roomCode: string | null;
+  onToggle: () => void;
+}) {
+  const hooked = tow.towedVehicleId ? vehicles[tow.towedVehicleId] : undefined;
+  const connected = !!hooked;
+  const target = connected ? hooked : findTowTargetBehind(tow, vehicles, grid);
+  const targetLabel = target
+    ? `${(target.type || 'car').replace(/-/g, ' ')} ${target.id.slice(0, 10)}`
+    : null;
+
+  return (
+    <div
+      className={`flex items-center justify-between gap-3 px-2 py-1.5 rounded-lg border ${
+        connected
+          ? 'border-amber-300 bg-amber-50'
+          : target
+            ? 'border-slate-200 bg-white'
+            : 'border-slate-100 bg-slate-50'
+      }`}
+      data-testid="tow-hook-toggle"
+    >
+      <div className="flex items-center gap-2 min-w-0">
+        {connected ? (
+          <Unlink className="w-4 h-4 shrink-0 text-amber-700" />
+        ) : (
+          <Link2 className="w-4 h-4 shrink-0 text-slate-500" />
+        )}
+        <div className="min-w-0">
+          <div className="text-xs font-semibold text-slate-700">Tow hook</div>
+          <div className="text-[10px] text-slate-500 truncate">
+            {connected
+              ? `Towing ${targetLabel}`
+              : target
+                ? `Vehicle behind: ${targetLabel}`
+                : 'No vehicle within ½ tile behind'}
+          </div>
+        </div>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={connected}
+        data-testid="tow-hook-switch"
+        title={
+          connected
+            ? 'Disconnect hooked vehicle'
+            : target
+              ? 'Connect to vehicle behind'
+              : 'Need a vehicle within ½ tile behind the tow truck'
+        }
+        disabled={!roomCode || (!connected && !target)}
+        onClick={onToggle}
+        className={`relative w-11 h-6 rounded-full transition-colors shrink-0 disabled:opacity-40 ${
+          connected ? 'bg-amber-500' : 'bg-slate-300'
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
+            connected ? 'translate-x-5' : 'translate-x-0'
+          }`}
+        />
+      </button>
+    </div>
+  );
+}
+
 function FloatingVehicleDrivePanel({
   vehicleId,
   vehicle,
@@ -3978,6 +4088,7 @@ function FloatingVehicleDrivePanel({
   onClearHomes,
   onChangeTrailers,
   onToggleManualOverride,
+  onToggleTowHook,
   onAssignDriver,
   onAssignPassenger,
   onAssignOwnerPerson,
@@ -4017,6 +4128,7 @@ function FloatingVehicleDrivePanel({
   onClearHomes?: () => void;
   onChangeTrailers?: (delta: number) => void;
   onToggleManualOverride: (enabled: boolean) => void;
+  onToggleTowHook?: () => void;
   /** Assign / clear person as driver (null clears) */
   onAssignDriver?: (personId: string | null) => void;
   /** Board or remove passenger */
@@ -4369,6 +4481,7 @@ function FloatingVehicleDrivePanel({
         if ((e.target as HTMLElement).closest('[data-drive-panel-title]')) return;
         if ((e.target as HTMLElement).closest('[data-resize-handle]')) return;
         stopGridPropagation(e);
+        if ((e.target as HTMLElement).closest('[data-camera-joystick]')) return;
         onActivateRef.current();
       }}
       // stop bubble to grid; title-bar handlers still run first (event target)
@@ -4400,7 +4513,11 @@ function FloatingVehicleDrivePanel({
               className="w-2.5 h-2.5 rounded-full border border-white/70 shrink-0 mt-0.5"
               style={{ backgroundColor: vehicle.color }}
             />
-            <span className="text-xs font-bold break-all leading-tight min-w-0" title={vehicleId}>
+            <span
+              className="text-xs font-bold break-all leading-tight min-w-0"
+              title={vehicleId}
+              data-testid="drive-panel-title"
+            >
               Drive · {vehicleId}
             </span>
           </div>
@@ -4465,7 +4582,7 @@ function FloatingVehicleDrivePanel({
 
       {isActive && !isControlledByOther && (
         <div className="px-3 py-1 bg-slate-900/90 text-[9px] text-slate-200 font-medium tracking-wide border-b border-slate-700/50">
-          Keys → this vehicle: G go · S stop · F/B step · L/R turn · ↑↓ speed · ←→ lane
+          Keys → this vehicle: G go · S stop · F/B step · L/R turn · U u-turn · ↑↓ speed · ←→ lane
         </div>
       )}
       {isActive && isControlledByOther && (
@@ -4831,6 +4948,19 @@ function FloatingVehicleDrivePanel({
           )}
         </div>
 
+        {panelType === 'service' && vehicle.type === 'tow-truck' && onToggleTowHook && (
+          <TowHookToggle
+            tow={vehicle}
+            vehicles={vehiclesMap}
+            grid={grid}
+            roomCode={effectiveRoomCode}
+            onToggle={() => {
+              onActivate();
+              onToggleTowHook();
+            }}
+          />
+        )}
+
         {panelType === 'semi' && onChangeTrailers && (
           <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-100 rounded-xl px-2 py-1.5">
             <span className="text-[10px] font-semibold text-amber-800">
@@ -4881,6 +5011,54 @@ function FloatingVehicleDrivePanel({
   );
 }
 
+function TravelPreferenceSwitch({
+  value,
+  disabled,
+  name,
+  onChange,
+}: {
+  value: TravelPreference | undefined;
+  disabled?: boolean;
+  name: string;
+  onChange: (pref: TravelPreference) => void;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Travel preference"
+      className="flex flex-wrap gap-1"
+      data-testid="travel-preference"
+    >
+      {TRAVEL_PREFERENCE_OPTIONS.map(opt => {
+        const on = value === opt.id;
+        return (
+          <label
+            key={opt.id}
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md border text-[10px] font-bold cursor-pointer ${
+              on
+                ? 'bg-violet-600 text-white border-violet-700'
+                : 'bg-white text-slate-600 border-slate-200 hover:bg-violet-50'
+            } ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+          >
+            <input
+              type="radio"
+              name={name}
+              className="sr-only"
+              checked={on}
+              disabled={disabled}
+              data-testid={`travel-pref-${opt.id}`}
+              onChange={() => {
+                if (!disabled) onChange(opt.id);
+              }}
+            />
+            {opt.label}
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
 export type FloatingPersonPanelState = {
   personId: string;
   x: number;
@@ -4916,6 +5094,7 @@ function FloatingPersonControlPanel({
   onEnterNearbyBuilding,
   onAssignWorkplace,
   onFocusOnMap,
+  onTravelPreference,
 }: {
   personId: string;
   person: Person | undefined;
@@ -4940,6 +5119,7 @@ function FloatingPersonControlPanel({
   onEnterNearbyBuilding: () => void;
   onAssignWorkplace: () => void;
   onFocusOnMap: () => void;
+  onTravelPreference: (pref: TravelPreference) => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
@@ -5289,6 +5469,23 @@ function FloatingPersonControlPanel({
         </div>
 
         <div className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
+          Travel
+        </div>
+        <TravelPreferenceSwitch
+          name={`person-travel-${personId}`}
+          value={person.travelPreference}
+          disabled={!roomCode}
+          onChange={pref => {
+            onActivate();
+            onTravelPreference(pref);
+          }}
+        />
+        <p className="text-[9px] text-slate-400 leading-snug">
+          {person.travelPreference
+            ? `${travelPreferenceLabel(person.travelPreference)} is used for every trip.`
+            : 'Not set — drives their car when they own one, otherwise walks.'}
+        </p>
+        <div className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
           Actions
         </div>
         <div className="grid grid-cols-2 gap-1.5">
@@ -5299,10 +5496,11 @@ function FloatingPersonControlPanel({
               onActivate();
               onSendHome();
             }}
+            data-testid="person-go-home"
             className="py-1.5 rounded-lg text-[11px] font-bold bg-rose-600 text-white disabled:opacity-40 hover:bg-rose-700"
           >
             <Home className="w-3 h-3 inline mr-0.5" />
-            Send home
+            Go home
           </button>
           <button
             type="button"
@@ -5311,8 +5509,9 @@ function FloatingPersonControlPanel({
               onActivate();
               onGoToWork();
             }}
+            data-testid="person-go-to-work"
             className="py-1.5 rounded-lg text-[11px] font-bold bg-emerald-600 text-white disabled:opacity-40 hover:bg-emerald-700"
-            title={hasWork ? 'Travel to workplace' : 'No workplace assigned'}
+            title={hasWork ? 'Travel to workplace now' : 'No workplace assigned'}
           >
             <Briefcase className="w-3 h-3 inline mr-0.5" />
             Go to work
@@ -5498,6 +5697,19 @@ function TrafficPanel({
     { key: 'greenMs' as const, label: 'Green' },
   ];
 
+  const toggleAllOfKind = (kind: 'stop-sign' | 'stoplight') => {
+    const items = kind === 'stop-sign' ? signs : lights;
+    const keys = items.map(item => trafficControlKey(item));
+    const selectedCount = keys.filter(key => selectedIds.has(key)).length;
+    const next = new Set(selectedIds);
+    if (keys.length > 0 && selectedCount === keys.length) {
+      keys.forEach(key => next.delete(key));
+    } else {
+      keys.forEach(key => next.add(key));
+    }
+    onSelectIds(next);
+  };
+
   return (
     <div className="flex flex-col gap-4 h-full">
       <div className="bg-slate-50 rounded-xl p-3 border border-slate-100 space-y-3 shrink-0">
@@ -5558,8 +5770,21 @@ function TrafficPanel({
 
       <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-hidden">
         <div className="flex flex-col min-h-0 shrink-0" style={{ maxHeight: '38%' }}>
-          <div className="flex items-center justify-between px-1 mb-1">
-            <span className="text-sm font-medium text-slate-700">Stop Signs ({signs.length})</span>
+          <div className="flex items-center justify-between px-1 mb-1 gap-2">
+            <label className={`flex items-center gap-1.5 min-w-0 ${signs.length === 0 || !roomCode ? '' : 'cursor-pointer'}`}>
+              <input
+                type="checkbox"
+                aria-label="Select all stop signs"
+                title="Select all stop signs"
+                checked={signs.length > 0 && selectedSigns.length === signs.length}
+                disabled={signs.length === 0 || !roomCode}
+                onChange={() => toggleAllOfKind('stop-sign')}
+                className="rounded border-slate-300 text-red-600 focus:ring-red-600 disabled:opacity-40"
+              />
+              <span className="text-sm font-medium text-slate-700 truncate">
+                Stop Signs ({selectedSigns.length}/{signs.length})
+              </span>
+            </label>
             <button
               type="button"
               disabled={selectedSigns.length === 0 || !roomCode}
@@ -5606,8 +5831,21 @@ function TrafficPanel({
         </div>
 
         <div className="flex flex-col min-h-0 flex-1">
-          <div className="flex items-center justify-between px-1 mb-1">
-            <span className="text-sm font-medium text-slate-700">Stoplights ({lights.length})</span>
+          <div className="flex items-center justify-between px-1 mb-1 gap-2">
+            <label className={`flex items-center gap-1.5 min-w-0 ${lights.length === 0 || !roomCode ? '' : 'cursor-pointer'}`}>
+              <input
+                type="checkbox"
+                aria-label="Select all stoplights"
+                title="Select all stoplights"
+                checked={lights.length > 0 && selectedLights.length === lights.length}
+                disabled={lights.length === 0 || !roomCode}
+                onChange={() => toggleAllOfKind('stoplight')}
+                className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-600 disabled:opacity-40"
+              />
+              <span className="text-sm font-medium text-slate-700 truncate">
+                Stoplights ({selectedLights.length}/{lights.length})
+              </span>
+            </label>
             <div className="flex items-center gap-0.5">
               <button
                 type="button"
@@ -6233,6 +6471,7 @@ function createBuildingConfig(anchorKey: string, type: string): BuildingConfig {
     taxiFleetIds: role === 'taxi-station' ? [] : undefined,
     activeTaxiRides: role === 'taxi-station' ? [] : undefined,
     busFleetIds: role === 'bus-station' ? [] : undefined,
+    busRoutes: role === 'bus-station' ? [] : undefined,
     busRoute: role === 'bus-station' ? [] : undefined,
   };
   return normalizeBuildingConfig(base);
@@ -6343,23 +6582,97 @@ function findVehiclesInBusStationBays(
   return findVehiclesInBuildingBays(anchorKey, grid, vehicles, 'building-bus-station');
 }
 
-function findBusBayCells(
-  anchorKey: string,
-  grid: GridData,
-): Array<{ key: string; bayIndex: number; x: number; y: number }> {
-  const cells: Array<{ key: string; bayIndex: number; x: number; y: number }> = [];
-  for (const [key, tiles] of Object.entries(grid)) {
-    for (const t of tiles) {
-      if (t.type !== 'building-bus-station') continue;
-      const isAnchor = t.part !== 'member' && key === anchorKey;
-      const isMember = t.part === 'member' && t.anchorKey === anchorKey;
-      if (!isAnchor && !isMember) continue;
-      if (!isBusStationBay(t)) continue;
-      const [x, y] = key.split(',').map(Number);
-      cells.push({ key, bayIndex: getBusStationBayIndex(t), x, y });
-    }
+/** Thick blue preview of the route selected in the bus station window. */
+function BusRouteMapOverlay({ stops, grid }: { stops: string[]; grid: GridData }) {
+  const stopKey = stops.join('|');
+  const cells = useMemo(() => traceBusRouteCells(grid, stops), [grid, stopKey]);
+  const pixel = (p: Point) => ({
+    x: (p.x + 0.5) * GRID_SIZE,
+    y: (p.y + 0.5) * GRID_SIZE,
+  });
+  const line = cells.map(pixel);
+  const markers = stops
+    .map((key, index) => {
+      const p = parseGridKey(key);
+      return p ? { key, index, ...pixel(p) } : null;
+    })
+    .filter((m): m is { key: string; index: number; x: number; y: number } => !!m);
+  if (line.length === 0 && markers.length === 0) return null;
+
+  const xs = [...line.map(p => p.x), ...markers.map(m => m.x)];
+  const ys = [...line.map(p => p.y), ...markers.map(m => m.y)];
+  const pad = 28;
+  const minX = Math.min(...xs) - pad;
+  const minY = Math.min(...ys) - pad;
+  const width = Math.max(...xs) - minX + pad;
+  const height = Math.max(...ys) - minY + pad;
+  const rel = line.map(p => ({ x: p.x - minX, y: p.y - minY }));
+  const segments: { key: number; left: number; top: number; len: number; ang: number }[] = [];
+  for (let i = 0; i < rel.length - 1; i++) {
+    const a = rel[i];
+    const b = rel[i + 1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) continue;
+    segments.push({
+      key: i,
+      left: (a.x + b.x) / 2,
+      top: (a.y + b.y) / 2,
+      len,
+      ang: (Math.atan2(dy, dx) * 180) / Math.PI,
+    });
   }
-  return cells.sort((a, b) => a.bayIndex - b.bayIndex);
+  const seen = new Map<string, number>();
+
+  return (
+    <div
+      className="absolute pointer-events-none z-[58]"
+      data-testid="bus-route-overlay"
+      style={{ left: minX, top: minY, width, height }}
+    >
+      {segments.map((s, i) => (
+        <div
+          key={s.key}
+          data-route-seg=""
+          data-testid={i === 0 ? 'bus-route-overlay-line' : undefined}
+          className="absolute"
+          style={{
+            left: s.left,
+            top: s.top,
+            width: s.len,
+            height: 14,
+            transform: `translate(-50%, -50%) rotate(${s.ang}deg)`,
+            backgroundColor: '#2563eb',
+            borderRadius: 7,
+            boxShadow: '0 0 0 4px #ffffff',
+          }}
+        />
+      ))}
+      {markers.map(m => {
+        const dup = seen.get(m.key) || 0;
+        seen.set(m.key, dup + 1);
+        return (
+          <div
+            key={`${m.key}-${m.index}`}
+            data-testid={`bus-route-stop-num-${m.index}`}
+            className="absolute z-10 flex items-center justify-center rounded-full bg-white border-[3px] border-blue-600 text-blue-800 font-bold shadow-md"
+            style={{
+              left: m.x - minX + dup * 16,
+              top: m.y - minY - dup * 16,
+              width: 26,
+              height: 26,
+              transform: 'translate(-50%, -50%)',
+              fontSize: 13,
+              lineHeight: 1,
+            }}
+          >
+            {m.index + 1}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function BusStationInspectorModal({
@@ -6371,8 +6684,9 @@ function BusStationInspectorModal({
   setEconomy,
   setVehicles,
   roomCode,
-  pendingBusRouteStationKey,
-  setPendingBusRouteStationKey,
+  pendingBusRouteEdit,
+  setPendingBusRouteEdit,
+  onPreviewRoute,
   onClose,
 }: {
   bkey: string;
@@ -6383,12 +6697,13 @@ function BusStationInspectorModal({
   setEconomy: (eco: EconomyState | ((prev: EconomyState) => EconomyState)) => void;
   setVehicles: (vs: Record<string, Vehicle> | ((prev: Record<string, Vehicle>) => Record<string, Vehicle>)) => void;
   roomCode: string | null;
-  pendingBusRouteStationKey: string | null;
-  setPendingBusRouteStationKey: (key: string | null) => void;
+  pendingBusRouteEdit: PendingBusRouteEdit | null;
+  setPendingBusRouteEdit: (edit: PendingBusRouteEdit | null) => void;
+  onPreviewRoute: (stops: string[] | null) => void;
   onClose: () => void;
 }) {
+  const routes = busRoutesOf(cfg);
   const fleetIds = cfg.busFleetIds || [];
-  const stationRoute = cfg.busRoute || [];
   const bayVehicles = findVehiclesInBusStationBays(bkey, grid, vehicles);
   const unassignedBuses = Object.values(vehicles).filter(
     v =>
@@ -6396,24 +6711,96 @@ function BusStationInspectorModal({
       !fleetIds.includes(v.id) &&
       (!v.busStationKey || v.busStationKey === bkey),
   );
-  const editingRoute = pendingBusRouteStationKey === bkey;
+  const editingHere = pendingBusRouteEdit?.stationKey === bkey ? pendingBusRouteEdit : null;
+
+  const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const selected =
+    routes.find(r => r.id === selectedRouteId) ||
+    (editingHere ? routes.find(r => r.id === editingHere.routeId) : undefined) ||
+    routes[0] ||
+    null;
+  const [draftName, setDraftName] = useState(selected?.name || '');
+  const previewKey = selected?.stops.join('|') ?? '';
+
+  useEffect(() => {
+    setDraftName(selected?.name || '');
+  }, [selected?.id, selected?.name]);
+
+  useEffect(() => {
+    onPreviewRoute(selected && selected.stops.length > 0 ? selected.stops : null);
+  }, [selected?.id, previewKey, onPreviewRoute]);
+
+  useEffect(() => {
+    return () => onPreviewRoute(null);
+  }, [onPreviewRoute]);
+
+  useEffect(() => {
+    if (!roomCode) return;
+    const stamped = stampRouteIds(vehicles, fleetIds, routes, bkey);
+    if (stamped === vehicles) return;
+    setVehicles(stamped);
+    socket.emit('update-vehicles', { roomCode, vehicles: stamped });
+    // Stamp once when the station window opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bkey]);
 
   const saveCfg = (nextCfg: BuildingConfig, nextVehicles?: Record<string, Vehicle>) => {
-    const withFleet: BuildingConfig = {
-      ...nextCfg,
-      busFleetIds: nextCfg.busFleetIds ?? [],
-      busRoute: nextCfg.busRoute ?? [],
-    };
+    const routesNow = busRoutesOf(nextCfg);
+    const withFleet = withBusRoutes(
+      { ...nextCfg, busFleetIds: nextCfg.busFleetIds ?? [] },
+      routesNow,
+    );
+    let vehiclesOut = nextVehicles;
+    if (vehiclesOut) {
+      vehiclesOut = stampRouteIds(vehiclesOut, withFleet.busFleetIds || [], routesNow, bkey);
+    }
     const eco = {
       ...economy,
       buildings: { ...economy.buildings, [bkey]: withFleet },
     };
     setEconomy(eco);
-    if (nextVehicles) setVehicles(nextVehicles);
+    if (vehiclesOut) setVehicles(vehiclesOut);
     if (roomCode) {
       socket.emit('update-economy', { roomCode, economy: eco });
-      if (nextVehicles) socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+      if (vehiclesOut) socket.emit('update-vehicles', { roomCode, vehicles: vehiclesOut });
     }
+  };
+
+  const persistRouteStops = (routeId: string, stops: string[]) => {
+    const stamped = stampRouteIds(vehicles, fleetIds, routes, bkey);
+    const nextRoutes = routes.map(r => (r.id === routeId ? { ...r, stops } : r));
+    const synced = syncAssignedBuses(stamped, bkey, routeId, stops);
+    saveCfg(
+      withBusRoutes({ ...cfg, busFleetIds: fleetIds }, nextRoutes),
+      synced !== vehicles ? synced : undefined,
+    );
+  };
+
+  const poseBusOnRoute = (v: Vehicle, route: BusRoute): Vehicle => {
+    const first = parseGridKey(route.stops[0]);
+    const firstStop = first ? getBusStopTileAt(grid, first.x, first.y) : undefined;
+    const startHeading = firstStop ? getBusStopApproachHeading(firstStop) : v.heading;
+    const startLane = firstStop
+      ? getBusStopBayLane(firstStop, startHeading)
+      : getLegalTrafficLane(false, false);
+    return {
+      ...v,
+      busRouteId: route.id,
+      busRoute: [...route.stops],
+      busRouteIndex: 0,
+      busRouteLoops: 0,
+      busPhase: 'route',
+      busStationKey: bkey,
+      busStopUntil: undefined,
+      busRefuelTicks: undefined,
+      busRefuelAccumMs: undefined,
+      destination: first,
+      isMoving: !!first,
+      lane: v.lane < 0 ? startLane : Math.abs(v.lane) || startLane,
+      randomTurning: false,
+      turnAroundAtDeadEnd: true,
+      manualOverride: false,
+    };
   };
 
   const addBusToFleet = () => {
@@ -6442,14 +6829,9 @@ function BusStationInspectorModal({
       busStationKey: bkey,
       maxPassengers: getMaxPassengers('bus'),
     };
-    const nextVehicles = { ...vehicles, [id]: bus };
     saveCfg(
-      {
-        ...cfg,
-        busFleetIds: [...fleetIds, id],
-        busRoute: stationRoute,
-      },
-      nextVehicles,
+      { ...cfg, busFleetIds: [...fleetIds, id] },
+      { ...vehicles, [id]: bus },
     );
   };
 
@@ -6457,31 +6839,20 @@ function BusStationInspectorModal({
     if (fleetIds.includes(busId)) return;
     const v = vehicles[busId];
     if (!v || v.type !== 'bus') return;
-    // Don't steal a bus tied to another station's fleet
     if (v.busStationKey && v.busStationKey !== bkey) {
       const other = economy.buildings[v.busStationKey];
       if (other?.busFleetIds?.includes(busId)) return;
     }
-    const nextVehicles = {
-      ...vehicles,
-      [busId]: { ...v, busStationKey: bkey },
-    };
     saveCfg(
-      {
-        ...cfg,
-        busFleetIds: [...fleetIds, busId],
-        busRoute: stationRoute,
-      },
-      nextVehicles,
+      { ...cfg, busFleetIds: [...fleetIds, busId] },
+      { ...vehicles, [busId]: { ...v, busStationKey: bkey } },
     );
   };
 
   const removeBusFromFleet = (busId: string, deleteVehicle: boolean) => {
-    const nextFleet = fleetIds.filter(id => id !== busId);
     const nextCfg: BuildingConfig = {
       ...cfg,
-      busFleetIds: nextFleet,
-      busRoute: stationRoute,
+      busFleetIds: fleetIds.filter(id => id !== busId),
     };
     if (deleteVehicle) {
       const nextVehicles = { ...vehicles };
@@ -6491,71 +6862,79 @@ function BusStationInspectorModal({
     }
     const v = vehicles[busId];
     if (v) {
-      const cleared = { ...v };
-      // Keep busStationKey only if still useful for refuel; clear route assignment
-      cleared.busRoute = undefined;
-      cleared.busPhase = undefined;
-      cleared.busRouteIndex = undefined;
-      cleared.busRouteLoops = undefined;
-      cleared.isMoving = false;
-      cleared.destination = null;
-      saveCfg(nextCfg, { ...vehicles, [busId]: cleared });
+      const cleared = clearVehicleRoute(v);
+      saveCfg(nextCfg, { ...vehicles, [busId]: { ...cleared, busStationKey: bkey } });
     } else {
       saveCfg(nextCfg);
     }
   };
 
-  const clearStationRoute = () => {
-    saveCfg({ ...cfg, busFleetIds: fleetIds, busRoute: [] });
+  const createRoute = () => {
+    const added = addBusRoute(cfg);
+    setSelectedRouteId(added.route.id);
+    saveCfg(added.cfg);
+  };
+
+  const selectRoute = (routeId: string) => {
+    setSelectedRouteId(routeId);
+    if (editingHere) setPendingBusRouteEdit({ stationKey: bkey, routeId });
+  };
+
+  const commitName = () => {
+    if (!selected) return;
+    const name = draftName.trim();
+    if (!name || name === selected.name) {
+      setDraftName(selected.name);
+      return;
+    }
+    saveCfg(renameBusRoute(cfg, selected.id, name));
+  };
+
+  const toggleAddStops = () => {
+    if (!selected) return;
+    if (editingHere?.routeId === selected.id) {
+      setPendingBusRouteEdit(null);
+      return;
+    }
+    setPendingBusRouteEdit({ stationKey: bkey, routeId: selected.id });
+  };
+
+  const clearSelectedStops = () => {
+    if (!selected) return;
+    persistRouteStops(selected.id, []);
   };
 
   const removeStop = (index: number) => {
-    const next = stationRoute.filter((_, i) => i !== index);
-    saveCfg({ ...cfg, busFleetIds: fleetIds, busRoute: next });
+    if (!selected) return;
+    const next = removeBusRouteStopAt(cfg, selected.id, index);
+    const route = findBusRoute(next, selected.id);
+    const stamped = stampRouteIds(vehicles, fleetIds, routes, bkey);
+    const synced = syncAssignedBuses(stamped, bkey, selected.id, route?.stops || []);
+    saveCfg(next, synced !== vehicles ? synced : undefined);
   };
 
-  /** Copy station route onto a bus and start service */
-  const assignBusToRouteAndStart = (busId: string) => {
-    if (!stationRoute.length || !roomCode) return;
+  const removeSelectedRoute = () => {
+    if (!selected) return;
+    const released = releaseBusesFromRoute(vehicles, selected.id);
+    const next = deleteBusRoute(cfg, selected.id);
+    if (editingHere?.routeId === selected.id) setPendingBusRouteEdit(null);
+    const remaining = busRoutesOf(next);
+    setSelectedRouteId(remaining[0]?.id ?? null);
+    saveCfg(next, released !== vehicles ? released : undefined);
+  };
+
+  const startBus = (busId: string) => {
+    if (!roomCode) return;
     const v = vehicles[busId];
     if (!v || v.type !== 'bus') return;
-    const first = parseGridKey(stationRoute[0]);
-    const firstStop = first
-      ? getBusStopTileAt(grid, first.x, first.y)
-      : undefined;
-    const startHeading = firstStop
-      ? getBusStopApproachHeading(firstStop)
-      : v.heading;
-    const startLane = firstStop
-      ? getBusStopBayLane(firstStop, startHeading)
-      : getLegalTrafficLane(false, false);
-    const nextVehicles = {
-      ...vehicles,
-      [busId]: {
-        ...v,
-        busRoute: [...stationRoute],
-        busRouteIndex: 0,
-        busRouteLoops: 0,
-        busPhase: 'route' as const,
-        busStationKey: bkey,
-        busStopUntil: undefined,
-        busRefuelTicks: undefined,
-        destination: first,
-        isMoving: !!first,
-        // Always legal right-hand lane when starting a route
-        lane: v.lane < 0 ? startLane : Math.abs(v.lane) || startLane,
-        randomTurning: false,
-        turnAroundAtDeadEnd: true,
-        manualOverride: false,
-      },
-    };
-    // Ensure bus is in fleet
+    const routeId = resolveBusRouteId(v, routes);
+    const route = routes.find(r => r.id === routeId);
+    if (!route || route.stops.length === 0) return;
     const nextFleet = fleetIds.includes(busId) ? fleetIds : [...fleetIds, busId];
     saveCfg(
-      { ...cfg, busFleetIds: nextFleet, busRoute: stationRoute },
-      nextVehicles,
+      { ...cfg, busFleetIds: nextFleet },
+      { ...vehicles, [busId]: poseBusOnRoute(v, route) },
     );
-    setPendingBusRouteStationKey(null);
   };
 
   const stopBusRoute = (busId: string) => {
@@ -6576,31 +6955,44 @@ function BusStationInspectorModal({
     if (roomCode) socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
   };
 
-  const assignAllFleetToRoute = () => {
-    if (!stationRoute.length) return;
+  const pickRouteForBus = (busId: string, routeId: string) => {
+    const v = vehicles[busId];
+    if (!v || v.type !== 'bus') return;
+    if (!routeId) {
+      const cleared = clearVehicleRoute(v);
+      saveCfg(cfg, { ...vehicles, [busId]: { ...cleared, busStationKey: v.busStationKey || bkey } });
+      return;
+    }
+    const route = routes.find(r => r.id === routeId);
+    if (!route) return;
+    const running =
+      v.busPhase === 'route' ||
+      v.busPhase === 'boarding' ||
+      v.busPhase === 'to-station' ||
+      v.busPhase === 'refueling';
+    const nextBus =
+      running && route.stops.length > 0
+        ? poseBusOnRoute(v, route)
+        : assignBusToRoute(v, route, bkey);
+    saveCfg(cfg, { ...vehicles, [busId]: nextBus });
+  };
+
+  const startBusesOnSelected = () => {
+    if (!selected || selected.stops.length === 0 || !roomCode) return;
     let nextVehicles = { ...vehicles };
+    let any = false;
     for (const busId of fleetIds) {
       const v = nextVehicles[busId];
       if (!v || v.type !== 'bus') continue;
-      const first = parseGridKey(stationRoute[0]);
-      nextVehicles[busId] = {
-        ...v,
-        busRoute: [...stationRoute],
-        busRouteIndex: 0,
-        busRouteLoops: 0,
-        busPhase: 'route',
-        busStationKey: bkey,
-        destination: first,
-        isMoving: !!first,
-        lane: v.lane < 0 ? getLegalTrafficLane(false, false) : Math.abs(v.lane) || 1,
-        randomTurning: false,
-        turnAroundAtDeadEnd: true,
-        manualOverride: false,
-      };
+      if (resolveBusRouteId(v, routes) !== selected.id) continue;
+      nextVehicles[busId] = poseBusOnRoute(v, selected);
+      any = true;
     }
-    saveCfg({ ...cfg, busFleetIds: fleetIds, busRoute: stationRoute }, nextVehicles);
-    setPendingBusRouteStationKey(null);
+    if (!any) return;
+    saveCfg({ ...cfg, busFleetIds: fleetIds }, nextVehicles);
   };
+
+  const editingSelected = !!(selected && editingHere?.routeId === selected.id);
 
   return (
     <FloatingWindow
@@ -6610,99 +7002,170 @@ function BusStationInspectorModal({
           {cfg.name || 'Bus Station'}
         </span>
       }
-      subtitle={`${bkey} · 2×2 · 2 bays · ${fleetIds.length} bus${fleetIds.length === 1 ? '' : 'es'}`}
+      subtitle={`${bkey} · 2×2 · ${routes.length} route${routes.length === 1 ? '' : 's'} · ${fleetIds.length} bus${fleetIds.length === 1 ? '' : 'es'}`}
       headerClassName="bg-blue-600 text-white"
       borderClassName="border-blue-300"
-      widthClassName="w-[min(32rem,calc(100vw-2rem))]"
-      maxHeightClassName="max-h-[min(85vh,680px)]"
+      widthClassName="w-[min(36rem,calc(100vw-2rem))]"
+      maxHeightClassName="max-h-[min(85vh,720px)]"
       onClose={() => {
-        if (pendingBusRouteStationKey === bkey) setPendingBusRouteStationKey(null);
+        if (editingHere) setPendingBusRouteEdit(null);
         onClose();
       }}
     >
-      <div className="p-4 space-y-4 text-xs">
+      <div className="p-4 space-y-4 text-xs" data-testid="bus-station-panel">
         <div className="rounded-xl border border-blue-100 bg-blue-50/80 px-2.5 py-2 space-y-0.5">
           <div className="text-[10px] font-semibold text-blue-900 uppercase tracking-wide">
-            Route editor
+            Routes
           </div>
           <p className="text-[10px] text-slate-600 leading-snug">
-            Build a route by clicking <strong>bus-stop</strong> road tiles in order, then assign fleet buses to that route.
-            After <strong>5 loops</strong> a bus returns here for gas ({BUS_REFUEL_TICKS}s) and resumes.
+            Define several routes by clicking <strong>bus-stop</strong> tiles in order. The selected route is drawn on the map. Then assign each bus to one route.
+            After <strong>5 loops</strong> a bus returns here for gas ({BUS_REFUEL_TICKS}s) and resumes its route.
           </p>
         </div>
 
-        {/* Station route */}
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-2">
             <div className="font-semibold text-slate-800">
-              Station route ({stationRoute.length} stop{stationRoute.length === 1 ? '' : 's'})
+              Routes ({routes.length})
             </div>
-            <div className="flex gap-1">
-              <button
-                type="button"
-                disabled={!roomCode}
-                onClick={() => {
-                  setPendingBusRouteStationKey(editingRoute ? null : bkey);
-                }}
-                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold disabled:opacity-40 ${
-                  editingRoute
-                    ? 'bg-blue-700 text-white animate-pulse'
-                    : 'bg-blue-600 text-white hover:bg-blue-700'
-                }`}
-              >
-                {editingRoute ? 'Clicking stops…' : 'Add stops on map'}
-              </button>
-              <button
-                type="button"
-                disabled={!roomCode || stationRoute.length === 0}
-                onClick={clearStationRoute}
-                className="px-2 py-1.5 rounded-lg text-[11px] font-bold bg-white border border-blue-200 text-blue-800 disabled:opacity-40"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-1 min-h-[1.5rem]">
-            {stationRoute.length === 0 && (
-              <span className="text-[10px] text-slate-400 italic">
-                No stops yet — click “Add stops on map”, then bus-stop tiles
-              </span>
-            )}
-            {stationRoute.map((stop, i) => (
-              <span
-                key={`${stop}-${i}`}
-                className="inline-flex items-center gap-0.5 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-white text-blue-800 border-blue-200"
-                title={`Stop ${i + 1}`}
-              >
-                {i + 1}. {stop}
-                <button
-                  type="button"
-                  className="ml-0.5 text-slate-400 hover:text-rose-600"
-                  title="Remove stop"
-                  onClick={() => removeStop(i)}
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
-          {fleetIds.length > 0 && stationRoute.length > 0 && (
             <button
               type="button"
+              data-testid="bus-route-add"
               disabled={!roomCode}
-              onClick={assignAllFleetToRoute}
-              className="w-full py-1.5 rounded-lg text-[11px] font-bold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40"
+              onClick={createRoute}
+              className="px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40"
             >
-              Assign all fleet buses to route &amp; start
+              + New route
             </button>
+          </div>
+
+          {routes.length === 0 ? (
+            <div className="text-slate-400 text-center py-3 border border-dashed border-slate-200 rounded-xl">
+              No routes yet. Add a route, then click bus stops on the map.
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1" data-testid="bus-route-list">
+              {routes.map(route => {
+                const active = selected?.id === route.id;
+                const onMap = editingHere?.routeId === route.id;
+                return (
+                  <button
+                    key={route.id}
+                    type="button"
+                    data-testid={`bus-route-${route.id}`}
+                    onClick={() => selectRoute(route.id)}
+                    className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg border text-left ${
+                      active
+                        ? 'bg-blue-600 text-white border-blue-600'
+                        : 'bg-white text-slate-700 border-blue-100 hover:bg-blue-50'
+                    }`}
+                  >
+                    <span className="font-semibold truncate">{route.name}</span>
+                    <span className={`text-[10px] shrink-0 ${active ? 'text-blue-100' : 'text-slate-500'}`}>
+                      {onMap ? 'Adding stops · ' : ''}
+                      {route.stops.length} stop{route.stops.length === 1 ? '' : 's'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {selected && (
+            <div className="space-y-2 rounded-xl border border-slate-100 bg-slate-50 p-2.5">
+              <label className="block space-y-1">
+                <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide">Name</span>
+                <input
+                  data-testid="bus-route-name"
+                  value={draftName}
+                  disabled={!roomCode}
+                  onChange={e => setDraftName(e.target.value)}
+                  onBlur={commitName}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      (e.target as HTMLInputElement).blur();
+                    }
+                  }}
+                  className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-xs bg-white focus:outline-none focus:border-blue-400"
+                />
+              </label>
+              <div className="flex flex-wrap gap-1">
+                <button
+                  type="button"
+                  data-testid="bus-route-add-stops"
+                  disabled={!roomCode}
+                  onClick={toggleAddStops}
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold disabled:opacity-40 ${
+                    editingSelected
+                      ? 'bg-blue-700 text-white animate-pulse'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
+                >
+                  {editingSelected ? 'Clicking stops…' : 'Add stops on map'}
+                </button>
+                <button
+                  type="button"
+                  data-testid="bus-route-clear"
+                  disabled={!roomCode || selected.stops.length === 0}
+                  onClick={clearSelectedStops}
+                  className="px-2 py-1.5 rounded-lg text-[11px] font-bold bg-white border border-blue-200 text-blue-800 disabled:opacity-40"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  data-testid="bus-route-delete"
+                  disabled={!roomCode}
+                  onClick={removeSelectedRoute}
+                  className="px-2 py-1.5 rounded-lg text-[11px] font-bold bg-white border border-red-100 text-red-600 hover:bg-red-50 disabled:opacity-40"
+                >
+                  Delete route
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1 min-h-[1.5rem]" data-testid="bus-route-stops">
+                {selected.stops.length === 0 && (
+                  <span className="text-[10px] text-slate-400 italic">
+                    No stops yet — click “Add stops on map”, then bus-stop tiles
+                  </span>
+                )}
+                {selected.stops.map((stop, i) => (
+                  <span
+                    key={`${stop}-${i}`}
+                    className="inline-flex items-center gap-0.5 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-white text-blue-800 border-blue-200"
+                    title={`Stop ${i + 1}`}
+                  >
+                    {i + 1}. {stop}
+                    <button
+                      type="button"
+                      className="ml-0.5 text-slate-400 hover:text-rose-600"
+                      title="Remove stop"
+                      data-testid={`bus-route-stop-remove-${i}`}
+                      onClick={() => removeStop(i)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+              <button
+                type="button"
+                data-testid="bus-route-start-assigned"
+                disabled={!roomCode || selected.stops.length === 0}
+                onClick={startBusesOnSelected}
+                className="w-full py-1.5 rounded-lg text-[11px] font-bold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40"
+              >
+                Start buses assigned to {selected.name}
+              </button>
+            </div>
           )}
         </div>
 
-        {/* Fleet */}
         <div className="flex items-center justify-between gap-2">
           <div className="font-semibold text-slate-800">Fleet ({fleetIds.length})</div>
           <button
             type="button"
+            data-testid="bus-fleet-add"
             disabled={!roomCode}
             onClick={addBusToFleet}
             className="px-2.5 py-1.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white font-bold disabled:opacity-40"
@@ -6716,14 +7179,17 @@ function BusStationInspectorModal({
             No buses yet. Add a bus to this station, or assign an existing bus below.
           </div>
         ) : (
-          <ul className="space-y-1.5">
+          <ul className="space-y-1.5" data-testid="bus-fleet-list">
             {fleetIds.map(bid => {
               const v = vehicles[bid];
-              const onRoute = !!(v?.busRoute && v.busRoute.length > 0);
+              const assignedId = v ? resolveBusRouteId(v, routes) : null;
+              const assigned = routes.find(r => r.id === assignedId);
+              const onRoute = !!(v?.busPhase && assigned && assigned.stops.length > 0);
               return (
                 <li
                   key={bid}
                   className="flex flex-col gap-1.5 p-2 rounded-xl border border-slate-100 bg-slate-50"
+                  data-testid={`bus-fleet-${bid}`}
                 >
                   <div className="flex items-center gap-2">
                     <span
@@ -6732,10 +7198,11 @@ function BusStationInspectorModal({
                     />
                     <div className="min-w-0 flex-1">
                       <div className="font-mono text-[11px] text-slate-700 truncate">{bid}</div>
-                      <div className="text-[10px] text-slate-500">
+                      <div className="text-[10px] text-slate-500" data-testid={`bus-status-${bid}`}>
                         {v
                           ? `@ ${v.x},${v.y}${v.destination ? ` → ${v.destination.x},${v.destination.y}` : ''}`
                           : 'Missing vehicle'}
+                        {assigned ? ` · ${assigned.name}` : ' · No route'}
                         {v?.busPhase ? ` · ${v.busPhase}` : ' · Idle'}
                         {typeof v?.busRouteLoops === 'number' && onRoute
                           ? ` · loops ${v.busRouteLoops}/${BUS_LOOPS_BEFORE_REFUEL}`
@@ -6744,25 +7211,39 @@ function BusStationInspectorModal({
                           ? ` · fuel ${v.busRefuelTicks}s`
                           : ''}
                       </div>
-                      {onRoute && (
-                        <div className="text-[9px] text-blue-700 font-mono truncate">
-                          Route: {(v!.busRoute || []).join(' → ')}
-                        </div>
-                      )}
                     </div>
                   </div>
+                  <label className="flex items-center gap-2">
+                    <span className="text-[10px] text-slate-500 shrink-0">Route</span>
+                    <select
+                      data-testid={`bus-route-select-${bid}`}
+                      disabled={!roomCode || routes.length === 0}
+                      value={assignedId || ''}
+                      onChange={e => pickRouteForBus(bid, e.target.value)}
+                      className="flex-1 min-w-0 border border-slate-200 rounded-lg px-2 py-1 text-[11px] bg-white disabled:opacity-40"
+                    >
+                      <option value="">{routes.length === 0 ? 'Add a route first' : 'No route'}</option>
+                      {routes.map(route => (
+                        <option key={route.id} value={route.id}>
+                          {route.name} ({route.stops.length} stop{route.stops.length === 1 ? '' : 's'})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <div className="flex flex-wrap gap-1">
                     <button
                       type="button"
-                      disabled={!roomCode || stationRoute.length === 0}
-                      onClick={() => assignBusToRouteAndStart(bid)}
+                      data-testid={`bus-start-${bid}`}
+                      disabled={!roomCode || !assigned || assigned.stops.length === 0}
+                      onClick={() => startBus(bid)}
                       className="px-2 py-1 rounded-lg text-[10px] font-bold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40"
                     >
-                      {onRoute ? 'Restart on route' : 'Assign to route & start'}
+                      {onRoute ? 'Restart on route' : 'Start on route'}
                     </button>
                     {onRoute && (
                       <button
                         type="button"
+                        data-testid={`bus-pause-${bid}`}
                         disabled={!roomCode}
                         onClick={() => stopBusRoute(bid)}
                         className="px-2 py-1 rounded-lg text-[10px] font-bold bg-white border border-slate-200 text-slate-700 disabled:opacity-40"
@@ -6825,6 +7306,7 @@ function BusStationInspectorModal({
   );
 }
 
+
 function findTaxiBayCells(
   anchorKey: string,
   grid: GridData,
@@ -6877,7 +7359,11 @@ function TaxiStationInspectorModal({
     v => v.type === 'taxi' && !v.taxiOwnerId && !fleetIds.includes(v.id),
   );
 
-  const saveCfg = (nextCfg: BuildingConfig, nextVehicles?: Record<string, Vehicle>) => {
+  const saveCfg = (
+    nextCfg: BuildingConfig,
+    nextVehicles?: Record<string, Vehicle>,
+    buildingsBase?: Record<string, BuildingConfig>,
+  ) => {
     const withOwner: BuildingConfig = {
       ...nextCfg,
       taxiStationOwnerId: nextCfg.taxiStationOwnerId || ownerId,
@@ -6885,7 +7371,7 @@ function TaxiStationInspectorModal({
     };
     const eco = {
       ...economy,
-      buildings: { ...economy.buildings, [bkey]: withOwner },
+      buildings: { ...(buildingsBase || economy.buildings), [bkey]: withOwner },
     };
     setEconomy(eco);
     if (nextVehicles) setVehicles(nextVehicles);
@@ -6970,7 +7456,7 @@ function TaxiStationInspectorModal({
     if (deleteVehicle) {
       const nextVehicles = { ...vehicles };
       delete nextVehicles[taxiId];
-      saveCfg(nextCfg, nextVehicles);
+      saveCfg(nextCfg, nextVehicles, releaseDeletedTaxis(economy.buildings, [taxiId]));
       return;
     }
     const v = vehicles[taxiId];
@@ -7005,7 +7491,7 @@ function TaxiStationInspectorModal({
       maxHeightClassName="max-h-[min(85vh,640px)]"
       onClose={onClose}
     >
-        <div className="p-4 space-y-4 text-xs">
+        <div className="p-4 space-y-4 text-xs" data-testid="taxi-station-panel">
           <div className="rounded-xl border border-yellow-100 bg-yellow-50/80 px-2.5 py-2 space-y-0.5">
             <div className="text-[10px] font-semibold text-yellow-900 uppercase tracking-wide">
               Station owner
@@ -7205,6 +7691,7 @@ function BuildingInspectorModal({
   const nearbyTrailers = findNearbyTrailersForBuilding(bkey, grid, economy, vehicles, 3);
   const vehiclesInBays = role === 'repair-shop' ? findVehiclesInRepairShopBays(bkey, grid, vehicles) : [];
   const ambulancesInBays = role === 'hospital' ? findVehiclesInHospitalBays(bkey, grid, vehicles) : [];
+  const storeCustomerCount = role === 'store' ? peopleShoppingAt(economy.people, bkey).length : 0;
   const activeRepairs = cfg.activeRepairs || [];
   const activePatients = cfg.activePatients || [];
 
@@ -7983,7 +8470,14 @@ function BuildingInspectorModal({
 
         {role === 'store' && (
           <div className="mb-4">
-            <div className="font-semibold text-sm mb-1">Consumption Rates (per second)</div>
+            <div className="font-semibold text-sm mb-1">Consumption (per customer)</div>
+            <p className="text-[10px] text-slate-500 mb-1.5 leading-snug">
+              Rate is units/sec for each shopper in the store. Empty stores do not consume.
+              A shopper takes 1 unit of each item below, then leaves.
+            </p>
+            <div className="text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-2">
+              {storeCustomerCount} customer{storeCustomerCount === 1 ? '' : 's'} in store
+            </div>
             <div className="border rounded p-2 text-xs bg-slate-50">
               {(Object.keys(localRates).length === 0) && <div className="text-slate-400 text-[10px]">No rates set</div>}
               {Object.entries(localRates).map(([it, rate]) => (
@@ -7991,7 +8485,7 @@ function BuildingInspectorModal({
                   <span>{getItemLabel(it)}</span>
                   <div className="flex items-center gap-1">
                     <input type="number" step="0.1" value={rate} onChange={e => setLocalRates(p => ({ ...p, [it]: Math.max(0, parseFloat(e.target.value) || 0) }))} className="w-16 text-right border px-1 text-xs" />
-                    <span className="text-[10px] text-slate-500">/s</span>
+                    <span className="text-[10px] text-slate-500">/cust·s</span>
                     <button onClick={() => { const n = { ...localRates }; delete n[it]; setLocalRates(n); }} className="text-red-500 text-[10px]">×</button>
                   </div>
                 </div>
@@ -8012,7 +8506,7 @@ function BuildingInspectorModal({
                   setAddRateItem('');
                 }}
                 className="text-xs px-2 bg-slate-200 rounded disabled:opacity-40"
-              >+0.5/s</button>
+              >+0.5/cust·s</button>
             </div>
           </div>
         )}
@@ -8707,8 +9201,18 @@ export default function App() {
   const [pendingRouteVehicleId, setPendingRouteVehicleId] = useState<string | null>(null);
   /** Bus id whose route is being edited by clicking bus-stop tiles (legacy / service panel) */
   const [pendingBusRouteVehicleId, setPendingBusRouteVehicleId] = useState<string | null>(null);
-  /** Bus station anchor whose shared route is being edited on the map */
-  const [pendingBusRouteStationKey, setPendingBusRouteStationKey] = useState<string | null>(null);
+  /** Station route whose stops are being added by clicking bus-stop tiles */
+  const [pendingBusRouteEdit, setPendingBusRouteEdit] = useState<PendingBusRouteEdit | null>(null);
+  /** Stop keys of the route highlighted on the map from the station window */
+  const [previewBusStops, setPreviewBusStops] = useState<string[] | null>(null);
+  const setPreviewBusRoute = useCallback((stops: string[] | null) => {
+    setPreviewBusStops(prev => {
+      const prevKey = prev?.join('|') ?? '';
+      const nextKey = stops?.join('|') ?? '';
+      if (prevKey === nextKey) return prev;
+      return stops ? [...stops] : null;
+    });
+  }, []);
   /** When true, next house click assigns homeKey for selected cars */
   const [pendingHomeAssign, setPendingHomeAssign] = useState(false);
   /** When true, next tree click starts a fire on that tile */
@@ -8718,6 +9222,10 @@ export default function App() {
   /** Tick for burning tree animation re-render */
   const [burnUiTick, setBurnUiTick] = useState(0);
   const [showPeoplePanel, setShowPeoplePanel] = useState(false);
+  const [showBotPanel, setShowBotPanel] = useState(false);
+  const [botPickMode, setBotPickMode] = useState<BotPickMode>(null);
+  const [botPickAsk, setBotPickAsk] = useState<BotAsk | null>(null);
+  const botPickResultRef = useRef<((result: BotPickResult) => void) | null>(null);
   const [selectedPersonIds, setSelectedPersonIds] = useState<Set<string>>(new Set());
   const [peopleFilter, setPeopleFilter] = useState('');
   /** People panel create/edit form */
@@ -8799,10 +9307,29 @@ export default function App() {
   }, [zoom]);
 
   const minimapRef = useRef<HTMLCanvasElement>(null);
+  const rightMenuRef = useRef<HTMLDivElement>(null);
   const minimapSize = 180;
   const [minimapDragging, setMinimapDragging] = useState(false);
   const [showOverview, setShowOverview] = useState(false);
   const overviewHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [rightMenuClearancePx, setRightMenuClearancePx] = useState(160);
+
+  useLayoutEffect(() => {
+    const el = rightMenuRef.current;
+    if (!el) return;
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      setRightMenuClearancePx(Math.max(0, window.innerWidth - rect.left));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener('resize', measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, []);
 
   const getMinimapLayout = useCallback(() => {
     const bounds = GRID_CANVAS_BOUNDS;
@@ -9505,6 +10032,8 @@ export default function App() {
         if (targetTile.type.includes('bridge') || targetTile.type.includes('trestle')) zIndex = 1;
 
         let heading = targetTile.rotation;
+        const scatterOneWay = getOneWayTravel(targetTile);
+        if (scatterOneWay) heading = scatterOneWay.heading;
         if (targetTile.type === 'rail-road-crossing' && vType !== 'train') {
            heading = (heading + 90) % 360;
         }
@@ -9569,6 +10098,8 @@ export default function App() {
         newX = rx;
         newY = ry;
         heading = topTile.rotation;
+        const spawnOneWay = getOneWayTravel(topTile);
+        if (spawnOneWay) heading = spawnOneWay.heading;
         if (topTile.type === 'rail-road-crossing' && type !== 'train') {
            heading = (heading + 90) % 360; // Cars should go along the road axis
         }
@@ -9610,10 +10141,32 @@ export default function App() {
     const ids = Array.from(targetIds);
     if (ids.length === 0) return;
     const updatedVehicles = { ...vehicles };
+    const removedTaxiIds: string[] = [];
     ids.forEach(id => {
+      const v = updatedVehicles[id];
+      if (v?.type === 'taxi') removedTaxiIds.push(id);
+      if (v?.towedVehicleId && updatedVehicles[v.towedVehicleId]) {
+        const hooked = { ...updatedVehicles[v.towedVehicleId] };
+        delete hooked.towedById;
+        updatedVehicles[v.towedVehicleId] = hooked;
+      }
+      if (v?.towedById && updatedVehicles[v.towedById]) {
+        updatedVehicles[v.towedById] = {
+          ...updatedVehicles[v.towedById],
+          towedVehicleId: undefined,
+        };
+      }
       delete updatedVehicles[id];
     });
     setVehicles(updatedVehicles);
+    if (removedTaxiIds.length > 0) {
+      const buildings = releaseDeletedTaxis(economy.buildings, removedTaxiIds);
+      if (buildings !== economy.buildings) {
+        const nextEco = { ...economy, buildings };
+        setEconomy(nextEco);
+        if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+      }
+    }
     setSelectedVehicles(prev => {
       const next = new Set(prev);
       ids.forEach(id => next.delete(id));
@@ -10096,6 +10649,24 @@ export default function App() {
     }
   };
 
+  const toggleTowHook = (towId: string) => {
+    const live =
+      vehiclesRef.current && Object.keys(vehiclesRef.current).length > 0
+        ? vehiclesRef.current
+        : vehicles;
+    const tow = live[towId];
+    if (!isTowTruck(tow)) return;
+    const next = tow.towedVehicleId
+      ? disconnectTowHook(live, towId)
+      : (() => {
+          const target = findTowTargetBehind(tow, live, gridRef.current);
+          return target ? connectTowHook(live, towId, target.id) : live;
+        })();
+    if (next === live) return;
+    setVehicles(next);
+    if (roomCode) socket.emit('update-vehicles', { roomCode, vehicles: next });
+  };
+
   const dropTrailerFromSemi = useCallback((vehicleId: string, trailerIndex?: number) => {
     const v = getVehicleById(vehicles, vehicleId);
     const currentGrid = gridRef.current || grid;
@@ -10346,7 +10917,8 @@ export default function App() {
     }
     const currentGrid = gridRef.current || grid || {};
     if (lastTimeRef.current !== 0) {
-      const deltaTime = time - lastTimeRef.current;
+      // Cap the step so a long frame cannot jump a vehicle across a red light.
+      const deltaTime = Math.min(100, Math.max(0, time - lastTimeRef.current));
       
       let pendingPeopleUpdate: Record<string, Person> | null = null;
 
@@ -10356,6 +10928,7 @@ export default function App() {
 
         for (const [uid, v] of Object.entries(prev)) {
           let vehicle = v as Vehicle;
+          if (vehicle.towedById) continue;
           const manualOverride = !!vehicle.manualOverride;
           const underUserControl =
             manualOverride || drivePanelIdsRef.current.has(vehicle.id);
@@ -10406,7 +10979,18 @@ export default function App() {
             hasChanges = true;
           }
 
-          if (vehicle.destination && vehicle.x === vehicle.destination.x && vehicle.y === vehicle.destination.y) {
+          const atDestination =
+            !!vehicle.destination &&
+            vehicle.x === vehicle.destination.x &&
+            vehicle.y === vehicle.destination.y;
+          const busAtRefuelStall =
+            vehicle.type === 'bus' &&
+            vehicle.busPhase === 'to-station' &&
+            !!vehicle.busRoute &&
+            vehicle.busRoute.length > 0 &&
+            !manualOverride &&
+            isBusRefuelStall(vehicle.x, vehicle.y, vehicle.busStationKey, currentGrid);
+          if (atDestination || busAtRefuelStall) {
             // Bus route service: board/alight at stops, refuel at station after 5 loops
             if (
               vehicle.type === 'bus' &&
@@ -10425,10 +11009,12 @@ export default function App() {
               hasChanges = true;
               continue;
             }
-            const arrivalPatch = getDestinationArrivalPatch(vehicle, vehicle.x, vehicle.y);
-            nextVehicles[uid] = { ...vehicle, ...arrivalPatch };
-            hasChanges = true;
-            continue;
+            if (atDestination) {
+              const arrivalPatch = getDestinationArrivalPatch(vehicle, vehicle.x, vehicle.y);
+              nextVehicles[uid] = { ...vehicle, ...arrivalPatch };
+              hasChanges = true;
+              continue;
+            }
           }
 
           // Bus AI: route progression, boarding dwell, refuel countdown
@@ -10438,7 +11024,7 @@ export default function App() {
             vehicle.busRoute.length > 0 &&
             !manualOverride
           ) {
-            const peopleMapLive = localEconomyRef.current.people || {};
+            const peopleMapLive = pendingPeopleUpdate || localEconomyRef.current.people || {};
             const adv = advanceBusService(
               vehicle,
               peopleMapLive,
@@ -10447,6 +11033,13 @@ export default function App() {
               Date.now(),
             );
             if (adv.handled) {
+              if (adv.people !== peopleMapLive) {
+                pendingPeopleUpdate = adv.people;
+                localEconomyRef.current = {
+                  ...localEconomyRef.current,
+                  people: adv.people,
+                };
+              }
               // Still need kinematics if moving toward destination
               vehicle = adv.vehicle;
               nextVehicles[uid] = vehicle;
@@ -10612,7 +11205,18 @@ export default function App() {
             if (vehicle.trafficStopReason === 'stoplight' && vType !== 'train') {
               const tiles = currentGrid[`${vehicle.x},${vehicle.y}`];
               const roadTile = getGroundRoadTile(tiles, vehicle.zIndex);
-              if (roadTile && !shouldStopForLight(vehicle, trafficState)) {
+              const signalCtx = roadTile
+                ? signalHoldContext(vehicle, roadTile, currentGrid)
+                : undefined;
+              if (roadTile && !shouldStopForLight(vehicle, trafficState, signalCtx)) {
+                const resumed = { ...vehicle, isMoving: true };
+                delete resumed.trafficStopReason;
+                nextVehicles[uid] = resumed;
+                hasChanges = true;
+              }
+            } else if (vehicle.trafficStopReason === 'yield' && vType !== 'train') {
+              const yieldCap = roundaboutYieldLimit(vehicle, nextVehicles, currentGrid);
+              if (yieldCap == null || vehicle.progress < yieldCap - 1e-3) {
                 const resumed = { ...vehicle, isMoving: true };
                 delete resumed.trafficStopReason;
                 nextVehicles[uid] = resumed;
@@ -10674,12 +11278,23 @@ export default function App() {
             return (zIndex === 1 && isBridge) || (zIndex === 0 && !isBridge);
           });
 
-          // Emergency mode: overtake on the wrong side when traffic is ahead; merge home when clear
+          if (!manualOverride && currentTile) {
+            const owHere = getOneWayTravel(currentTile);
+            if (owHere) {
+              let d = Math.abs((((heading - owHere.heading) % 360) + 360) % 360);
+              if (d > 180) d = 360 - d;
+              if (d > 90) heading = owHere.heading;
+            }
+          }
+
+          // Emergency mode: overtake on the wrong side when traffic is ahead; merge home when clear.
+          // One-way: both lanes are legal — never auto-shift.
           if (
             emergencyMode &&
             vType !== 'train' &&
             currentTile &&
             isRoadTile(currentTile.type) &&
+            !isOneWayTileType(currentTile.type) &&
             (vehicle.isMoving || vehicle.stepForward)
           ) {
             const is4Lane = currentTile.type.includes('4lane');
@@ -10730,7 +11345,7 @@ export default function App() {
                 // Passing through stop tile without servicing — still legal lane
                 lane = getLegalTrafficLane(is4, false);
               }
-            } else if (onRoad) {
+            } else if (onRoad && !isOneWayTileType(currentTile.type)) {
               // En route: always positive (right-hand) lane; outer when heading to a stop
               const preferOuter =
                 !!destStop &&
@@ -10843,16 +11458,26 @@ export default function App() {
             }
           }
 
-          // Stoplights / stop signs: apply to all road vehicles including robotaxis.
-          // Only emergency vehicles with lights on may run red/yellow.
-          // User control (manual override or open drive panel): skip automated traffic holds.
+          // Stoplights apply to every road vehicle except trains and emergency vehicles
+          // with lights on. Manual override and an open drive panel still stop.
+          // Stop signs stay a system hold and are skipped while the user is driving.
+          // Prefer the road on this layer even if another tile is stacked first.
+          const signalTile = currentTiles?.find(t => {
+            const bridge = t.type.includes('bridge') || t.type.includes('trestle');
+            const onLayer = (zIndex === 1 && bridge) || (zIndex === 0 && !bridge);
+            return onLayer && t.type.startsWith('road-');
+          });
           if (
-            !underUserControl &&
             vType !== 'train' &&
-            currentTile &&
-            isRoadTile(currentTile.type)
+            signalTile &&
+            !activeVehicle.stepForward &&
+            !activeVehicle.stepBackward
           ) {
-            if (shouldStopForLight(activeVehicle, trafficState)) {
+            if (shouldStopForLight(
+              activeVehicle,
+              trafficState,
+              signalHoldContext(activeVehicle, signalTile, currentGrid),
+            )) {
               nextVehicles[uid] = {
                 ...activeVehicle,
                 isMoving: false,
@@ -10861,6 +11486,25 @@ export default function App() {
               hasChanges = true;
               continue;
             }
+          }
+          if (vType !== 'train' && !emergencyMode && !activeVehicle.stepBackward) {
+            const yieldCap = roundaboutYieldLimit(activeVehicle, nextVehicles, currentGrid);
+            if (yieldCap != null && activeVehicle.progress >= yieldCap - 1e-3) {
+              nextVehicles[uid] = {
+                ...activeVehicle,
+                isMoving: false,
+                trafficStopReason: 'yield',
+              };
+              hasChanges = true;
+              continue;
+            }
+          }
+          if (
+            !underUserControl &&
+            vType !== 'train' &&
+            currentTile &&
+            isRoadTile(currentTile.type)
+          ) {
             const signStop = shouldStopForSign(activeVehicle, currentTile, trafficState, nextVehicles, currentGrid);
             if (signStop.stop) {
               nextVehicles[uid] = {
@@ -10887,23 +11531,32 @@ export default function App() {
             step = -0.1; // One step backward
           }
 
+          // Longer circle paths (left, U-turn) cover more pixels than one straight tile.
+          if (step !== 0 && currentTile && isRoundabout4Way(currentTile.type) && vType !== 'train') {
+            const exitH = resolveVehicleExit(
+              { ...activeVehicle, x, y, heading, lane },
+              currentTile,
+              currentGrid,
+            );
+            step *= roundaboutTravelFactor(x, y, heading, exitH, lane);
+          }
+
           let newProgress = progress + step;
           if (step > 0 && (activeVehicle.isMoving || activeVehicle.stepForward)) {
             newProgress = findMaxSafeProgress(activeVehicle, newProgress, nextVehicles, currentGrid);
 
-            // Never jump over a red/yellow stop line (robotaxis and all non-emergency).
-            // User control: drive through lights under the player's own control.
+            // Never jump a red/yellow signal. Applies while the user is driving too.
+            // A single F/B step is the explicit creep-through and is not clamped.
             if (
-              !underUserControl &&
-              !emergencyMode &&
+              !activeVehicle.stepForward &&
               vType !== 'train' &&
-              currentTile &&
-              isRoadTile(currentTile.type)
+              signalTile
             ) {
               const lightClamp = clampProgressForRedLight(
                 { ...activeVehicle, progress },
                 newProgress,
-                trafficState
+                trafficState,
+                signalHoldContext({ ...activeVehicle, progress }, signalTile, currentGrid),
               );
               if (lightClamp.mustStop) {
                 nextVehicles[uid] = {
@@ -10916,6 +11569,25 @@ export default function App() {
                 continue;
               }
               newProgress = lightClamp.progress;
+            }
+
+            // Do not cross into an occupied 4-way roundabout. F/B stops at the yield line.
+            if (vType !== 'train' && !emergencyMode && !activeVehicle.stepBackward) {
+              const yieldCap = roundaboutYieldLimit(
+                { ...activeVehicle, progress },
+                nextVehicles,
+                currentGrid,
+              );
+              if (yieldCap != null && newProgress > yieldCap + 1e-6) {
+                nextVehicles[uid] = {
+                  ...activeVehicle,
+                  progress: progress > yieldCap ? progress : yieldCap,
+                  isMoving: false,
+                  trafficStopReason: 'yield',
+                };
+                hasChanges = true;
+                continue;
+              }
             }
 
             // Stop-sign approach: do not skip past the hold line in one frame
@@ -10985,63 +11657,11 @@ export default function App() {
             });
 
             if (currentTile) {
-              const isRobotaxi = vehicle.type === 'taxi';
-              const onTaxiBay = isTaxiStationBay(currentTile) || isBuildingParkingBay(currentTile);
-              // Robotaxis on station/service bays can exit toward any of the 4 edges
-              const basePorts =
-                isRobotaxi && onTaxiBay
-                  ? [0, 1, 2, 3]
-                  : (TILE_CONNECTIONS[currentTile.type] || []);
-              const ports = basePorts.map(p =>
-                isRobotaxi && onTaxiBay ? p : (p + currentTile.rotation / 90) % 4
+              exitHeading = resolveVehicleExit(
+                { ...activeVehicle, x, y, heading },
+                currentTile,
+                currentGrid,
               );
-              const entryPort = (heading / 90 + 2) % 4;
-              let otherPorts = ports.filter(p => p !== entryPort);
-              // Prefer exits that land on an adjacent road when leaving a taxi bay
-              if (isRobotaxi && onTaxiBay && otherPorts.length > 1) {
-                const roadExits = otherPorts.filter(exitPort => {
-                  const eh = exitPort * 90;
-                  const ndx = eh === 90 ? 1 : eh === 270 ? -1 : 0;
-                  const ndy = eh === 180 ? 1 : eh === 0 ? -1 : 0;
-                  const nk = `${x + ndx},${y + ndy}`;
-                  const nt = currentGrid[nk];
-                  return !!nt?.some(t => t.type.startsWith('road'));
-                });
-                if (roadExits.length > 0) otherPorts = roadExits;
-              }
-              
-              if (currentTile.type === 'rail-road-crossing') {
-                const straightPort = (entryPort + 2) % 4;
-                otherPorts = otherPorts.includes(straightPort) ? [straightPort] : [];
-              }
-              
-              if (otherPorts.length > 0) {
-                let exitPort = otherPorts[0];
-                if (otherPorts.length > 1) {
-                  const straightPort = (entryPort + 2) % 4;
-                  const leftPort = (entryPort + 1) % 4;
-                  const rightPort = (entryPort + 3) % 4;
-
-                  if (activeDestination) {
-                    const recExit = getRecommendedExit(
-                      x,
-                      y,
-                      heading,
-                      activeDestination,
-                      (vehicle.type || 'car') as any,
-                      currentGrid,
-                    );
-                    if (recExit !== null) {
-                      exitPort = Math.round(recExit / 90) % 4;
-                    } else if (turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
-                    else if (turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
-                    else if (otherPorts.includes(straightPort)) exitPort = straightPort;
-                  } else if (turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
-                  else if (turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
-                  else if (otherPorts.includes(straightPort)) exitPort = straightPort;
-                }
-                exitHeading = exitPort * 90;
-              }
             }
 
             const dx = exitHeading === 90 ? 1 : exitHeading === 270 ? -1 : 0;
@@ -11049,7 +11669,7 @@ export default function App() {
             const nextX = x + dx;
             const nextY = y + dy;
             const nextKey = `${nextX},${nextY}`;
-            
+
             if (currentGrid[nextKey]) {
               const nextTiles = currentGrid[nextKey];
               let validNextTiles = nextTiles.filter(t => {
@@ -11081,51 +11701,43 @@ export default function App() {
               if (nextTile) {
                 const nextPorts = (TILE_CONNECTIONS[nextTile.type] || []).map(p => (p + nextTile.rotation / 90) % 4);
                 const nextEntryPort = (exitHeading / 90 + 2) % 4;
+                const nextOneWay = getOneWayTravel(nextTile);
                 // Robotaxis may enter any adjacent road from a bay (driveway access),
                 // even if the road tile does not list that edge as a normal port.
                 const robotaxiOntoRoad =
                   vehicle.type === 'taxi' && nextTile.type.startsWith('road');
                 const canEnterNext =
-                  nextPorts.includes(nextEntryPort) ||
-                  robotaxiOntoRoad ||
+                  (nextOneWay
+                    ? nextEntryPort === nextOneWay.enterPort
+                    : nextPorts.includes(nextEntryPort)) ||
+                  (!nextOneWay && robotaxiOntoRoad) ||
                   (vehicle.type === 'taxi' && isBuildingParkingBay(nextTile));
 
                 if (canEnterNext) {
                   const isNext4Lane = nextTile.type.includes('4lane');
+                  const isNextOneWay = isOneWayTileType(nextTile.type);
                   const nextIsBridge = nextTile.type.includes('bridge') || nextTile.type.includes('trestle');
 
-                  // Robotaxi entering a road: snap travel heading onto a legal road axis
-                  // so stoplights/stop signs (matched by heading) actually apply.
-                  let enterHeading = exitHeading;
+                  // Keep the exit heading through the tile boundary. The quarter-circle
+                  // (or stall curve) is drawn while heading and the exit still differ.
+                  // Snapping a taxi onto the next road's axis here pivots it at the edge.
+                  let enterHeading = headingWhenEnteringTile(exitHeading);
                   let enterLane =
                     vehicle.type === 'train'
                       ? 0
-                      : vehicle.type === 'bus'
-                        ? getLegalTrafficLane(isNext4Lane, false)
-                        : isNext4Lane
-                          ? lane
-                          : 1;
-                  if (robotaxiOntoRoad && nextPorts.length > 0) {
-                    let bestPort = nextPorts[0];
-                    let bestScore = -Infinity;
-                    for (const p of nextPorts) {
-                      const h = p * 90;
-                      // Prefer continuing in the exit direction / toward destination
-                      let score = Math.cos(((h - exitHeading) * Math.PI) / 180);
-                      if (activeDestination) {
-                        const tdx = activeDestination.x - nextX;
-                        const tdy = activeDestination.y - nextY;
-                        const fx = h === 90 ? 1 : h === 270 ? -1 : 0;
-                        const fy = h === 180 ? 1 : h === 0 ? -1 : 0;
-                        score += tdx * fx + tdy * fy;
-                      }
-                      if (score > bestScore) {
-                        bestScore = score;
-                        bestPort = p;
-                      }
-                    }
-                    enterHeading = bestPort * 90;
-                    enterLane = isNext4Lane ? (enterLane < 0 ? -1 : 1) : 1;
+                      : vehicle.type === 'taxi'
+                        ? taxiLaneEnteringTile(lane, underUserControl, isNextOneWay, isNext4Lane)
+                        : isNextOneWay
+                          ? oneWayKeepLane(lane)
+                          : vehicle.type === 'bus'
+                            ? getLegalTrafficLane(isNext4Lane, false)
+                            : isNext4Lane
+                              ? lane
+                              : 1;
+
+                  // The circle is one lane and feeds the right-hand lane of the exit road.
+                  if (isRoundabout4Way(currentTile?.type) && vehicle.type !== 'train' && !isNextOneWay) {
+                    enterLane = 1;
                   }
 
                   // Bus: legal traffic lane always; approach heading + bay curb at stops
@@ -11152,7 +11764,7 @@ export default function App() {
                         }
                       }
                       enterLane = getBusStopBayLane(nextTile, enterHeading);
-                    } else if (nextTile.type.startsWith('road')) {
+                    } else if (nextTile.type.startsWith('road') && !isNextOneWay) {
                       // Always right-hand traffic lane on normal roads
                       const destStop = activeDestination
                         ? getBusStopTileAt(
@@ -11212,17 +11824,21 @@ export default function App() {
                         : (allowRandomTurning
                             ? (['left', 'right', 'straight'][Math.floor(Math.random() * 3)] as any)
                             : null),
-                      // Robotaxi / bus snap to legal heading/lane; emergency may keep pass lane
+                      // Taxis keep the curved exit heading. A driven taxi also keeps its lane.
+                      // Autonomous taxis and buses take the legal lane.
+                      // One-way: keep the current lane (both lanes are legal).
                       lane:
-                        vehicle.type === 'taxi' || vehicle.type === 'bus'
+                        isNextOneWay
                           ? enterLane
-                          : activeVehicle.type === 'train'
-                            ? 0
-                            : isNext4Lane
-                              ? lane
-                              : emergencyMode
+                          : vehicle.type === 'taxi' || vehicle.type === 'bus'
+                            ? enterLane
+                            : activeVehicle.type === 'train'
+                              ? 0
+                              : isNext4Lane
                                 ? lane
-                                : 1,
+                                : emergencyMode
+                                  ? lane
+                                  : 1,
                       ...getDestinationArrivalPatch(activeVehicle, nextX, nextY),
                     };
                   }
@@ -11261,7 +11877,18 @@ export default function App() {
           nextVehicles[uid] = clearStopSignSatisfactionIfNeeded(vehicle, newVehicleState);
         }
 
-        return hasChanges ? nextVehicles : prev;
+        let working = nextVehicles;
+        for (const id of Object.keys(working)) {
+          const tv = working[id];
+          if (tv.type !== 'tow-truck' || !tv.towedVehicleId) continue;
+          const snapped = snapTowedVehicle(working, working[id]);
+          if (snapped !== working) {
+            working = snapped;
+            hasChanges = true;
+          }
+        }
+
+        return hasChanges ? working : prev;
       });
 
       if (pendingPeopleUpdate) {
@@ -11333,25 +11960,49 @@ export default function App() {
       const simNow = getSimNow(eco, Date.now());
       let changed = false;
       const peopleMap = eco.people as Record<string, Person>;
-      const nextPeople: Record<string, Person> = { ...peopleMap };
-      for (const [id, p] of Object.entries(peopleMap)) {
-        if (p.location.kind !== 'walking' && p.activity !== 'walking') continue;
-        const walked = advanceWalkingPerson(
-          p,
-          gridRef.current,
-          localTrafficRef.current,
-          simNow,
-          0.22,
-        );
-        if (walked !== p) {
-          nextPeople[id] = walked;
-          changed = true;
+      let nextPeople: Record<string, Person> = { ...peopleMap };
+      let nextVehicles = { ...vehiclesRef.current };
+      for (const [id, p] of Object.entries(nextPeople)) {
+        let cur = p;
+        if (p.location.kind === 'walking' || p.activity === 'walking') {
+          const walked = advanceWalkingPerson(
+            p,
+            gridRef.current,
+            localTrafficRef.current,
+            simNow,
+            0.22,
+            eco.buildings,
+          );
+          if (walked !== p) {
+            nextPeople[id] = walked;
+            cur = walked;
+            changed = true;
+          }
         }
+        const pickupId = cur.travelIntent?.pickupVehicleId;
+        if (!pickupId) continue;
+        const car = nextVehicles[pickupId];
+        if (!car || !personNearVehicle(cur, car, 2)) continue;
+        const patch = startPersonTravel(cur, cur.travelIntent!, simNow, {
+          grid: gridRef.current,
+          buildings: eco.buildings || {},
+          vehicles: nextVehicles,
+          people: nextPeople,
+          traffic: localTrafficRef.current,
+        });
+        const applied = applyPeopleSimPatch(patch, nextPeople, nextVehicles, simNow);
+        nextPeople = applied.people;
+        nextVehicles = applied.vehicles;
+        changed = true;
       }
       if (!changed) return;
       const nextEco = { ...eco, people: nextPeople };
       setEconomy(nextEco);
-      if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+      setVehicles(nextVehicles);
+      if (roomCode) {
+        socket.emit('update-economy', { roomCode, economy: nextEco });
+        socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+      }
     }, 250);
     return () => clearInterval(iv);
   }, [roomCode, isSimLeader, setEconomy]);
@@ -11406,14 +12057,8 @@ export default function App() {
       Object.keys(nextB).forEach(ak => {
         const cfg = { ...nextB[ak] };
         const dt = 0.25; // seconds per tick
-        if (cfg.role === 'store' && cfg.consumptionRates) {
-          Object.keys(cfg.consumptionRates).forEach(it => {
-            const rate = cfg.consumptionRates![it] || 0;
-            const cur = cfg.inventory[it] || 0;
-            const nextQty = Math.max(0, Math.floor(cur - rate * dt));
-            if (nextQty !== cur) { cfg.inventory[it] = nextQty; changed = true; }
-          });
-        }
+        // Stores consume only when shoppers check out (1 unit per customer per visit).
+        // Rate is units/sec/customer and controls how long each shopper stays.
         if ((cfg.role === 'factory' || cfg.role === 'lumbermill') && cfg.productionEnabled && cfg.cycleTimeSec && cfg.recipeInputs && cfg.recipeOutputs) {
           const staffed = isStaffedForProduction(cfg, ak, economy.people);
           if (staffed && hasRecipeInputs(cfg) && hasOutputCapacity(cfg)) {
@@ -11832,6 +12477,7 @@ export default function App() {
         : Array.from(selectedVehicles)
       ).filter(id => {
         const v = vehicles[id];
+        if (v?.towedById) return false;
         if (!v?.manualOverride || !v.manualOverrideByUid) return true;
         // Only the user who holds manual override may key-drive that vehicle
         return !!myUid && v.manualOverrideByUid === myUid;
@@ -11842,7 +12488,7 @@ export default function App() {
         const isArrowKey = e.key.startsWith('Arrow');
         const isVehicleControlKey =
           key === 'g' || key === 's' || key === 'f' || key === 'b' ||
-          key === 'l' || (key === 'r' && !inTilePlacementMode) || isArrowKey;
+          key === 'l' || key === 'u' || (key === 'r' && !inTilePlacementMode) || isArrowKey;
 
         if (isVehicleControlKey) {
           // Prevent focused UI buttons (e.g. Destination 🎯) from also activating
@@ -11883,8 +12529,11 @@ export default function App() {
                 }
                 updated = true;
               } else if (key === 's') {
-                if (newVehicle.isMoving !== false) {
+                if (newVehicle.isMoving !== false || newVehicle.trafficStopReason) {
                   newVehicle.isMoving = false;
+                  // A driver Stop stays stopped when the light turns green.
+                  delete newVehicle.trafficStopReason;
+                  delete newVehicle.trafficStopUntil;
                   updated = true;
                 }
               } else if (key === 'f') {
@@ -11953,6 +12602,22 @@ export default function App() {
                   newVehicle.turnIntent = intent;
                   updated = true;
                 }
+              } else if (key === 'u') {
+                if ((newVehicle.type || 'car') === 'train') continue;
+
+                const currentTiles = gridRef.current[`${myVehicle.x},${myVehicle.y}`];
+                const currentTile = currentTiles?.find(t => {
+                  const isBridge = t.type.includes('bridge') || t.type.includes('trestle');
+                  return (myVehicle.zIndex === 1 && isBridge) || (myVehicle.zIndex === 0 && !isBridge);
+                });
+
+                if (!currentTile?.type.startsWith('road')) continue;
+                if (!isRoundabout4Way(currentTile.type)) continue;
+
+                if (newVehicle.turnIntent !== 'uturn') {
+                  newVehicle.turnIntent = 'uturn';
+                  updated = true;
+                }
               }
 
               if (updated) {
@@ -12018,10 +12683,12 @@ export default function App() {
         setPendingPersonFormPick(null);
         setPendingRouteVehicleId(null);
         setPendingBusRouteVehicleId(null);
-        setPendingBusRouteStationKey(null);
+        setPendingBusRouteEdit(null);
         setIsPlacingVehicles(false);
         setIsPlacingPeople(false);
         setInspectHomeKey(null);
+        setBotPickMode(null);
+        setBotPickAsk(null);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -12413,7 +13080,8 @@ export default function App() {
         heading = relX < 0.5 ? 90 : 270;
       }
     } else if (isOneWay) {
-      heading = targetTile.rotation;
+      const ow = getOneWayTravel(targetTile);
+      heading = ow ? ow.heading : targetTile.rotation;
       if (heading === 0 || heading === 180) {
         lane = relX > 0.5 ? 1 : -1;
         if (heading === 180) lane = -lane;
@@ -12504,6 +13172,305 @@ export default function App() {
     return true;
   }, [isPlacingVehicles, selectedVehicles, roomCode, getTile, hasTile]);
 
+  const getBotContext = useCallback((): BotContext => {
+    if (selectionStart && selectionEnd) {
+      const minX = Math.min(selectionStart.x, selectionEnd.x);
+      const minY = Math.min(selectionStart.y, selectionEnd.y);
+      const maxX = Math.max(selectionStart.x, selectionEnd.x);
+      const maxY = Math.max(selectionStart.y, selectionEnd.y);
+      return {
+        aim: { x: minX, y: minY },
+        selection: { minX, minY, maxX, maxY },
+      };
+    }
+    const cw = containerRef.current?.clientWidth ?? 800;
+    const ch = containerRef.current?.clientHeight ?? 600;
+    const sidebar = showSidebar ? SIDEBAR_WIDTH : 0;
+    const worldX = ((cw + sidebar) / 2 - offset.x) / zoom;
+    // Use visual center of the map viewport (container already excludes sidebar layout-wise;
+    // mouse math subtracts sidebar when sidebar overlays — prefer container center).
+    const cx = (cw / 2 - offset.x) / zoom;
+    const cy = (ch / 2 - offset.y) / zoom;
+    const aim = {
+      x: Math.floor(cx / GRID_SIZE),
+      y: Math.floor(cy / GRID_SIZE),
+    };
+    void worldX;
+    void sidebar;
+    return { aim, selection: null };
+  }, [selectionStart, selectionEnd, offset.x, offset.y, zoom, showSidebar]);
+
+  const executeBotActions = useCallback(
+    async (
+      actions: BotAction[],
+      onProgress?: (msg: string) => void,
+    ): Promise<{ summary: string }> => {
+      const ctxInfo = getBotContext();
+      const defaultOrigin = ctxInfo.aim;
+      const occupied = (x: number, y: number) => {
+        const tiles = gridRef.current[`${x},${y}`];
+        return !!(tiles && tiles.length);
+      };
+      const concrete = expandActions(actions, defaultOrigin, {
+        occupied,
+        inBounds: isWithinGridCanvas,
+      });
+
+      let placedTiles = 0;
+      let placedBuildings = 0;
+      let deleted = 0;
+      let busesSpawned = 0;
+      let skipped = 0;
+      let busSetups = 0;
+
+      let workingGrid: GridData = { ...gridRef.current };
+      let workingEco: EconomyState = {
+        ...(localEconomyRef.current || economy),
+        buildings: { ...(localEconomyRef.current || economy).buildings },
+      };
+      let workingVehicles: Record<string, Vehicle> = { ...vehiclesRef.current };
+
+      const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+      const applyPlaceTile = (x: number, y: number, tile: string, rotation: number) => {
+        if (!isWithinGridCanvas(x, y)) {
+          skipped += 1;
+          return;
+        }
+        const key = `${x},${y}`;
+        const isBuilding = tile.startsWith('building-');
+        const isMulti =
+          tile.startsWith('parking-') ||
+          tile === 'building-strip-mall' ||
+          tile === 'building-lumbermill' ||
+          tile === 'building-apartment' ||
+          tile === 'building-highschool' ||
+          tile === 'building-college' ||
+          tile === 'building-university' ||
+          tile === 'building-large-park' ||
+          tile === 'building-warehouse-large' ||
+          tile === 'building-factory-large' ||
+          tile === 'building-train-station-large' ||
+          tile === 'building-repair-shop' ||
+          tile === 'building-hospital' ||
+          tile === 'building-taxi-station' ||
+          tile === 'building-bus-station';
+
+        if (isMulti || (isBuilding && getMultiTileDimensions(tile).w * getMultiTileDimensions(tile).h > 1)) {
+          const { w, h } = getMultiTileDimensions(tile);
+          const cells = getMultiTileCells(tile, rotation);
+          if (!cells.every(c => isWithinGridCanvas(x + c.dx, y + c.dy))) {
+            skipped += 1;
+            return;
+          }
+          // Skip if any cell occupied
+          if (cells.some(c => (workingGrid[`${x + c.dx},${y + c.dy}`] || []).length)) {
+            skipped += 1;
+            return;
+          }
+          cells.forEach(cell => {
+            const targetKey = `${x + cell.dx},${y + cell.dy}`;
+            const newTile: GridTile = {
+              type: tile as TileType,
+              rotation,
+              part: cell.isAnchor ? 'anchor' : 'member',
+              localX: cell.localX,
+              localY: cell.localY,
+              w,
+              h,
+              anchorKey: `${x},${y}`,
+            };
+            workingGrid[targetKey] = [newTile];
+          });
+          placedBuildings += 1;
+          if (isEconomyBuilding(tile) && !workingEco.buildings[`${x},${y}`]) {
+            workingEco = {
+              ...workingEco,
+              buildings: {
+                ...workingEco.buildings,
+                [`${x},${y}`]: createBuildingConfig(`${x},${y}`, tile),
+              },
+            };
+          }
+          return;
+        }
+
+        if ((workingGrid[key] || []).length && isBuilding) {
+          skipped += 1;
+          return;
+        }
+        const isTree = tile.startsWith('tree-');
+        const finalRotation = isBuilding || isTree ? 0 : rotation;
+        const newTile: GridTile = {
+          type: tile as TileType,
+          rotation: finalRotation,
+        };
+        workingGrid[key] = [newTile];
+        if (isBuilding) {
+          placedBuildings += 1;
+          if (isEconomyBuilding(tile) && !workingEco.buildings[key]) {
+            workingEco = {
+              ...workingEco,
+              buildings: {
+                ...workingEco.buildings,
+                [key]: createBuildingConfig(key, tile),
+              },
+            };
+          }
+        } else {
+          placedTiles += 1;
+        }
+      };
+
+      const flush = () => {
+        setGrid(workingGrid);
+        gridRef.current = workingGrid;
+        setEconomy(workingEco);
+        localEconomyRef.current = workingEco;
+        setVehicles(workingVehicles);
+        vehiclesRef.current = workingVehicles;
+        if (roomCode) {
+          socket.emit('update-economy', { roomCode, economy: workingEco });
+          socket.emit('update-vehicles', { roomCode, vehicles: workingVehicles });
+        }
+      };
+
+      for (let i = 0; i < concrete.length; i++) {
+        const op = concrete[i];
+        if (op.op === 'place_tile' || op.op === 'place_building') {
+          applyPlaceTile(op.x, op.y, op.tile, op.rotation);
+        } else if (op.op === 'delete_cells') {
+          for (const c of op.cells) {
+            const k = `${c.x},${c.y}`;
+            if (workingGrid[k]) {
+              delete workingGrid[k];
+              deleted += 1;
+            }
+          }
+        } else if (op.op === 'setup_bus_service') {
+          const stationKey = `${op.station.x},${op.station.y}`;
+          // Ensure station building exists
+          const stTiles = workingGrid[stationKey];
+          const top = stTiles?.[stTiles.length - 1];
+          if (!top || top.type !== 'building-bus-station') {
+            applyPlaceTile(op.station.x, op.station.y, 'building-bus-station', 0);
+          }
+          // Ensure stop road tiles
+          const stopKeys: string[] = [];
+          for (const s of op.stops.slice(0, BOT_ACTION_LIMITS.maxBusStops)) {
+            const sk = `${s.x},${s.y}`;
+            const tiles = workingGrid[sk];
+            const t = tiles?.[tiles.length - 1];
+            if (!t || !String(t.type).includes('bus-stop')) {
+              applyPlaceTile(s.x, s.y, 'road-bus-stop', t?.rotation ?? 0);
+            }
+            stopKeys.push(sk);
+          }
+          let cfg = workingEco.buildings[stationKey];
+          if (!cfg || cfg.role !== 'bus-station') {
+            cfg = createBuildingConfig(stationKey, 'building-bus-station');
+          }
+          const existingRoutes = busRoutesOf(cfg);
+          const routeId = makeBusRouteId();
+          const addedRoute = {
+            id: routeId,
+            name: `Route ${existingRoutes.length + 1}`,
+            stops: stopKeys,
+          };
+          cfg = withBusRoutes(
+            { ...cfg, busFleetIds: [...(cfg.busFleetIds || [])] },
+            stopKeys.length ? [...existingRoutes, addedRoute] : existingRoutes,
+          );
+          workingEco = {
+            ...workingEco,
+            buildings: { ...workingEco.buildings, [stationKey]: cfg },
+          };
+
+          const wantBuses = Math.min(op.buses, BOT_ACTION_LIMITS.maxBuses);
+          // Need grid flushed-ish for bay finder — use workingGrid
+          const bays = findBusBayCells(stationKey, workingGrid);
+          let fleet = [...(cfg.busFleetIds || [])];
+          for (let b = 0; b < wantBuses; b++) {
+            const spawn = bays[b] || bays[0];
+            if (!spawn) break;
+            const id = makeVehicleId('bus');
+            const first = stopKeys[0] ? stopKeys[0].split(',').map(Number) : null;
+            const destination = first && first.length === 2 ? { x: first[0], y: first[1] } : null;
+            workingVehicles[id] = {
+              id,
+              x: spawn.x,
+              y: spawn.y,
+              heading: 0,
+              lane: 1,
+              progress: 0.5,
+              color: SERVICE_VEHICLE_META.bus.color,
+              zIndex: 0,
+              type: 'bus',
+              isMoving: !!destination,
+              speed: 0.9,
+              turnAroundAtDeadEnd: true,
+              randomTurning: false,
+              parkingStallIndex: spawn.bayIndex,
+              lastParkingKey: stationKey,
+              busStationKey: stationKey,
+              maxPassengers: getMaxPassengers('bus'),
+              busRouteId: stopKeys.length ? routeId : undefined,
+              busRoute: [...stopKeys],
+              busRouteIndex: 0,
+              busRouteLoops: 0,
+              busPhase: stopKeys.length ? 'route' : undefined,
+              destination,
+              manualOverride: false,
+            };
+            fleet.push(id);
+            busesSpawned += 1;
+          }
+          workingEco = {
+            ...workingEco,
+            buildings: {
+              ...workingEco.buildings,
+              [stationKey]: withBusRoutes({ ...cfg, busFleetIds: fleet }, busRoutesOf(cfg)),
+            },
+          };
+          busSetups += 1;
+        }
+
+        if ((i + 1) % BOT_ACTION_LIMITS.batchSize === 0) {
+          flush();
+          onProgress?.(
+            `Placing… ${i + 1}/${concrete.length} ops (${placedBuildings} buildings, ${placedTiles} tiles)`,
+          );
+          await sleep(BOT_ACTION_LIMITS.batchDelayMs);
+          // Refresh working copies in case sync merged
+          workingGrid = { ...gridRef.current };
+          workingEco = {
+            ...(localEconomyRef.current || workingEco),
+            buildings: { ...(localEconomyRef.current || workingEco).buildings },
+          };
+          workingVehicles = { ...vehiclesRef.current };
+        }
+      }
+
+      flush();
+      addToHistory(workingGrid);
+
+      const originLabel = `(${defaultOrigin.x}, ${defaultOrigin.y})`;
+      const summary = [
+        `Done near ${originLabel}:`,
+        placedBuildings ? `${placedBuildings} buildings` : null,
+        placedTiles ? `${placedTiles} tiles/roads` : null,
+        deleted ? `${deleted} deleted` : null,
+        busSetups ? `bus service×${busSetups}` : null,
+        busesSpawned ? `${busesSpawned} buses` : null,
+        skipped ? `${skipped} skipped` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return { summary: summary || 'No changes applied.' };
+    },
+    [getBotContext, economy, roomCode, addToHistory],
+  );
+
   const handleGridClick = (e: React.MouseEvent) => {
     if (isFromGridControl(e) || isPanning || isSelecting || didDragPointerRef.current) return;
 
@@ -12524,6 +13491,40 @@ export default function App() {
     const localY = worldY - gridY * GRID_SIZE;
     const relX = localX / GRID_SIZE;
     const relY = localY / GRID_SIZE;
+
+    // GrokBot pick mode — resolve ask without placing palette tiles
+    if (botPickMode) {
+      if (botPickMode === 'pick_building') {
+        if (!hasTile(gridX, gridY)) return;
+        const tiles = getTile(gridX, gridY) || [];
+        const building = tiles.find(t => t.type.startsWith('building-'));
+        if (!building) return;
+        const anchorKey =
+          building.part === 'member' && building.anchorKey ? building.anchorKey : key;
+        const [ax, ay] = anchorKey.split(',').map(Number);
+        botPickResultRef.current?.({
+          type: 'pick_building',
+          x: ax,
+          y: ay,
+          key: anchorKey,
+          buildingType: building.type,
+        });
+        setBotPickMode(null);
+        setBotPickAsk(null);
+        return;
+      }
+      // pick_location — any in-canvas cell
+      if (!isWithinGridCanvas(gridX, gridY)) return;
+      botPickResultRef.current?.({
+        type: 'pick_location',
+        x: gridX,
+        y: gridY,
+        key,
+      });
+      setBotPickMode(null);
+      setBotPickAsk(null);
+      return;
+    }
 
     // Place people mode — sidewalk on roads, outdoor elsewhere
     if (isPlacingPeople) {
@@ -12795,33 +13796,39 @@ export default function App() {
       return;
     }
 
-    // Bus station route editing: click bus-stop tiles to append to the station route
-    if (pendingBusRouteStationKey && hasTile(gridX, gridY)) {
+    // Bus station route editing: click bus-stop tiles to append to the selected route
+    if (pendingBusRouteEdit && hasTile(gridX, gridY)) {
       const tiles = getTile(gridX, gridY) || [];
       const top = tiles[tiles.length - 1];
       if (top && isBusStopTileType(top.type)) {
         const stopKey = key;
         const eco = localEconomyRef.current || economy;
-        const bcfg = eco.buildings[pendingBusRouteStationKey];
+        const { stationKey, routeId } = pendingBusRouteEdit;
+        const bcfg = eco.buildings[stationKey];
         if (bcfg && bcfg.role === 'bus-station') {
-          const route = [...(bcfg.busRoute || [])];
-          if (route[route.length - 1] !== stopKey) {
-            route.push(stopKey);
-          }
+          const before = busRoutesOf(bcfg);
+          const live = vehiclesRef.current;
+          const stamped = stampRouteIds(live, bcfg.busFleetIds || [], before, stationKey);
+          const nextCfg = appendBusRouteStop(bcfg, routeId, stopKey);
+          const route = findBusRoute(nextCfg, routeId);
+          const nextVehicles = route
+            ? syncAssignedBuses(stamped, stationKey, routeId, route.stops)
+            : stamped;
           const nextEco = {
             ...eco,
-            buildings: {
-              ...eco.buildings,
-              [pendingBusRouteStationKey]: {
-                ...bcfg,
-                busRoute: route,
-                busFleetIds: bcfg.busFleetIds || [],
-              },
-            },
+            buildings: { ...eco.buildings, [stationKey]: nextCfg },
           };
           setEconomy(nextEco);
+          localEconomyRef.current = nextEco;
+          if (nextVehicles !== live) {
+            setVehicles(nextVehicles);
+            vehiclesRef.current = nextVehicles;
+          }
           if (roomCode) {
             socket.emit('update-economy', { roomCode, economy: nextEco });
+            if (nextVehicles !== live) {
+              socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
+            }
           }
         }
         return;
@@ -13657,6 +14664,19 @@ export default function App() {
     }
     return newGrid;
   };
+  const rightDockWidthPx = openRightDockWidthPx({
+    people: showPeoplePanel,
+    logistics: showLogistics,
+    plant: showPlantGrowth,
+    traffic: showTrafficPanel,
+    cars: showCarsPanel,
+    semi: showSemiTrailerPanel,
+    train: showTrainPanel,
+    service: showServicePanel,
+    bot: showBotPanel,
+  });
+  const overviewRightOffsetPx =
+    (rightDockWidthPx > 0 ? rightDockWidthPx : rightMenuClearancePx) + RIGHT_HUD_GAP_PX;
   const effectiveSidebarWidth = showSidebar ? SIDEBAR_WIDTH : 0;
   const worldX = (mousePos.x - effectiveSidebarWidth - offset.x) / zoom;
   const worldY = (mousePos.y - offset.y) / zoom;
@@ -13719,6 +14739,13 @@ export default function App() {
   const peopleList = Object.values(economy.people || {}).sort((a, b) =>
     personDisplayName(a).localeCompare(personDisplayName(b)),
   );
+  const selectedTravelPreference = (() => {
+    const ids = Array.from(selectedPersonIds);
+    if (ids.length === 0) return undefined;
+    const first = economy.people?.[ids[0]]?.travelPreference;
+    return ids.every(id => economy.people?.[id]?.travelPreference === first) ? first : undefined;
+  })();
+
   const filteredPeople = peopleList.filter(p => {
     if (!peopleFilter.trim()) return true;
     const q = peopleFilter.toLowerCase();
@@ -13726,7 +14753,8 @@ export default function App() {
       personDisplayName(p).toLowerCase().includes(q) ||
       p.homeKey.includes(q) ||
       (p.workplaceKey || '').includes(q) ||
-      (p.activity || '').includes(q)
+      (p.activity || '').includes(q) ||
+      travelPreferenceLabel(p.travelPreference).toLowerCase().includes(q)
     );
   });
 
@@ -14228,59 +15256,119 @@ export default function App() {
     }
   };
 
-  const sendSelectedPeopleHome = () => {
-    if (selectedPersonIds.size === 0) return;
-    let people = { ...(economy.people || {}) };
-    const now = getSimNow(economy, Date.now());
-    for (const pid of selectedPersonIds) {
+  /**
+   * Immediately start walking or driving for the given people.
+   * Work / home: owned car → drive, park, enter; otherwise walk in.
+   */
+  const startPeopleCommute = (
+    personIds: Iterable<string>,
+    purpose: 'work' | 'home' | 'shop' | 'care',
+    destinationKeyFor?: (p: Person) => string | undefined,
+  ) => {
+    const eco = localEconomyRef.current || economy;
+    let people = { ...(eco.people || {}) };
+    let nextVehicles = { ...vehiclesRef.current };
+    const now = getSimNow(eco, Date.now());
+    const gridNow = gridRef.current;
+    const trafficNow = localTrafficRef.current;
+    let changed = false;
+    for (const pid of personIds) {
       const person = people[pid];
       if (!person) continue;
-      people = alightPerson(people, pid, { kind: 'home', homeKey: person.homeKey }, 'home', now + 20_000);
-      people[pid] = {
-        ...people[pid],
-        travelIntent: { purpose: 'home', destinationKey: person.homeKey, transport: 'auto' },
-        activity: people[pid].location.kind === 'vehicle' ? 'commuting' : 'idle',
-        activityUntil: now,
-      };
+      const dest =
+        destinationKeyFor?.(person) ||
+        (purpose === 'work'
+          ? person.workplaceKey
+          : purpose === 'home'
+            ? person.homeKey
+            : undefined);
+      if (!dest) continue;
+      const intent =
+        purpose === 'work' || purpose === 'home'
+          ? commuteIntentForPerson(person, purpose, nextVehicles, people)
+          : { purpose, destinationKey: dest, transport: 'auto' as const };
+      if (!intent) continue;
+      const patch = startPersonTravel(person, intent, now, {
+        grid: gridNow,
+        buildings: eco.buildings || {},
+        vehicles: nextVehicles,
+        people,
+        traffic: trafficNow,
+      });
+      const applied = applyPeopleSimPatch(patch, people, nextVehicles, now);
+      people = applied.people;
+      nextVehicles = applied.vehicles;
+      changed = true;
     }
-    let nextVehicles = { ...vehicles };
-    Object.keys(nextVehicles).forEach(vid => {
-      nextVehicles[vid] = syncVehicleOccupancy(nextVehicles[vid], people);
-    });
-    const nextEco = { ...economy, people };
-    setEconomy(nextEco);
-    setVehicles(nextVehicles);
-    if (roomCode) {
-      socket.emit('update-economy', { roomCode, economy: nextEco });
-      socket.emit('update-vehicles', { roomCode, vehicles: nextVehicles });
-    }
+    if (!changed) return;
+    applyPeopleVehicleSync(people, nextVehicles);
   };
 
-  /** Queue a trip for one person (city AI picks walk/car/taxi next tick). */
+  const sendSelectedPeopleHome = () => {
+    if (selectedPersonIds.size === 0) return;
+    startPeopleCommute(selectedPersonIds, 'home');
+  };
+
+  const sendSelectedPeopleToWork = () => {
+    if (selectedPersonIds.size === 0) return;
+    startPeopleCommute(selectedPersonIds, 'work');
+  };
+
+  const setPeopleTravelPreference = (ids: Iterable<string>, pref: TravelPreference) => {
+    if (!roomCode) return;
+    const people = { ...(economy.people || {}) };
+    const gridNow = gridRef.current;
+    let changed = false;
+    for (const id of ids) {
+      const p = people[id];
+      if (!p) continue;
+      let next: Person = { ...p, travelPreference: pref };
+      if (p.travelIntent && p.location.kind !== 'vehicle') {
+        const place =
+          p.location.kind === 'walking'
+            ? `${Math.floor(p.location.x)},${Math.floor(p.location.y)}`
+            : p.location.kind === 'outdoor'
+              ? p.location.atKey
+              : p.location.kind === 'tile'
+                ? `${p.location.x},${p.location.y}`
+                : p.location.kind === 'building'
+                  ? p.location.buildingKey
+                  : p.homeKey;
+        next = {
+          ...next,
+          location:
+            p.location.kind === 'home' || p.location.kind === 'building'
+              ? p.location.kind === 'home'
+                ? { kind: 'home', homeKey: p.homeKey }
+                : p.location
+              : toOutdoorLocation(place, gridNow),
+          travelIntent: {
+            purpose: p.travelIntent.purpose,
+            destinationKey: p.travelIntent.destinationKey,
+            transport: preferenceToTransport(pref),
+          },
+          busDropoffStop: undefined,
+          taxiRideId: undefined,
+          activity: 'idle',
+          activityUntil: Date.now(),
+        };
+      }
+      people[id] = next;
+      changed = true;
+    }
+    if (!changed) return;
+    const nextEco = { ...economy, people };
+    setEconomy(nextEco);
+    socket.emit('update-economy', { roomCode, economy: nextEco });
+  };
+
+  /** Start a trip immediately (walk or drive — no teleport). */
   const queuePersonTravel = (
     personId: string,
     purpose: 'work' | 'shop' | 'home' | 'care',
     destinationKey: string,
   ) => {
-    const people = { ...(economy.people || {}) };
-    const p = people[personId];
-    if (!p) return;
-    const now = getSimNow(economy, Date.now());
-    people[personId] = {
-      ...p,
-      travelIntent: { purpose, destinationKey, transport: 'auto' },
-      activity:
-        p.location.kind === 'vehicle'
-          ? purpose === 'care'
-            ? 'seeking_care'
-            : 'commuting'
-          : 'idle',
-      activityUntil: now,
-      taxiRideId: purpose === 'home' ? undefined : p.taxiRideId,
-    };
-    const nextEco = { ...economy, people };
-    setEconomy(nextEco);
-    if (roomCode) socket.emit('update-economy', { roomCode, economy: nextEco });
+    startPeopleCommute([personId], purpose, () => destinationKey);
   };
 
   const boardOnePerson = (personId: string, seat: 'driver' | 'passenger') => {
@@ -14444,6 +15532,12 @@ export default function App() {
             {v.homeKey && (
               <span className="text-[9px] text-rose-500 shrink-0" title={`Home ${v.homeKey}`}>🏠{v.homeKey}</span>
             )}
+            {v.towedVehicleId && (
+              <span className="text-[9px] text-amber-600 shrink-0">🪝towing</span>
+            )}
+            {v.towedById && (
+              <span className="text-[9px] text-amber-600 shrink-0">🪝hooked</span>
+            )}
           </div>
           {Object.keys(peopleMap).length > 0 && (
             <div className="text-[9px] text-slate-400 pl-5 truncate">
@@ -14480,11 +15574,31 @@ export default function App() {
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               className="bg-white rounded-[2.5rem] p-10 shadow-2xl max-w-md w-full text-center border border-white/20"
+              data-testid="lobby-dialog"
             >
               <div className="bg-blue-600 w-20 h-20 rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-lg shadow-blue-200">
                 <MapIcon className="w-10 h-10 text-white" />
               </div>
-              <h2 className="text-3xl font-black text-slate-900 mb-3 tracking-tight">Grid City Collaborative</h2>
+              <div className="flex items-center justify-center gap-2 mb-3">
+                <h2 className="text-3xl font-black text-slate-900 tracking-tight">Grid City Collaborative</h2>
+                <span
+                  className="text-xs font-semibold text-slate-400 tracking-wide shrink-0"
+                  data-testid="lobby-version"
+                >
+                  {formatAppVersion()}
+                </span>
+                <a
+                  href="/help"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-testid="lobby-help-button"
+                  title="Open documentation in a new tab"
+                  aria-label="Open documentation in a new tab"
+                  className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-colors shrink-0"
+                >
+                  <CircleHelp className="w-6 h-6" />
+                </a>
+              </div>
               <p className="text-slate-500 mb-10 text-lg leading-relaxed">
                 Design cities together in real-time. Create a new room or join an existing one.
               </p>
@@ -14494,6 +15608,7 @@ export default function App() {
                   <button 
                     onClick={createRoom}
                     className="w-full py-4 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all shadow-xl shadow-blue-200 flex items-center justify-center gap-3"
+                    data-testid="create-room-button"
                   >
                     <Plus className="w-5 h-5" />
                     Create New Room
@@ -14514,11 +15629,13 @@ export default function App() {
                       onKeyDown={(e) => e.key === 'Enter' && joinRoom()}
                       className="flex-1 py-4 px-6 bg-slate-50 border-2 border-slate-100 rounded-2xl text-center text-xl font-black tracking-widest focus:outline-none focus:border-blue-500 transition-all uppercase"
                       maxLength={6}
+                      data-testid="join-room-input"
                     />
                     <button 
                       onClick={joinRoom}
                       disabled={!tempRoomCode.trim()}
                       className="bg-slate-900 text-white px-6 rounded-2xl font-bold hover:bg-slate-800 disabled:opacity-30 transition-all"
+                      data-testid="join-room-button"
                     >
                       Join
                     </button>
@@ -14579,10 +15696,30 @@ export default function App() {
         <div className="w-72 h-full flex flex-col overscroll-contain">
         <div className="p-6 border-b border-slate-100">
           <div className="flex items-center justify-between mb-4 gap-2">
-            <h1 className="text-2xl font-bold tracking-tight text-slate-800 flex items-center gap-2 min-w-0">
-              <MapIcon className="w-6 h-6 text-blue-600 shrink-0" />
-              <span className="truncate">Grid City</span>
-            </h1>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <h1 className="text-2xl font-bold tracking-tight text-slate-800 flex items-center gap-2 min-w-0">
+                <MapIcon className="w-6 h-6 text-blue-600 shrink-0" />
+                <span className="truncate" data-testid="app-title">Grid City</span>
+              </h1>
+              <span
+                className="text-[11px] font-bold text-slate-500 tracking-wide leading-none shrink-0 pt-1"
+                data-testid="app-version"
+                title={`Grid City ${formatAppVersion()}`}
+              >
+                {formatAppVersion()}
+              </span>
+              <a
+                href="/help"
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="help-button"
+                title="Open documentation in a new tab"
+                aria-label="Open documentation in a new tab"
+                className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors shrink-0"
+              >
+                <CircleHelp className="w-5 h-5" />
+              </a>
+            </div>
             <button
               type="button"
               onClick={() => setShowSidebar(false)}
@@ -14594,7 +15731,10 @@ export default function App() {
           </div>
 
           {roomCode && (
-            <div className="flex items-center justify-between bg-blue-50/50 p-2.5 rounded-xl border border-blue-100 mb-4 group transition-all hover:bg-blue-50">
+            <div
+              className="flex items-center justify-between bg-blue-50/50 p-2.5 rounded-xl border border-blue-100 mb-4 group transition-all hover:bg-blue-50"
+              data-testid="active-room"
+            >
               <div className="flex items-center gap-2.5">
                 <div className="relative">
                   <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
@@ -14602,7 +15742,10 @@ export default function App() {
                 </div>
                 <div className="flex flex-col">
                   <span className="text-[10px] font-bold text-blue-400 uppercase tracking-[0.2em] leading-none mb-1">Active Room</span>
-                  <span className="text-sm font-black text-blue-700 tracking-widest leading-none">{roomCode}</span>
+                  <span
+                    className="text-sm font-black text-blue-700 tracking-widest leading-none"
+                    data-testid="active-room-code"
+                  >{roomCode}</span>
                 </div>
               </div>
               <div className="flex items-center gap-1">
@@ -14866,6 +16009,7 @@ export default function App() {
       {/* Main Viewport */}
       <div 
         ref={containerRef}
+        data-testid="map-viewport"
         className={`flex-1 relative overflow-hidden cursor-${
           isPanning
             ? 'grabbing'
@@ -14873,11 +16017,12 @@ export default function App() {
                 isPlacingPeople ||
                 pendingRouteVehicleId ||
                 pendingBusRouteVehicleId ||
-                pendingBusRouteStationKey ||
+                pendingBusRouteEdit ||
                 pendingHomeAssign ||
                 pendingFireStart ||
                 pendingEmployeeAssign ||
                 pendingPersonFormPick ||
+                botPickMode ||
                 trafficTool ||
                 selectedTile
               ? 'crosshair'
@@ -14948,16 +16093,49 @@ export default function App() {
               : 'Click map to drop a new person (roads → sidewalk) · Esc to cancel'}
           </div>
         )}
-        {pendingBusRouteStationKey && (
-          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-blue-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
-            Click bus-stop tiles for station route (
-            {economy.buildings[pendingBusRouteStationKey]?.busRoute?.length || 0} stops) · Esc to finish
+        {pendingBusRouteEdit && (
+          <div
+            data-testid="bus-route-banner"
+            className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-blue-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg"
+          >
+            {(() => {
+              const stationCfg = economy.buildings[pendingBusRouteEdit.stationKey];
+              const editingRoute = stationCfg
+                ? findBusRoute(stationCfg, pendingBusRouteEdit.routeId)
+                : undefined;
+              const stopCount = editingRoute?.stops.length || 0;
+              return `Click bus-stop tiles for ${editingRoute?.name || 'route'} (${stopCount} stop${stopCount === 1 ? '' : 's'}) · Esc to finish`;
+            })()}
           </div>
         )}
-        {pendingBusRouteVehicleId && !pendingBusRouteStationKey && (
+        {pendingBusRouteVehicleId && !pendingBusRouteEdit && (
           <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-blue-600 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg">
             Click bus-stop tiles to build route ({vehicles[pendingBusRouteVehicleId]?.busRoute?.length || 0} stops) · Esc to finish
           </div>
+        )}
+        {botPickMode && (
+          <div
+            data-testid="bot-pick-map-banner"
+            className="absolute top-14 left-1/2 -translate-x-1/2 z-50 pointer-events-none bg-violet-700 text-white text-xs font-bold px-4 py-2 rounded-full shadow-lg flex items-center gap-2"
+          >
+            <span className="inline-block w-2 h-2 rounded-full bg-white animate-pulse" />
+            {botPickAsk?.prompt ||
+              (botPickMode === 'pick_building'
+                ? 'GrokBot: click a building'
+                : 'GrokBot: click a map location')}{' '}
+            · Esc to cancel
+          </div>
+        )}
+        {botPickMode && (
+          <div
+            data-testid="bot-pick-crosshair"
+            className="absolute inset-0 pointer-events-none z-40"
+            style={{
+              background:
+                'radial-gradient(circle at center, transparent 0 28px, rgba(91,33,182,0.08) 29px)',
+              boxShadow: 'inset 0 0 0 3px rgba(109,40,217,0.35)',
+            }}
+          />
         )}
         {/* Outside canvas backdrop */}
         <div className="absolute inset-0 pointer-events-none bg-slate-200/50" />
@@ -15121,7 +16299,7 @@ export default function App() {
               );
             })}
 
-          {/* Restroom-style person icons (standing outside homes/buildings, walking, waiting) */}
+          {/* Person icons at every location: inside, outside, walking, or riding */}
           {economy.showPersonIcons !== false &&
             economy.people &&
             (() => {
@@ -15133,6 +16311,7 @@ export default function App() {
                 gy: number;
                 crossing?: boolean;
                 waiting?: boolean;
+                inVehicle?: boolean;
               }> = [];
               const peopleMap = economy.people as Record<string, Person>;
               for (const p of Object.values(peopleMap)) {
@@ -15147,7 +16326,9 @@ export default function App() {
                           ? `${Math.floor(p.location.x)},${Math.floor(p.location.y)}`
                           : p.location.kind === 'tile'
                             ? `${p.location.x},${p.location.y}`
-                            : p.id;
+                            : p.location.kind === 'vehicle'
+                              ? `veh:${p.location.vehicleId}`
+                              : p.id;
                 const stack = stackCounts[tileKey] || 0;
                 stackCounts[tileKey] = stack + 1;
                 const place = getPersonMapPlacement(p, grid, vehicles, stack);
@@ -15158,6 +16339,7 @@ export default function App() {
                   gy: place.y,
                   crossing: place.crossing,
                   waiting: place.waiting,
+                  inVehicle: place.inVehicle,
                 });
               }
               return placements.map(pl => (
@@ -15249,26 +16431,9 @@ export default function App() {
                 return (v.zIndex === 1 && isBridge) || (v.zIndex === 0 && !isBridge);
               });
               
-              let exitHeading = v.heading;
-              if (currentTile) {
-                const ports = (TILE_CONNECTIONS[currentTile.type] || []).map(p => (p + currentTile.rotation / 90) % 4);
-                const entryPort = (v.heading / 90 + 2) % 4;
-                const otherPorts = ports.filter(p => p !== entryPort);
-                
-                if (otherPorts.length > 0) {
-                  let exitPort = otherPorts[0];
-                  if (otherPorts.length > 1) {
-                    const straightPort = (entryPort + 2) % 4;
-                    const leftPort = (entryPort + 1) % 4;
-                    const rightPort = (entryPort + 3) % 4;
-
-                    if (v.turnIntent === 'left' && otherPorts.includes(leftPort)) exitPort = leftPort;
-                    else if (v.turnIntent === 'right' && otherPorts.includes(rightPort)) exitPort = rightPort;
-                    else if (otherPorts.includes(straightPort)) exitPort = straightPort;
-                  }
-                  exitHeading = exitPort * 90;
-                }
-              }
+              const exitHeading = currentTile
+                ? resolveVehicleExit(v, currentTile, grid || {})
+                : v.heading;
               
               return (
                 <div key={v.id}>
@@ -15395,6 +16560,10 @@ export default function App() {
               })}
             </div>
           )}
+          {previewBusStops && previewBusStops.length > 0 && (
+            <BusRouteMapOverlay stops={previewBusStops} grid={grid} />
+          )}
+
           {/* Selection Box */}
           {selectionStart && selectionEnd && (
             <div 
@@ -15495,13 +16664,18 @@ export default function App() {
         <AnimatePresence>
           {showOverview && (
             <motion.div
-              initial={{ opacity: 0, scale: 0.92 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.92 }}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
               transition={{ duration: 0.15 }}
-              className="absolute bottom-4 right-4 z-[60] bg-white/95 border border-slate-200 rounded-2xl overflow-hidden shadow-2xl backdrop-blur-sm"
-              style={{ width: minimapSize + 8, height: minimapSize + 24 }}
+              className="fixed bottom-4 z-[95] bg-white/95 border border-slate-200 rounded-2xl overflow-hidden shadow-2xl backdrop-blur-sm"
+              style={{
+                right: overviewRightOffsetPx,
+                width: minimapSize + 8,
+                height: minimapSize + 24,
+              }}
               data-grid-control
+              data-testid="overview-minimap"
               {...blockGridPointerEvents}
             >
               <div className="px-2 py-0.5 text-[10px] text-slate-500 font-medium tracking-wider">OVERVIEW</div>
@@ -15517,10 +16691,13 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* Floating Controls — two-column button grid */}
+        {/* Floating Controls — two-column button grid, pinned to the viewport right edge */}
         <div 
-          className="absolute bottom-8 right-8 flex flex-col gap-2"
+          ref={rightMenuRef}
+          className="fixed bottom-8 z-[90] flex flex-col gap-2 transition-[right] duration-150"
+          style={{ right: (rightDockWidthPx > 0 ? rightDockWidthPx + 32 : 32) }}
           data-grid-control
+          data-testid="right-tool-menu"
           {...blockGridPointerEvents}
         >
           <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 p-2 grid grid-cols-2 gap-1">
@@ -15629,6 +16806,16 @@ export default function App() {
               <Sprout className="w-5 h-5 mx-auto" />
             </button>
 
+            <button
+              type="button"
+              data-testid="bot-panel-toggle"
+              onClick={() => setShowBotPanel(v => !v)}
+              className={`p-3 rounded-xl transition-colors ${showBotPanel ? 'text-sky-600 bg-sky-50' : 'text-slate-400 hover:bg-slate-50'}`}
+              title="GrokBot"
+            >
+              <Bot className="w-5 h-5 mx-auto" />
+            </button>
+
             {/* Factory / Recipe Floater */}
             <button 
               onClick={() => setShowLogistics(true)}
@@ -15644,14 +16831,40 @@ export default function App() {
           </div>
         </div>
 
+        <BotPanel
+          open={showBotPanel}
+          onClose={() => {
+            setShowBotPanel(false);
+            setBotPickMode(null);
+            setBotPickAsk(null);
+          }}
+          getContext={getBotContext}
+          executeActions={executeBotActions}
+          pickMode={botPickMode}
+          onEnterPickMode={(mode, ask) => {
+            setBotPickMode(mode);
+            setBotPickAsk(ask);
+            setSelectedTile(null);
+            setIsPasting(false);
+            setIsPlacingVehicles(false);
+            setPendingRouteVehicleId(null);
+          }}
+          onCancelPick={() => {
+            setBotPickMode(null);
+            setBotPickAsk(null);
+          }}
+          pickResultRef={botPickResultRef}
+        />
+
         {/* Logistics & Economy Panel (new) */}
         <AnimatePresence>
           {showLogistics && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[110] flex flex-col overscroll-contain"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[110] flex flex-col overscroll-contain"
               data-grid-control
               {...blockGridPointerEvents}
             >
@@ -15949,10 +17162,11 @@ export default function App() {
         <AnimatePresence>
           {showPlantGrowth && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[105] flex flex-col overscroll-contain"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[105] flex flex-col overscroll-contain"
               data-grid-control
               {...blockGridPointerEvents}
             >
@@ -16068,10 +17282,11 @@ export default function App() {
         <AnimatePresence>
           {showTrafficPanel && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
               data-grid-control
               {...blockGridPointerEvents}
             >
@@ -16166,10 +17381,11 @@ export default function App() {
         <AnimatePresence>
           {showCarsPanel && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-80 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
               data-grid-control
               {...blockGridPointerEvents}
             >
@@ -16353,10 +17569,11 @@ export default function App() {
         <AnimatePresence>
           {showSemiTrailerPanel && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
               data-grid-control
               {...blockGridPointerEvents}
             >
@@ -16592,10 +17809,11 @@ export default function App() {
         <AnimatePresence>
           {showTrainPanel && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
               data-grid-control
               {...blockGridPointerEvents}
             >
@@ -16785,10 +18003,11 @@ export default function App() {
         <AnimatePresence>
           {showServicePanel && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-96 bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
               data-grid-control
               {...blockGridPointerEvents}
             >
@@ -16901,7 +18120,7 @@ export default function App() {
                         )
                       }
                       className="disabled:opacity-30 disabled:pointer-events-none p-1 rounded-md transition-colors text-blue-600 hover:text-blue-700 bg-blue-50 hover:bg-blue-100"
-                      title="Open bus station — edit route & assign buses"
+                      title="Open bus station — edit routes & assign buses"
                     >
                       <Bus className="w-5 h-5" />
                     </button>
@@ -16936,8 +18155,8 @@ export default function App() {
 
                 <div className="text-[10px] text-slate-500 bg-blue-50 border border-blue-100 rounded-lg p-2 space-y-1">
                   <p>
-                    <strong>Buses:</strong> open a <strong>Bus Station</strong> on the map to edit the station route,
-                    add buses to the fleet, and assign them to the route. After 5 loops they refuel at the station for{' '}
+                    <strong>Buses:</strong> open a <strong>Bus Station</strong> on the map to define routes,
+                    add buses to the fleet, and assign each bus to a route. After 5 loops they refuel at the station for{' '}
                     {BUS_REFUEL_TICKS}s.
                   </p>
                 </div>
@@ -16996,7 +18215,21 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="shrink-0 p-4 border-t border-slate-200 bg-slate-50/50 max-h-[45vh] overflow-y-auto overscroll-contain">
+              <div className="shrink-0 p-4 border-t border-slate-200 bg-slate-50/50 max-h-[45vh] overflow-y-auto overscroll-contain space-y-2">
+                {serviceFilteredSelection.size === 1 && (() => {
+                  const sid = Array.from(serviceFilteredSelection)[0];
+                  const sv = vehicles[sid];
+                  if (!sv || sv.type !== 'tow-truck') return null;
+                  return (
+                    <TowHookToggle
+                      tow={sv}
+                      vehicles={vehicles}
+                      grid={grid}
+                      roomCode={roomCode}
+                      onToggle={() => toggleTowHook(sid)}
+                    />
+                  );
+                })()}
                 <VehicleMotionControls
                   panelType="service"
                   filteredSelection={serviceFilteredSelection}
@@ -17027,11 +18260,13 @@ export default function App() {
         <AnimatePresence>
           {showPeoplePanel && (
             <motion.div
-              initial={{ x: 400, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: 400, opacity: 0 }}
-              className="absolute right-0 top-0 bottom-0 w-[26rem] bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="fixed top-0 right-0 bottom-0 w-[26rem] bg-white/95 backdrop-blur-md shadow-2xl border-l border-slate-200 z-[100] flex flex-col min-h-0 overflow-hidden"
               data-grid-control
+              data-testid="people-panel"
               {...blockGridPointerEvents}
             >
               <div className="p-5 border-b border-slate-100 flex items-center justify-between shrink-0">
@@ -17052,8 +18287,8 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 flex flex-col gap-3">
-                <div className="flex gap-2">
+              <div className="flex-1 min-h-0 overflow-hidden p-4 flex flex-col gap-2.5">
+                <div className="flex gap-2 shrink-0">
                   <button
                     type="button"
                     disabled={!roomCode}
@@ -17080,35 +18315,30 @@ export default function App() {
                     {economy.peoplePaused ? 'Paused' : 'Running'}
                   </button>
                 </div>
-                <p className="text-[10px] text-slate-500">
-                  Create and manage citizens. Assign employees to recipe buildings (factories / lumbermills)
-                  so production can run. 1 year of age = 1 hour real time.
+                <p className="text-[10px] text-slate-500 shrink-0">
+                  Assign workplaces from the Control row, then click a building. Staff must be on-site for production.
                 </p>
 
-                <div className="bg-violet-50/60 border border-violet-100 rounded-xl p-2.5 space-y-1.5">
-                  <div className="text-[10px] font-semibold text-violet-900 uppercase tracking-wide">Map badges</div>
-                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                <div className="shrink-0 flex flex-wrap gap-x-3 gap-y-1 bg-violet-50/60 border border-violet-100 rounded-xl px-2.5 py-1.5">
+                  <label className="flex items-center gap-1.5 text-[11px] cursor-pointer">
                     <input
                       type="checkbox"
                       checked={economy.showHomeBadges !== false}
                       onChange={e => setEconomyBadgeFlag('showHomeBadges', e.target.checked)}
                     />
-                    Show home occupancy badges
+                    Home badges
                   </label>
-                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                  <label className="flex items-center gap-1.5 text-[11px] cursor-pointer">
                     <input
                       type="checkbox"
                       checked={economy.showPersonIcons !== false}
                       onChange={e => setEconomyBadgeFlag('showPersonIcons', e.target.checked)}
                     />
-                    Show person icons on map
+                    Person icons
                   </label>
-                  <p className="text-[9px] text-slate-500 leading-snug">
-                    Restroom-style icons stand outside homes, buildings, and bus stops. People walk sidewalks and cross at stop signs / signals. Vehicles yield.
-                  </p>
                 </div>
 
-                <div className="grid grid-cols-2 gap-1.5">
+                <div className="grid grid-cols-2 gap-1.5 shrink-0">
                   <button
                     type="button"
                     disabled={!roomCode}
@@ -17167,23 +18397,10 @@ export default function App() {
                     <UserMinus className="w-3 h-3" />
                     Delete selected
                   </button>
-                  <button
-                    type="button"
-                    disabled={!roomCode || selectedPersonIds.size === 0}
-                    onClick={startAssignEmployees}
-                    className={`col-span-2 flex items-center justify-center gap-1 py-1.5 rounded-lg text-[11px] font-bold border disabled:opacity-40 ${
-                      pendingEmployeeAssign
-                        ? 'bg-violet-600 text-white border-violet-700 animate-pulse'
-                        : 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
-                    }`}
-                  >
-                    <Briefcase className="w-3 h-3" />
-                    {pendingEmployeeAssign ? 'Click building…' : 'Assign workplace'}
-                  </button>
                 </div>
 
                 {peopleFormMode !== 'closed' && (
-                  <div className="bg-white border border-violet-200 rounded-xl p-3 space-y-2 shadow-sm">
+                  <div className="bg-white border border-violet-200 rounded-xl p-3 space-y-2 shadow-sm shrink-0 max-h-[38%] overflow-y-auto">
                     <div className="flex items-center justify-between">
                       <div className="text-xs font-bold text-violet-900">
                         {peopleFormMode === 'create' ? 'Create person' : 'Edit person'}
@@ -17518,10 +18735,10 @@ export default function App() {
                   value={peopleFilter}
                   onChange={e => setPeopleFilter(e.target.value)}
                   placeholder="Filter by name, home, workplace, activity…"
-                  className="w-full border border-slate-200 rounded-lg px-3 py-1.5 text-xs"
+                  className="w-full border border-slate-200 rounded-lg px-3 py-1.5 text-xs shrink-0"
                 />
 
-                <div className="flex items-center justify-between text-[10px] text-slate-500 px-1">
+                <div className="flex items-center justify-between text-[10px] text-slate-500 px-1 shrink-0">
                   <label className="flex items-center gap-1.5 cursor-pointer">
                     <input
                       type="checkbox"
@@ -17538,7 +18755,127 @@ export default function App() {
                   </label>
                 </div>
 
-                <div className="bg-white border border-slate-100 rounded-2xl overflow-y-auto max-h-[32vh] shadow-inner">
+                <div
+                  className="shrink-0 bg-violet-50/80 border border-violet-100 rounded-xl px-2 py-1.5 space-y-1"
+                  data-testid="people-travel-preference"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[9px] font-bold uppercase tracking-wide text-violet-800">
+                      Travel
+                    </span>
+                    <span className="text-[9px] text-slate-400 truncate">
+                      {selectedPersonIds.size === 0
+                        ? 'Select people'
+                        : 'Applies to the selection'}
+                    </span>
+                  </div>
+                  <TravelPreferenceSwitch
+                    name="people-panel-travel"
+                    value={selectedTravelPreference}
+                    disabled={!roomCode || selectedPersonIds.size === 0}
+                    onChange={pref => setPeopleTravelPreference(selectedPersonIds, pref)}
+                  />
+                </div>
+
+                <div
+                  className="shrink-0 flex flex-wrap items-center gap-1 bg-violet-50 border border-violet-100 rounded-xl px-2 py-1.5"
+                  data-testid="people-control-bar"
+                >
+                  <span className="text-[9px] font-bold uppercase tracking-wide text-violet-800 mr-0.5 shrink-0">
+                    Control
+                  </span>
+                  <PeopleIconBtn
+                    title={pendingEmployeeAssign ? 'Click a building on the map…' : 'Assign workplace — then click a building'}
+                    testId="people-control-assign-work"
+                    disabled={selectedPersonIds.size === 0 || !roomCode}
+                    active={pendingEmployeeAssign}
+                    onClick={startAssignEmployees}
+                    className="bg-emerald-600"
+                  >
+                    <Briefcase className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Clear workplace"
+                    testId="people-control-clear-work"
+                    disabled={selectedPersonIds.size === 0 || !roomCode}
+                    onClick={clearSelectedWorkplaces}
+                    className="bg-slate-500"
+                  >
+                    <CircleOff className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Board selected vehicle as driver"
+                    testId="people-control-board-driver"
+                    disabled={selectedPersonIds.size === 0 || selectedVehicles.size === 0 || !roomCode}
+                    onClick={() => boardSelectedPeople('driver')}
+                    className="bg-indigo-600"
+                  >
+                    <ShipWheel className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Board selected vehicle as passenger"
+                    testId="people-control-board-passenger"
+                    disabled={selectedPersonIds.size === 0 || selectedVehicles.size === 0 || !roomCode}
+                    onClick={() => boardSelectedPeople('passenger')}
+                    className="bg-sky-600"
+                  >
+                    <Users className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Leave vehicle here"
+                    testId="people-control-alight"
+                    disabled={selectedPersonIds.size === 0 || !roomCode}
+                    onClick={() => alightSelectedPeople('here')}
+                    className="bg-slate-700"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Open floating person control panel(s)"
+                    testId="people-control-panel"
+                    disabled={selectedPersonIds.size === 0}
+                    onClick={() => {
+                      for (const id of selectedPersonIds) {
+                        spawnPersonPanel(id);
+                      }
+                    }}
+                    className="bg-blue-600"
+                  >
+                    <Joystick className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Go to work now — uses each person's travel preference"
+                    testId="people-control-go-work"
+                    disabled={selectedPersonIds.size === 0 || !roomCode}
+                    onClick={sendSelectedPeopleToWork}
+                    className="bg-emerald-700"
+                  >
+                    <PlayCircle className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Go home now — uses each person's travel preference"
+                    testId="people-control-send-home"
+                    disabled={selectedPersonIds.size === 0 || !roomCode}
+                    onClick={sendSelectedPeopleHome}
+                    className="bg-rose-600"
+                  >
+                    <Home className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                  <PeopleIconBtn
+                    title="Enter building (at vehicle / open inspector)"
+                    testId="people-control-enter-building"
+                    disabled={selectedPersonIds.size === 0 || !roomCode}
+                    onClick={enterSelectedBuildingWithPeople}
+                    className="bg-emerald-700"
+                  >
+                    <Building2 className="w-3.5 h-3.5" />
+                  </PeopleIconBtn>
+                </div>
+
+                <div
+                  className="bg-white border border-slate-100 rounded-2xl overflow-y-auto min-h-0 flex-1 shadow-inner"
+                  data-testid="people-list"
+                >
                   {filteredPeople.length === 0 && (
                     <div className="p-6 text-center text-sm text-slate-400">
                       No people yet. Place homes, then Populate houses or create a person.
@@ -17588,6 +18925,7 @@ export default function App() {
                           </div>
                           <div className="text-[10px] text-violet-600 truncate">
                             {locationLabel(p.location)} · {p.activity || 'idle'}
+                            {` · ${travelPreferenceLabel(p.travelPreference)}`}
                             {typeof p.money === 'number' ? ` · $${p.money}` : ''}
                             {p.schedule?.length
                               ? ` · 📅 ${p.schedule.length} slots`
@@ -17597,91 +18935,6 @@ export default function App() {
                       </div>
                     );
                   })}
-                </div>
-
-                <div className="bg-violet-50 border border-violet-100 rounded-xl p-3 space-y-2">
-                  <div className="text-xs font-semibold text-violet-900">Control selected people</div>
-                  <p className="text-[10px] text-slate-500">
-                    Assign workplace by clicking a building tile. Existing people keep their current place and travel to work; only newly created people can start at a workplace. Production needs staff on-site.
-                    Board vehicles from Cars/Service selection.
-                  </p>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0 || !roomCode}
-                      onClick={startAssignEmployees}
-                      className={`py-1.5 rounded-lg text-[11px] font-bold disabled:opacity-40 ${
-                        pendingEmployeeAssign
-                          ? 'bg-violet-700 text-white animate-pulse'
-                          : 'bg-emerald-600 text-white'
-                      }`}
-                    >
-                      <Briefcase className="w-3 h-3 inline mr-0.5" />
-                      {pendingEmployeeAssign ? 'Click building…' : 'Assign workplace'}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0 || !roomCode}
-                      onClick={clearSelectedWorkplaces}
-                      className="py-1.5 rounded-lg text-[11px] font-bold bg-slate-200 text-slate-700 disabled:opacity-40"
-                    >
-                      Clear workplace
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0 || selectedVehicles.size === 0 || !roomCode}
-                      onClick={() => boardSelectedPeople('driver')}
-                      className="py-1.5 rounded-lg text-[11px] font-bold bg-indigo-600 text-white disabled:opacity-40"
-                    >
-                      Board as driver
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0 || selectedVehicles.size === 0 || !roomCode}
-                      onClick={() => boardSelectedPeople('passenger')}
-                      className="py-1.5 rounded-lg text-[11px] font-bold bg-sky-600 text-white disabled:opacity-40"
-                    >
-                      Board as passenger
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0 || !roomCode}
-                      onClick={() => alightSelectedPeople('here')}
-                      className="py-1.5 rounded-lg text-[11px] font-bold bg-slate-700 text-white disabled:opacity-40"
-                    >
-                      Leave vehicle here
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0}
-                      onClick={() => {
-                        for (const id of selectedPersonIds) {
-                          spawnPersonPanel(id);
-                        }
-                      }}
-                      className="py-1.5 rounded-lg text-[11px] font-bold bg-blue-600 text-white disabled:opacity-40"
-                      title="Open floating person control panel(s)"
-                    >
-                      Control panel
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0 || !roomCode}
-                      onClick={sendSelectedPeopleHome}
-                      className="py-1.5 rounded-lg text-[11px] font-bold bg-rose-600 text-white disabled:opacity-40"
-                    >
-                      <Home className="w-3 h-3 inline mr-0.5" />
-                      Send home
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedPersonIds.size === 0 || !roomCode}
-                      onClick={enterSelectedBuildingWithPeople}
-                      className="col-span-2 py-1.5 rounded-lg text-[11px] font-bold bg-emerald-700 text-white disabled:opacity-40"
-                    >
-                      Enter building (at vehicle / open inspector)
-                    </button>
-                  </div>
                 </div>
               </div>
             </motion.div>
@@ -17740,6 +18993,7 @@ export default function App() {
                   setSelectedPersonIds(new Set([panel.personId]));
                   startAssignEmployees();
                 }}
+                onTravelPreference={pref => setPeopleTravelPreference([panel.personId], pref)}
                 onFocusOnMap={() => {
                   selectPerson(panel.personId, {
                     openEdit: false,
@@ -17840,6 +19094,10 @@ export default function App() {
                 activateDrivePanel(panel.vehicleId);
                 setVehicleManualOverride(panel.vehicleId, enabled);
               }}
+              onToggleTowHook={() => {
+                activateDrivePanel(panel.vehicleId);
+                toggleTowHook(panel.vehicleId);
+              }}
               onAssignDriver={(personId) => {
                 activateDrivePanel(panel.vehicleId);
                 assignVehicleDriver(panel.vehicleId, personId);
@@ -17900,8 +19158,9 @@ export default function App() {
                   setEconomy={setEconomy}
                   setVehicles={setVehicles}
                   roomCode={roomCode}
-                  pendingBusRouteStationKey={pendingBusRouteStationKey}
-                  setPendingBusRouteStationKey={setPendingBusRouteStationKey}
+                  pendingBusRouteEdit={pendingBusRouteEdit}
+                  setPendingBusRouteEdit={setPendingBusRouteEdit}
+                  onPreviewRoute={setPreviewBusRoute}
                   onClose={() => setInspectBuildingKey(null)}
                 />
               ) : (
@@ -18305,9 +19564,18 @@ export default function App() {
                     <p>Turn at intersections, or change lanes on 4-lane roads.</p>
                   </li>
                 </ul>
+                <a
+                  href="/help"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-8 w-full py-3 bg-white border-2 border-blue-100 text-blue-700 rounded-2xl font-bold hover:bg-blue-50 transition-all flex items-center justify-center gap-2"
+                >
+                  <CircleHelp className="w-4 h-4" />
+                  Open full documentation
+                </a>
                 <button 
                   onClick={() => setShowInfo(false)}
-                  className="mt-8 w-full py-4 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-200 active:scale-95"
+                  className="mt-3 w-full py-4 bg-blue-600 text-white rounded-2xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-200 active:scale-95"
                 >
                   Start Building
                 </button>

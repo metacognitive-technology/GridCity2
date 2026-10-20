@@ -15,9 +15,12 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      - GRIDBOT_ESCALATE_WEBHOOK_URL=${GRIDBOT_ESCALATE_WEBHOOK_URL:-}
+      - GRIDBOT_ESCALATE_WEBHOOK_AUTH=${GRIDBOT_ESCALATE_WEBHOOK_AUTH:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/health"]
       interval: 30s
       timeout: 10s
       retries: 3

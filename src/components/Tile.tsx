@@ -12,6 +12,9 @@ import {
   ROAD_OUTER_4L,
   ROAD_WIDTH_2L,
   ROAD_WIDTH_4L,
+  ROUNDABOUT_ISLAND_R,
+  ROUNDABOUT_LANE_R,
+  ROUNDABOUT_OUTER_R,
   TILE_CENTER,
   TILE_PX,
   svgN,
@@ -143,7 +146,9 @@ const OneWayCurveMarkings: React.FC<{
       ? ONE_WAY_CURVE_NW_CENTER
       : ONE_WAY_CURVE_NW_CENTER.map(mirrorPt) as [Pt, Pt, Pt];
   const [p0, p1, p2] = center;
-
+  // NW One-Way Cv: counter-clockwise west→north (p2→p0).
+  // SE reverse: clockwise south→east (p0→p2). Dashed path is the same geometry.
+  const [a0, a1, a2]: [Pt, Pt, Pt] = variant === 'nw' ? [p2, p1, p0] : [p0, p1, p2];
   return (
     <>
       <path
@@ -155,9 +160,9 @@ const OneWayCurveMarkings: React.FC<{
         opacity="0.95"
       />
       <LaneCurveArrows
-        p0={p0}
-        p1={p1}
-        p2={p2}
+        p0={a0}
+        p1={a1}
+        p2={a2}
         samples={[0.22, 0.5, 0.78]}
         color={stripeColor}
       />
@@ -673,24 +678,69 @@ export const Tile: React.FC<TileProps> = ({
           </>
         );
       case 'road-roundabout':
+      case 'road-roundabout-reverse': {
+        // rot 0: quarter ring on the SE corner plus a west spur.
+        // The reverse tile is that art mirrored across the vertical center.
+        const mirror = type === 'road-roundabout-reverse';
         return (
-          <>
-            {/* The roundabout arc (quarter circle) */}
-            <path 
+          <g transform={mirror ? 'translate(64 0) scale(-1 1)' : undefined}>
+            <path
               d={`M ${svgN(ROAD_INSET_2L)} 64 A ${svgN(ROAD_OUTER_2L)} ${svgN(ROAD_OUTER_2L)} 0 0 1 64 ${svgN(ROAD_INSET_2L)} L 64 ${svgN(ROAD_OUTER_2L)} A ${svgN(ROAD_INSET_2L)} ${svgN(ROAD_INSET_2L)} 0 0 0 ${svgN(ROAD_OUTER_2L)} 64 Z`}
-              fill={color} 
+              fill={color}
             />
-            {/* The entrance/exit road */}
             <rect x="0" y={svgN(ROAD_INSET_2L)} width="32" height={svgN(ROAD_WIDTH_2L)} fill={color} />
-            {/* Markings */}
-            <path 
+            <path
               d={`M ${TILE_CENTER} 64 A ${TILE_CENTER} ${TILE_CENTER} 0 0 1 64 ${TILE_CENTER}`}
-              fill="none" 
-              stroke={stripeColor} 
-              strokeWidth="2" 
-              strokeDasharray="8,8" 
+              fill="none"
+              stroke={stripeColor}
+              strokeWidth="2"
+              strokeDasharray="8,8"
             />
             <line x1="0" y1={TILE_CENTER - 1} x2={svgN(ROAD_OUTER_2L - 20)} y2={TILE_CENTER - 1} stroke={stripeColor} strokeWidth="2" strokeDasharray="8,8" />
+          </g>
+        );
+      }
+      case 'road-roundabout-4way': {
+        const armLen = Math.max(4, TILE_CENTER - ROUNDABOUT_OUTER_R - 1);
+        const arrows: { x: number; y: number; angle: number }[] = [
+          { x: TILE_CENTER + ROUNDABOUT_LANE_R, y: TILE_CENTER, angle: 0 },
+          { x: TILE_CENTER, y: TILE_CENTER - ROUNDABOUT_LANE_R, angle: 270 },
+          { x: TILE_CENTER - ROUNDABOUT_LANE_R, y: TILE_CENTER, angle: 180 },
+          { x: TILE_CENTER, y: TILE_CENTER + ROUNDABOUT_LANE_R, angle: 90 },
+        ];
+        return (
+          <>
+            <circle cx={TILE_CENTER} cy={TILE_CENTER} r={ROUNDABOUT_OUTER_R} fill={color} />
+            <rect x={svgN(ROAD_INSET_2L)} y="0" width={svgN(ROAD_WIDTH_2L)} height="64" fill={color} />
+            <rect x="0" y={svgN(ROAD_INSET_2L)} width="64" height={svgN(ROAD_WIDTH_2L)} fill={color} />
+            <rect x={TILE_CENTER - 1} y="1" width="2" height={armLen} fill={stripeColor} />
+            <rect x={TILE_CENTER - 1} y={svgN(TILE_CENTER + ROUNDABOUT_OUTER_R + 1)} width="2" height={armLen} fill={stripeColor} />
+            <rect x="1" y={TILE_CENTER - 1} width={armLen} height="2" fill={stripeColor} />
+            <rect x={svgN(TILE_CENTER + ROUNDABOUT_OUTER_R + 1)} y={TILE_CENTER - 1} width={armLen} height="2" fill={stripeColor} />
+            <circle
+              cx={TILE_CENTER}
+              cy={TILE_CENTER}
+              r={ROUNDABOUT_LANE_R}
+              fill="none"
+              stroke={stripeColor}
+              strokeWidth="1.4"
+              strokeDasharray="3,3"
+            />
+            {arrows.map(a => (
+              <OneWayArrowHead key={`${a.x},${a.y}`} x={a.x} y={a.y} angle={a.angle} size={4.5} color={stripeColor} />
+            ))}
+            <circle cx={TILE_CENTER} cy={TILE_CENTER} r={ROUNDABOUT_ISLAND_R} fill="#86efac" stroke="#166534" strokeWidth="1" />
+          </>
+        );
+      }
+      case 'road-cul-de-sac':
+        return (
+          <>
+            {/* 2-lane stem on the south edge (port 2) plus a turnaround bulb */}
+            <rect x={ROAD_INSET_2L} y="30" width={ROAD_WIDTH_2L} height="34" fill={color} />
+            <circle cx={TILE_CENTER} cy="28" r="18" fill={color} />
+            <circle cx={TILE_CENTER} cy="28" r="5" fill="#86efac" stroke="#166534" strokeWidth="1" />
+            <rect x={TILE_CENTER - 1} y="42" width="2" height="12" fill={stripeColor} />
           </>
         );
       case 'road-end':

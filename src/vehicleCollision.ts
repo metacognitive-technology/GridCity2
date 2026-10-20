@@ -1,4 +1,5 @@
 import { isEmergencyMode } from './traffic';
+import { isTowLinked } from './tow';
 import { GridData, Vehicle } from './types';
 import {
   collisionBodiesIntersect,
@@ -30,6 +31,7 @@ export function vehiclesCollide(
   grid: GridData
 ): boolean {
   if (!vehiclesShareCollisionSpace(a, b)) return false;
+  if (isTowLinked(a, b)) return false;
   if (emergencyIgnoresCollision(a, b)) return false;
 
   const bodiesA = getVehicleCollisionBodies(a, grid);

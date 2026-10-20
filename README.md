@@ -54,6 +54,27 @@ docker ps
 
 All features work out of the box for anonymous users in collaborative rooms. No Google Sign-In or social logins are used.
 
+## Tests (Playwright)
+
+Browser and API smoke tests live in `e2e/`. First-time setup:
+
+```bash
+npm install
+npx playwright install chromium
+```
+
+```bash
+# Build a production bundle, serve it on :4173 with an isolated test DB, run tests
+npm test
+
+# Interactive UI / headed Chromium
+npm run test:ui
+npm run test:headed
+
+# Against an already-running app (e.g. Docker on :3001)
+PLAYWRIGHT_BASE_URL=http://127.0.0.1:3001 npm test
+```
+
 ---
 
 ### Alternative: Run without Docker Compose

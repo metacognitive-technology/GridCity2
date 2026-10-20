@@ -9,9 +9,12 @@ import type {
   GridData,
   GridTile,
   Person,
+  TileType,
   TrafficState,
   Vehicle,
 } from '../types';
+import { indoorTileKey } from '../people';
+import { Tile } from './Tile';
 import {
   DIVIDER_LEFT,
   DIVIDER_RIGHT,
@@ -23,19 +26,41 @@ import {
   ROAD_OUTER_4L,
   ROAD_WIDTH_2L,
   ROAD_WIDTH_4L,
+  ROUNDABOUT_ISLAND_R,
+  ROUNDABOUT_LANE_R,
+  ROUNDABOUT_OUTER_R,
   TILE_CENTER,
   TILE_PX,
 } from '../roadGeometry';
 import { getVehiclePose } from '../vehicleShapes';
 
 const TILE = 1; // world units per grid cell
-const VIEW_RANGE = 14; // tiles ahead / around
+/** Euclidean draw radius so the tile horizon stays constant as the camera yaws. */
+const VIEW_RANGE = 16; // tiles around the camera
 const EYE_HEIGHT = 0.42;
-/** Base / cruise FOV (radians). Wider when stopped or at junctions. */
-const FOV_CRUISE = 74 * (Math.PI / 180);
-const FOV_STOP = 92 * (Math.PI / 180);
-const FOV_JUNCTION = 100 * (Math.PI / 180);
-const NEAR_CLIP = 0.06;
+/**
+ * Standing adult eyes, in the same world units as building floors.
+ * First-floor windows are drawn at y 0.25–0.47; 0.32 looks through that band
+ * (~1.6m). Driver pitch-down is NOT applied — that reads as a 2-storey aerial.
+ */
+const PERSON_EYE_HEIGHT = 0.32;
+const PERSON_EYE_WALK = 0.34;
+/** Slight sidewalk look-down (radians), far less than PITCH_DOWN. */
+const PERSON_PITCH = 0.07;
+/** Vertical FOV (radians). Keep modest — wide angles warp buildings at the frame edges. */
+const FOV_CRUISE = 50 * (Math.PI / 180);
+/** Extra look-down (positive = toward the road). */
+const PITCH_DOWN = 15 * (Math.PI / 180);
+/** Camera look-joystick limits (radians). Stick-up looks toward the horizon. */
+const LOOK_YAW_MAX = 75 * (Math.PI / 180);
+const LOOK_PITCH_MAX = 42 * (Math.PI / 180);
+const JOY_TRAVEL_PX = 20;
+const NEAR_CLIP = 0.08;
+/** World-space grass sits just under tile surfaces (y = 0) so look-around has no screen-space parallax. */
+const GROUND_Y = -0.03;
+/** Disk radius; larger than VIEW_RANGE so the grass horizon is never a square cutoff. */
+const GROUND_PLANE_RADIUS = 48;
+const CAM_SMOOTH = 0.28;
 
 type RGB = [number, number, number];
 
@@ -181,74 +206,52 @@ function headingToYaw(headingDeg: number): number {
   return ((headingDeg - 90) * Math.PI) / 180;
 }
 
-/**
- * Build driver camera with adaptive FOV / pitch so junctions stay in frame
- * when stopped at lights or sitting on an intersection.
- */
+/** Driver camera: fixed FOV / pitch so the view does not lurch when stopping or turning. */
 function makeCam(vehicle: Vehicle, grid: GridData): Cam {
   const pose = getVehiclePose(vehicle, grid);
   const { x, z } = pixelToWorld(pose.posX, pose.posY);
   const yaw = headingToYaw(pose.rotation);
   const cos = Math.cos(yaw);
   const sin = Math.sin(yaw);
-  // Forward in world XZ (same as vehicle rendering)
-  const fx = cos;
-  const fz = sin;
-
-  const ground = vehicleGroundTile(vehicle, grid);
-  const onJunction = isIntersectionTileType(ground?.type);
-  const aheadJunction = tileAheadIsIntersection(vehicle, grid);
-  const stopped = !vehicle.isMoving;
-  const trafficHold =
-    vehicle.trafficStopReason === 'stoplight' ||
-    vehicle.trafficStopReason === 'stop-sign' ||
-    vehicle.trafficStopReason === 'yield';
-  // Stop-line region on approach tiles (lights/signs often hold ~0.55–0.85 progress)
-  const nearStopLine = vehicle.progress >= 0.5;
-  const junctionContext =
-    onJunction || aheadJunction || trafficHold || (stopped && nearStopLine);
-
-  // —— FOV: widen when stopped or at junctions so cross traffic / painted lines stay visible ——
-  let fov = FOV_CRUISE;
-  if (stopped) fov = FOV_STOP;
-  if (junctionContext) fov = Math.max(fov, FOV_JUNCTION);
-  if (stopped && junctionContext) fov = Math.max(fov, FOV_JUNCTION + 4 * (Math.PI / 180));
-
-  // —— Pitch: look down more when stopped / at junction so road surface fills the view ——
-  let pitch = 0.1; // slight look-down while cruising
-  if (stopped) pitch = 0.2;
-  if (junctionContext) pitch = Math.max(pitch, 0.26);
-  if (stopped && junctionContext) pitch = 0.32;
-
-  // —— Eye height ——
-  let eyeY = EYE_HEIGHT + (vehicle.zIndex > 0 ? 0.55 : 0);
-  if (junctionContext) eyeY += 0.06;
-  if (stopped && junctionContext) eyeY += 0.04;
-
-  // —— Pull camera back slightly so the vehicle nose doesn't fill the frame;
-  //    when stopped at a junction this keeps the whole intersection in view. ——
-  let back = 0.1;
-  if (stopped) back = 0.18;
-  if (junctionContext) back = Math.max(back, 0.28);
-  if (stopped && junctionContext) back = 0.38;
-
-  // When approaching stop line on a non-junction tile, bias slightly forward of
-  // the pull-back so the junction *ahead* remains centered (not only our tile).
-  let forwardBias = 0;
-  if (stopped && aheadJunction && !onJunction && nearStopLine) {
-    forwardBias = 0.12;
-    back = Math.max(0.2, back - 0.08);
-  }
-
+  const eyeY = EYE_HEIGHT + (vehicle.zIndex > 0 ? 0.55 : 0);
+  const back = 0.12;
   return {
-    x: x - fx * back + fx * forwardBias,
+    x: x - cos * back,
     y: eyeY,
-    z: z - fz * back + fz * forwardBias,
+    z: z - sin * back,
     yaw,
-    pitch,
-    fov,
+    pitch: 0.08 + PITCH_DOWN,
+    fov: FOV_CRUISE,
     cos,
     sin,
+  };
+}
+
+function applyLook(cam: Cam, lookYaw: number, lookPitch: number): Cam {
+  const yaw = cam.yaw + lookYaw;
+  const pitch = Math.max(-0.35, Math.min(1.1, cam.pitch + lookPitch));
+  return { ...cam, yaw, pitch, cos: Math.cos(yaw), sin: Math.sin(yaw) };
+}
+
+function lerpAngle(a: number, b: number, t: number): number {
+  let d = b - a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return a + d * t;
+}
+
+function smoothCam(prev: Cam | null, target: Cam, k: number): Cam {
+  if (!prev) return { ...target };
+  const yaw = lerpAngle(prev.yaw, target.yaw, k);
+  return {
+    x: prev.x + (target.x - prev.x) * k,
+    y: prev.y + (target.y - prev.y) * k,
+    z: prev.z + (target.z - prev.z) * k,
+    yaw,
+    pitch: prev.pitch + (target.pitch - prev.pitch) * k,
+    fov: target.fov,
+    cos: Math.cos(yaw),
+    sin: Math.sin(yaw),
   };
 }
 
@@ -265,12 +268,12 @@ function worldToCam(wx: number, wy: number, wz: number, cam: Cam) {
   let cx = dx * rx + dz * rz;
   let cy = dy;
   let cz = dx * fx + dz * fz;
-  // Pitch around camera X (positive pitch looks down at the road)
+  // Pitch around camera X. Positive pitch = look down (horizon moves up on screen).
   if (cam.pitch) {
     const cp = Math.cos(cam.pitch);
     const sp = Math.sin(cam.pitch);
-    const cy2 = cy * cp - cz * sp;
-    const cz2 = cy * sp + cz * cp;
+    const cy2 = cy * cp + cz * sp;
+    const cz2 = -cy * sp + cz * cp;
     cy = cy2;
     cz = cz2;
   }
@@ -287,10 +290,77 @@ function project(
 ): { x: number; y: number; z: number } | null {
   const c = worldToCam(wx, wy, wz, cam);
   if (c.z < NEAR_CLIP) return null;
+  return camToScreen(c, cam, w, h);
+}
+
+function camToScreen(
+  c: { x: number; y: number; z: number },
+  cam: Cam,
+  w: number,
+  h: number,
+): { x: number; y: number; z: number } {
   const f = 0.5 * h / Math.tan(cam.fov / 2);
-  const sx = w / 2 + (c.x * f) / c.z;
-  const sy = h / 2 - (c.y * f) / c.z;
-  return { x: sx, y: sy, z: c.z };
+  return {
+    x: w / 2 + (c.x * f) / c.z,
+    y: h / 2 - (c.y * f) / c.z,
+    z: c.z,
+  };
+}
+
+type CamPt = { x: number; y: number; z: number };
+
+function interpolateCam(a: CamPt, b: CamPt, da: number, db: number): CamPt {
+  const denom = da - db;
+  const t = Math.abs(denom) < 1e-12 ? 0 : da / denom;
+  const u = Math.max(0, Math.min(1, t));
+  return {
+    x: a.x + (b.x - a.x) * u,
+    y: a.y + (b.y - a.y) * u,
+    z: a.z + (b.z - a.z) * u,
+  };
+}
+
+/** Sutherland–Hodgman clip against dist(p) >= 0. */
+function clipPolyByDist(pts: CamPt[], dist: (p: CamPt) => number): CamPt[] {
+  if (pts.length < 3) return [];
+  const out: CamPt[] = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    const da = dist(a);
+    const db = dist(b);
+    const aIn = da >= -1e-7;
+    const bIn = db >= -1e-7;
+    if (aIn && bIn) {
+      out.push(b);
+    } else if (aIn && !bIn) {
+      out.push(interpolateCam(a, b, da, db));
+    } else if (!aIn && bIn) {
+      out.push(interpolateCam(a, b, da, db));
+      out.push(b);
+    }
+  }
+  return out;
+}
+
+/**
+ * Clip to the perspective frustum so tiles aren't sliced/stretched as the camera
+ * looks around. Slight overscan keeps in-view tiles whole (clip happens off-screen).
+ */
+function clipToViewFrustum(pts: CamPt[], cam: Cam, w: number, h: number): CamPt[] {
+  const f = 0.5 * h / Math.tan(cam.fov / 2);
+  const overscan = 1.35;
+  const tanH = ((w / 2) / f) * overscan;
+  const tanV = ((h / 2) / f) * overscan;
+  let out = clipPolyByDist(pts, p => p.z - NEAR_CLIP);
+  if (out.length < 3) return [];
+  out = clipPolyByDist(out, p => p.x + p.z * tanH);
+  if (out.length < 3) return [];
+  out = clipPolyByDist(out, p => -p.x + p.z * tanH);
+  if (out.length < 3) return [];
+  out = clipPolyByDist(out, p => p.y + p.z * tanV);
+  if (out.length < 3) return [];
+  return clipPolyByDist(out, p => -p.y + p.z * tanV);
 }
 
 function avgDepth(pts: { z: number }[]): number {
@@ -307,16 +377,14 @@ function pushQuad(
   corners: [number, number, number][],
   fill: string,
   stroke?: string,
+  depthBias = 0,
 ) {
-  const proj: { x: number; y: number; z: number }[] = [];
-  for (const [x, y, z] of corners) {
-    const p = project(x, y, z, cam, w, h);
-    if (!p) return;
-    proj.push(p);
-  }
-  // Back-face cull rough: skip if all behind
+  const camPts = corners.map(([x, y, z]) => worldToCam(x, y, z, cam));
+  const clipped = clipToViewFrustum(camPts, cam, w, h);
+  if (clipped.length < 3) return;
+  const proj = clipped.map(c => camToScreen(c, cam, w, h));
   faces.push({
-    depth: avgDepth(proj),
+    depth: avgDepth(proj) + depthBias,
     points: proj.map(p => ({ x: p.x, y: p.y })),
     fill,
     stroke,
@@ -974,7 +1042,36 @@ function pushGroundTile(
       [x0, y, z1],
     ],
     rgb(color, 1),
+    undefined,
+    0.04,
   );
+}
+
+function pushWorldGroundPlane(faces: Face[], cam: Cam, w: number, h: number) {
+  const R = GROUND_PLANE_RADIUS;
+  const y = GROUND_Y;
+  const segs = 24;
+  const fill = rgb(ROAD_GRASS, 0.95);
+  const cx = cam.x;
+  const cz = cam.z;
+  for (let i = 0; i < segs; i++) {
+    const a0 = (i / segs) * Math.PI * 2;
+    const a1 = ((i + 1) / segs) * Math.PI * 2;
+    pushQuad(
+      faces,
+      cam,
+      w,
+      h,
+      [
+        [cx, y, cz],
+        [cx + Math.cos(a0) * R, y, cz + Math.sin(a0) * R],
+        [cx + Math.cos(a1) * R, y, cz + Math.sin(a1) * R],
+      ],
+      fill,
+      undefined,
+      0.12,
+    );
+  }
 }
 
 /** Tile pixel (0–64) → unit fraction. */
@@ -1287,7 +1384,7 @@ function pushSolidQuadBezier(
   }
 }
 
-/** Tessellate curved road asphalt (NW default: enters from N, exits W). */
+/** Tessellate curved road asphalt (NW default: west↔north corner). */
 function pushCurveRoadSurface(
   faces: Face[],
   cam: Cam,
@@ -1529,6 +1626,26 @@ function pushRoadTileVisual(
     drawEWAsphalt(0, TILE_PX);
   } else if (type === 'road-end' || type === 'road-4lane-end' || type === 'rail-end') {
     drawNSAsphalt(TILE_CENTER, TILE_PX);
+  } else if (type === 'road-cul-de-sac') {
+    // South stem is the 2-lane connection; the bulb is the turnaround.
+    drawNSAsphalt(30, TILE_PX);
+    const bulb: [number, number] = [TILE_CENTER, 28];
+    const bulbR = 18;
+    const segs = 14;
+    for (let i = 0; i < segs; i++) {
+      const a0 = (i / segs) * Math.PI * 2;
+      const a1 = ((i + 1) / segs) * Math.PI * 2;
+      pushLocalQuad(
+        faces, cam, w, h, gx, gz, rot, ySurface,
+        [
+          bulb,
+          [bulb[0] + bulbR * Math.cos(a0), bulb[1] + bulbR * Math.sin(a0)],
+          [bulb[0] + bulbR * Math.cos(a1), bulb[1] + bulbR * Math.sin(a1)],
+          bulb,
+        ],
+        asphalt,
+      );
+    }
   } else if (type === 'road-transition-2to4') {
     pushLocalQuad(
       faces,
@@ -1547,34 +1664,53 @@ function pushRoadTileVisual(
       ],
       asphalt,
     );
-  } else if (type === 'road-roundabout') {
-    // Quarter ring centered at (0, TILE_PX) + west spur
+  } else if (type === 'road-roundabout' || type === 'road-roundabout-reverse') {
+    // Match Tile art: quarter ring centered on the SE corner, west spur.
+    // The reverse tile mirrors that across the vertical center.
+    const mirror = type === 'road-roundabout-reverse';
+    const flip = (x: number) => (mirror ? TILE_PX - x : x);
     const segs = 10;
-    const cArc: [number, number] = [0, TILE_PX];
+    const cArc = TILE_PX;
     for (let i = 0; i < segs; i++) {
-      const t0 = i / segs;
-      const t1 = (i + 1) / segs;
-      const a0 = (-Math.PI / 2) * t0;
-      const a1 = (-Math.PI / 2) * t1;
-      const i0: [number, number] = [
-        cArc[0] + ROAD_INSET_2L * Math.cos(a0),
-        cArc[1] + ROAD_INSET_2L * Math.sin(a0),
+      const a0 = Math.PI + (Math.PI / 2) * (i / segs);
+      const a1 = Math.PI + (Math.PI / 2) * ((i + 1) / segs);
+      const at = (r: number, a: number): [number, number] => [
+        flip(cArc + r * Math.cos(a)),
+        cArc + r * Math.sin(a),
       ];
-      const i1: [number, number] = [
-        cArc[0] + ROAD_INSET_2L * Math.cos(a1),
-        cArc[1] + ROAD_INSET_2L * Math.sin(a1),
-      ];
-      const o0: [number, number] = [
-        cArc[0] + ROAD_OUTER_2L * Math.cos(a0),
-        cArc[1] + ROAD_OUTER_2L * Math.sin(a0),
-      ];
-      const o1: [number, number] = [
-        cArc[0] + ROAD_OUTER_2L * Math.cos(a1),
-        cArc[1] + ROAD_OUTER_2L * Math.sin(a1),
-      ];
-      pushLocalQuad(faces, cam, w, h, gx, gz, rot, ySurface, [i0, o0, o1, i1], asphalt);
+      pushLocalQuad(
+        faces, cam, w, h, gx, gz, rot, ySurface,
+        [at(ROAD_INSET_2L, a0), at(ROAD_OUTER_2L, a0), at(ROAD_OUTER_2L, a1), at(ROAD_INSET_2L, a1)],
+        asphalt,
+      );
     }
-    drawEWAsphalt(0, TILE_CENTER);
+    const spurX0 = flip(0);
+    const spurX1 = flip(TILE_CENTER);
+    drawEWAsphalt(Math.min(spurX0, spurX1), Math.max(spurX0, spurX1));
+  } else if (type === 'road-roundabout-4way') {
+    drawNSAsphalt(0, TILE_PX);
+    drawEWAsphalt(0, TILE_PX);
+    const segs = 20;
+    for (let i = 0; i < segs; i++) {
+      const a0 = (i / segs) * Math.PI * 2;
+      const a1 = ((i + 1) / segs) * Math.PI * 2;
+      const midA = (a0 + a1) / 2;
+      const midR = ROUNDABOUT_OUTER_R * 0.92;
+      const mx = TILE_CENTER + midR * Math.cos(midA);
+      const my = TILE_CENTER + midR * Math.sin(midA);
+      const half = ROAD_WIDTH_2L / 2;
+      // Corner flares sit outside the 2-lane cross and inside the ring.
+      if (Math.abs(mx - TILE_CENTER) <= half || Math.abs(my - TILE_CENTER) <= half) continue;
+      const at = (r: number, a: number): [number, number] => [
+        TILE_CENTER + r * Math.cos(a),
+        TILE_CENTER + r * Math.sin(a),
+      ];
+      pushLocalQuad(
+        faces, cam, w, h, gx, gz, rot, ySurface,
+        [at(ROUNDABOUT_ISLAND_R, a0), at(ROUNDABOUT_OUTER_R, a0), at(ROUNDABOUT_OUTER_R, a1), at(ROUNDABOUT_ISLAND_R, a1)],
+        asphalt,
+      );
+    }
   } else if (type.startsWith('road-') || type.startsWith('rail-')) {
     pushLocalRect(faces, cam, w, h, gx, gz, rot, ySurface, 0, 0, TILE_PX, TILE_PX, asphalt);
   }
@@ -1717,9 +1853,14 @@ function pushRoadTileVisual(
         faces, cam, w, h, gx, gz, rot, yMark,
         p0, p1, p2, 1, 5, 5, MARK_WHITE, 14,
       );
+      // NW curve: CCW west→north (reverse bezier). SE reverse: CW south→east.
+      const ccw = type === 'road-oneway-curve';
       pushArrowAlongBezier(
         faces, cam, w, h, gx, gz, rot, yMark,
-        p0, p1, p2, [0.22, 0.5, 0.78], MARK_WHITE,
+        ccw ? p2 : p0,
+        p1,
+        ccw ? p0 : p2,
+        [0.22, 0.5, 0.78], MARK_WHITE,
       );
     } else {
       pushDashedQuadBezier(
@@ -1812,6 +1953,29 @@ function pushRoadTileVisual(
         ROAD_OUTER_2L, TILE_CENTER - 1, ROAD_OUTER_2L + 12, TILE_CENTER + 1, MARK_WHITE,
       );
     }
+  } else if (type === 'road-cul-de-sac') {
+    pushLocalRect(
+      faces, cam, w, h, gx, gz, rot, yMark,
+      TILE_CENTER - 1, 42, TILE_CENTER + 1, 54, MARK_WHITE,
+    );
+    // Center island
+    const island: [number, number] = [TILE_CENTER, 28];
+    const ir = 5;
+    const segs = 8;
+    for (let i = 0; i < segs; i++) {
+      const a0 = (i / segs) * Math.PI * 2;
+      const a1 = ((i + 1) / segs) * Math.PI * 2;
+      pushLocalQuad(
+        faces, cam, w, h, gx, gz, rot, yMark,
+        [
+          island,
+          [island[0] + ir * Math.cos(a0), island[1] + ir * Math.sin(a0)],
+          [island[0] + ir * Math.cos(a1), island[1] + ir * Math.sin(a1)],
+          island,
+        ],
+        'rgba(134,239,172,0.95)',
+      );
+    }
   } else if (type === 'road-end' || type === 'road-4lane-end') {
     if (is4Lane) {
       pushLocalRect(
@@ -1854,22 +2018,21 @@ function pushRoadTileVisual(
       faces, cam, w, h, gx, gz, rot, yMark,
       DIVIDER_RIGHT, 40, 56, 4, 4, 0.5, MARK_WHITE_DIM,
     );
-  } else if (type === 'road-roundabout') {
-    // Dashed arc centerline (center at SW corner family) + spur dash — matches Tile art
+  } else if (type === 'road-roundabout' || type === 'road-roundabout-reverse') {
+    const mirror = type === 'road-roundabout-reverse';
+    const flip = (x: number) => (mirror ? TILE_PX - x : x);
     const segs = 12;
-    const cArc: [number, number] = [0, TILE_PX];
+    const cArc = TILE_PX;
     for (let i = 0; i < segs; i++) {
-      const t0 = i / segs;
-      const t1 = (i + 1) / segs;
-      const angA = (-Math.PI / 2) * t0;
-      const angB = (-Math.PI / 2) * t1;
+      const angA = Math.PI + (Math.PI / 2) * (i / segs);
+      const angB = Math.PI + (Math.PI / 2) * ((i + 1) / segs);
       const aPt: [number, number] = [
-        cArc[0] + TILE_CENTER * Math.cos(angA),
-        cArc[1] + TILE_CENTER * Math.sin(angA),
+        flip(cArc + TILE_CENTER * Math.cos(angA)),
+        cArc + TILE_CENTER * Math.sin(angA),
       ];
       const bPt: [number, number] = [
-        cArc[0] + TILE_CENTER * Math.cos(angB),
-        cArc[1] + TILE_CENTER * Math.sin(angB),
+        flip(cArc + TILE_CENTER * Math.cos(angB)),
+        cArc + TILE_CENTER * Math.sin(angB),
       ];
       if (i % 2 === 0) {
         const dx = bPt[0] - aPt[0];
@@ -1889,10 +2052,60 @@ function pushRoadTileVisual(
         );
       }
     }
+    const dashX0 = flip(0);
+    const dashX1 = flip(ROAD_OUTER_2L - 20);
     pushDashedLineEW(
       faces, cam, w, h, gx, gz, rot, yMark,
-      TILE_CENTER, 0, ROAD_OUTER_2L - 20, 8, 8, 1, MARK_WHITE,
+      TILE_CENTER, Math.min(dashX0, dashX1), Math.max(dashX0, dashX1), 8, 8, 1, MARK_WHITE,
     );
+  } else if (type === 'road-roundabout-4way') {
+    const armLen = Math.max(4, TILE_CENTER - ROUNDABOUT_OUTER_R - 1);
+    pushLocalRect(
+      faces, cam, w, h, gx, gz, rot, yMark,
+      TILE_CENTER - 1, 1, TILE_CENTER + 1, 1 + armLen, MARK_WHITE,
+    );
+    pushLocalRect(
+      faces, cam, w, h, gx, gz, rot, yMark,
+      TILE_CENTER - 1, TILE_CENTER + ROUNDABOUT_OUTER_R + 1, TILE_CENTER + 1, TILE_CENTER + ROUNDABOUT_OUTER_R + 1 + armLen, MARK_WHITE,
+    );
+    pushLocalRect(
+      faces, cam, w, h, gx, gz, rot, yMark,
+      1, TILE_CENTER - 1, 1 + armLen, TILE_CENTER + 1, MARK_WHITE,
+    );
+    pushLocalRect(
+      faces, cam, w, h, gx, gz, rot, yMark,
+      TILE_CENTER + ROUNDABOUT_OUTER_R + 1, TILE_CENTER - 1, TILE_CENTER + ROUNDABOUT_OUTER_R + 1 + armLen, TILE_CENTER + 1, MARK_WHITE,
+    );
+    const segs = 18;
+    for (let i = 0; i < segs; i += 2) {
+      const a0 = (i / segs) * Math.PI * 2;
+      const a1 = ((i + 0.55) / segs) * Math.PI * 2;
+      const at = (a: number, radial: number): [number, number] => [
+        TILE_CENTER + (ROUNDABOUT_LANE_R + radial) * Math.cos(a),
+        TILE_CENTER + (ROUNDABOUT_LANE_R + radial) * Math.sin(a),
+      ];
+      pushLocalQuad(
+        faces, cam, w, h, gx, gz, rot, yMark,
+        [at(a0, 0.7), at(a0, -0.7), at(a1, -0.7), at(a1, 0.7)],
+        MARK_WHITE,
+      );
+    }
+    const island: [number, number] = [TILE_CENTER, TILE_CENTER];
+    const isegs = 10;
+    for (let i = 0; i < isegs; i++) {
+      const a0 = (i / isegs) * Math.PI * 2;
+      const a1 = ((i + 1) / isegs) * Math.PI * 2;
+      pushLocalQuad(
+        faces, cam, w, h, gx, gz, rot, yMark,
+        [
+          island,
+          [island[0] + ROUNDABOUT_ISLAND_R * Math.cos(a0), island[1] + ROUNDABOUT_ISLAND_R * Math.sin(a0)],
+          [island[0] + ROUNDABOUT_ISLAND_R * Math.cos(a1), island[1] + ROUNDABOUT_ISLAND_R * Math.sin(a1)],
+          island,
+        ],
+        'rgba(134,239,172,0.95)',
+      );
+    }
   }
 }
 
@@ -1901,34 +2114,22 @@ function topTile(tiles: GridTile[] | undefined): GridTile | null {
   return tiles[tiles.length - 1];
 }
 
-function drawSky(ctx: CanvasRenderingContext2D, w: number, h: number, isMoving: boolean) {
-  const g = ctx.createLinearGradient(0, 0, 0, h * 0.62);
-  g.addColorStop(0, '#5b8fd4');
-  g.addColorStop(0.55, '#9ec5f0');
-  g.addColorStop(1, '#d4e6f7');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, w, h * 0.62);
-  // ground fade
-  const g2 = ctx.createLinearGradient(0, h * 0.55, 0, h);
-  g2.addColorStop(0, '#6a9a4e');
-  g2.addColorStop(1, '#3d5c32');
-  ctx.fillStyle = g2;
-  ctx.fillRect(0, h * 0.55, w, h * 0.45);
-  if (isMoving) {
-    // subtle speed lines near edges
-    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-    ctx.lineWidth = 1;
-    for (let i = 0; i < 6; i++) {
-      const y = h * 0.35 + i * 8;
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(w * 0.12, y + 4);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(w, y);
-      ctx.lineTo(w * 0.88, y + 4);
-      ctx.stroke();
-    }
+function horizonScreenY(cam: Cam, h: number): number {
+  const f = 0.5 * h / Math.tan(cam.fov / 2);
+  return h / 2 - f * Math.tan(cam.pitch);
+}
+
+function drawSky(ctx: CanvasRenderingContext2D, w: number, h: number, cam: Cam) {
+  const hy = clamp(horizonScreenY(cam, h), 0, h);
+  ctx.fillStyle = rgb(ROAD_GRASS, 0.92);
+  ctx.fillRect(0, 0, w, h);
+  if (hy > 0) {
+    const g = ctx.createLinearGradient(0, 0, 0, hy);
+    g.addColorStop(0, '#5b8fd4');
+    g.addColorStop(0.7, '#9ec5f0');
+    g.addColorStop(1, '#c8ddc0');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, hy + 1);
   }
 }
 
@@ -1990,16 +2191,24 @@ function collectFaces(
   now: number,
 ): Face[] {
   const faces: Face[] = [];
-  const cx = Math.floor(cam.x);
-  const cz = Math.floor(cam.z);
+  // Anchor the loaded disk to the vehicle/person cell so look-around / heading
+  // (which only nudge the camera a few tenths) cannot pop tiles at the horizon.
+  const cx = vehicle.x;
+  const cz = vehicle.y;
+  const originX = cx + 0.5;
+  const originZ = cz + 0.5;
+  const range2 = VIEW_RANGE * VIEW_RANGE;
 
   for (let gz = cz - VIEW_RANGE; gz <= cz + VIEW_RANGE; gz++) {
     for (let gx = cx - VIEW_RANGE; gx <= cx + VIEW_RANGE; gx++) {
+      const dx = gx + 0.5 - originX;
+      const dz = gz + 0.5 - originZ;
+      if (dx * dx + dz * dz > range2) continue;
       const key = `${gx},${gz}`;
       const tiles = grid[key];
       const top = topTile(tiles);
       if (!top) {
-        // empty void — skip
+        pushGroundTile(faces, cam, w, h, gx, gz, ROAD_GRASS, GROUND_Y);
         continue;
       }
       const style = tileStyle(top.type);
@@ -2163,7 +2372,10 @@ function collectFaces(
   if (traffic?.controls) {
     for (const c of Object.values(traffic.controls)) {
       const [tx, ty] = c.gridKey.split(',').map(Number);
-      if (!Number.isFinite(tx) || Math.abs(tx - cx) > VIEW_RANGE || Math.abs(ty - cz) > VIEW_RANGE) continue;
+      if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
+      const tdx = tx + 0.5 - originX;
+      const tdz = ty + 0.5 - originZ;
+      if (tdx * tdx + tdz * tdz > range2) continue;
       if (c.kind === 'stop-sign') {
         pushBox(faces, cam, w, h, tx + 0.7, ty + 0.7, tx + 0.82, ty + 0.82, 0, 0.7, [180, 40, 40]);
         pushBox(faces, cam, w, h, tx + 0.65, ty + 0.65, tx + 0.88, ty + 0.88, 0.7, 0.9, [200, 40, 40]);
@@ -2180,7 +2392,9 @@ function collectFaces(
   // Other vehicles — solid multi-part meshes (body, cabin, glass, wheels, lights)
   for (const [id, v] of Object.entries(vehicles)) {
     if (id === vehicleId) continue;
-    if (Math.abs(v.x - vehicle.x) > VIEW_RANGE || Math.abs(v.y - vehicle.y) > VIEW_RANGE) continue;
+    const vdx = v.x + 0.5 - originX;
+    const vdz = v.y + 0.5 - originZ;
+    if (vdx * vdx + vdz * vdz > range2) continue;
     try {
       const pose = getVehiclePose(v, grid);
       const { x, z } = pixelToWorld(pose.posX, pose.posY);
@@ -2220,6 +2434,39 @@ function drawFaces(ctx: CanvasRenderingContext2D, faces: Face[]) {
   }
 }
 
+type LookStick = {
+  yaw: number;
+  pitch: number;
+  nx: number;
+  ny: number;
+  dragging: boolean;
+  originX: number;
+  originY: number;
+};
+
+function clampStick(nx: number, ny: number): { nx: number; ny: number } {
+  const len = Math.hypot(nx, ny);
+  if (len > 1 && len > 0) return { nx: nx / len, ny: ny / len };
+  return { nx, ny };
+}
+
+function applyLookStick(
+  look: LookStick,
+  nx: number,
+  ny: number,
+  knob: HTMLDivElement | null,
+) {
+  const c = clampStick(nx, ny);
+  look.nx = c.nx;
+  look.ny = c.ny;
+  look.yaw = c.nx * LOOK_YAW_MAX;
+  // Stick/drag down (ny > 0) looks further down (positive pitch)
+  look.pitch = c.ny * LOOK_PITCH_MAX;
+  if (knob) {
+    knob.style.transform = `translate(${c.nx * JOY_TRAVEL_PX}px, ${c.ny * JOY_TRAVEL_PX}px)`;
+  }
+}
+
 export function DriverView3D({
   vehicle,
   vehicleId,
@@ -2233,8 +2480,61 @@ export function DriverView3D({
 }: DriverView3DProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef(0);
+  const lookRef = useRef<LookStick>({
+    yaw: 0,
+    pitch: 0,
+    nx: 0,
+    ny: 0,
+    dragging: false,
+    originX: 0,
+    originY: 0,
+  });
+  const knobRef = useRef<HTMLDivElement>(null);
+  const pointerRef = useRef<number | null>(null);
+  const camSmoothRef = useRef<Cam | null>(null);
+  const camVehicleRef = useRef(vehicleId);
   const propsRef = useRef({ vehicle, vehicleId, grid, vehicles, traffic, people, width, height });
   propsRef.current = { vehicle, vehicleId, grid, vehicles, traffic, people, width, height };
+
+  const onLookPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    pointerRef.current = e.pointerId;
+    const look = lookRef.current;
+    look.dragging = true;
+    look.originX = e.clientX;
+    look.originY = e.clientY;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+  };
+
+  const onLookPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (pointerRef.current !== e.pointerId) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const look = lookRef.current;
+    const nx = (e.clientX - look.originX) / 72;
+    const ny = (e.clientY - look.originY) / 72;
+    applyLookStick(look, nx, ny, knobRef.current);
+  };
+
+  const onLookPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (pointerRef.current !== e.pointerId) return;
+    e.stopPropagation();
+    pointerRef.current = null;
+    lookRef.current.dragging = false;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore
+    }
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -2253,9 +2553,36 @@ export function DriverView3D({
       const p = propsRef.current;
       const w = p.width;
       const h = p.height;
+      const look = lookRef.current;
+      if (!look.dragging) {
+        look.yaw *= 0.8;
+        look.pitch *= 0.8;
+        look.nx *= 0.8;
+        look.ny *= 0.8;
+        if (Math.abs(look.yaw) < 0.002 && Math.abs(look.pitch) < 0.002) {
+          look.yaw = 0;
+          look.pitch = 0;
+          look.nx = 0;
+          look.ny = 0;
+        }
+        const knob = knobRef.current;
+        if (knob) {
+          knob.style.transform = `translate(${look.nx * JOY_TRAVEL_PX}px, ${look.ny * JOY_TRAVEL_PX}px)`;
+        }
+      }
       try {
-        const cam = makeCam(p.vehicle, p.grid);
-        drawSky(ctx, w, h, !!p.vehicle.isMoving);
+        const target = makeCam(p.vehicle, p.grid);
+        if (camVehicleRef.current !== p.vehicleId) {
+          camVehicleRef.current = p.vehicleId;
+          camSmoothRef.current = null;
+        }
+        const smoothed = smoothCam(camSmoothRef.current, target, CAM_SMOOTH);
+        camSmoothRef.current = smoothed;
+        const cam = applyLook(smoothed, look.yaw, look.pitch);
+        drawSky(ctx, w, h, cam);
+        const groundFaces: Face[] = [];
+        pushWorldGroundPlane(groundFaces, cam, w, h);
+        drawFaces(ctx, groundFaces);
         const faces = collectFaces(
           cam,
           w,
@@ -2287,38 +2614,88 @@ export function DriverView3D({
   }, [width, height]);
 
   return (
-    <div className={`relative overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-inner ${className}`}>
+    <div
+      className={`relative overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-inner touch-none cursor-grab active:cursor-grabbing ${className}`}
+      data-camera-joystick
+      onPointerDown={onLookPointerDown}
+      onPointerMove={onLookPointerMove}
+      onPointerUp={onLookPointerUp}
+      onPointerCancel={onLookPointerUp}
+      onDoubleClick={e => {
+        e.stopPropagation();
+        const look = lookRef.current;
+        look.yaw = 0;
+        look.pitch = 0;
+        look.nx = 0;
+        look.ny = 0;
+        look.dragging = false;
+        if (knobRef.current) knobRef.current.style.transform = 'translate(0px, 0px)';
+      }}
+    >
       <canvas
         ref={canvasRef}
         width={width}
         height={height}
-        className="block w-full h-auto"
+        className="block w-full h-auto pointer-events-none"
         style={{ aspectRatio: `${width} / ${height}` }}
         aria-label="Driver 3D view"
       />
-      <div className="absolute top-1.5 left-2 text-[9px] font-bold uppercase tracking-wider text-white/70 pointer-events-none drop-shadow">
-        Driver view
+      <div className="absolute top-1.5 left-2 text-[9px] font-bold uppercase tracking-wider text-cyan-100 pointer-events-none drop-shadow">
+        Driver view · drag to look
+      </div>
+      <div
+        className="absolute bottom-2 right-2 z-10 pointer-events-none select-none"
+        aria-hidden
+      >
+        <div className="relative w-[4.25rem] h-[4.25rem] rounded-full bg-slate-950/80 border-2 border-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.55)]">
+          <div className="absolute left-1/2 top-0.5 -translate-x-1/2 text-[8px] leading-none text-cyan-200 font-bold">▲</div>
+          <div className="absolute right-0.5 top-1/2 -translate-y-1/2 text-[8px] leading-none text-cyan-200 font-bold">▶</div>
+          <div className="absolute left-1/2 bottom-0.5 -translate-x-1/2 text-[8px] leading-none text-cyan-200 font-bold">▼</div>
+          <div className="absolute left-0.5 top-1/2 -translate-y-1/2 text-[8px] leading-none text-cyan-200 font-bold">◀</div>
+          <div className="absolute left-1/2 top-1/2 w-1.5 h-1.5 -ml-0.5 -mt-0.5 rounded-full bg-cyan-200/40" />
+          <div
+            ref={knobRef}
+            data-look-knob
+            className="absolute left-1/2 top-1/2 w-7 h-7 -ml-3.5 -mt-3.5 rounded-full bg-cyan-300 shadow-md border-2 border-white will-change-transform"
+          />
+        </div>
+        <div className="text-center text-[8px] font-black uppercase tracking-[0.18em] text-cyan-100 mt-0.5 drop-shadow">
+          Look
+        </div>
       </div>
     </div>
   );
 }
 
+function personEyeScale(person: Person | undefined): number {
+  const age = person?.ageYears ?? 30;
+  if (age < 5) return 0.42;
+  if (age < 13) return 0.62;
+  if (age < 18) return 0.85;
+  return 1;
+}
+
 /** Standing eye-height camera at continuous grid coords facing heading degrees. */
-function makePersonCam(worldX: number, worldZ: number, headingDeg: number, walking: boolean): Cam {
+function makePersonCam(
+  worldX: number,
+  worldZ: number,
+  headingDeg: number,
+  walking: boolean,
+  person?: Person,
+): Cam {
   const yaw = headingToYaw(headingDeg);
   const cos = Math.cos(yaw);
   const sin = Math.sin(yaw);
-  // Adult eye height ~1.6m relative to tile scale (~car eye 0.42)
-  const eyeY = walking ? 0.52 : 0.48;
-  const fov = walking ? FOV_CRUISE : FOV_STOP;
-  const pitch = walking ? 0.08 : 0.12;
+  const scale = personEyeScale(person);
+  const eyeY = (walking ? PERSON_EYE_WALK : PERSON_EYE_HEIGHT) * scale;
+  const fov = FOV_CRUISE;
   const back = 0.05;
   return {
     x: worldX - cos * back,
     y: eyeY,
     z: worldZ - sin * back,
     yaw,
-    pitch,
+    pitch: PERSON_PITCH,
     fov,
     cos,
     sin,
@@ -2340,27 +2717,26 @@ function drawPersonHud(
   ctx.font = 'bold 10px ui-monospace, monospace';
   ctx.textAlign = 'left';
   ctx.fillStyle = '#e2e8f0';
-  const label =
-    person.location.kind === 'vehicle'
+  const indoorKey = indoorTileKey(person.location);
+  const label = indoorKey
+    ? `Inside ${indoorKey}`
+    : person.location.kind === 'vehicle'
       ? 'In vehicle'
       : person.location.kind === 'walking'
         ? 'Walking'
         : activity || 'Standing';
   ctx.fillText(label, 12, h - 10);
-  const loc =
-    person.location.kind === 'tile'
+  const loc = indoorKey
+    ? ''
+    : person.location.kind === 'tile'
       ? `${person.location.x},${person.location.y}`
       : person.location.kind === 'walking'
         ? `${person.location.x.toFixed(1)},${person.location.y.toFixed(1)}`
-        : person.location.kind === 'home'
-          ? person.location.homeKey
-          : person.location.kind === 'outdoor'
-            ? person.location.atKey
-            : person.location.kind === 'building'
-              ? person.location.buildingKey
-              : person.location.kind === 'vehicle'
-                ? person.location.vehicleId.slice(0, 8)
-                : '';
+        : person.location.kind === 'outdoor'
+          ? person.location.atKey
+          : person.location.kind === 'vehicle'
+            ? person.location.vehicleId.slice(0, 8)
+            : '';
   ctx.fillStyle = '#93c5fd';
   ctx.fillText(loc, 100, h - 10);
 }
@@ -2381,9 +2757,23 @@ export interface PersonView3DProps {
   height?: number;
 }
 
+function indoorStay(
+  person: Person,
+  grid: GridData,
+): { key: string; tile?: GridTile; fallbackType: TileType } | null {
+  const key = indoorTileKey(person.location);
+  if (!key) return null;
+  const tiles = grid[key];
+  const tile = tiles?.length ? tiles[tiles.length - 1] : undefined;
+  const fallbackType: TileType =
+    person.location.kind === 'home' ? 'building-home' : 'building-store';
+  return { key, tile, fallbackType };
+}
+
 /**
  * Eye-level 3D view from a person on the map (same renderer as driver view).
  * If the person is aboard a vehicle, uses that vehicle's driver camera.
+ * Inside a home or building: show that tile's icon and "Inside X,Y".
  */
 export function PersonView3D({
   person,
@@ -2398,8 +2788,11 @@ export function PersonView3D({
   width = 320,
   height = 180,
 }: PersonView3DProps) {
+  const indoor = indoorStay(person, grid);
+  const isIndoor = !!indoor;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef(0);
+  const camSmoothRef = useRef<Cam | null>(null);
   const propsRef = useRef({
     person,
     grid,
@@ -2426,6 +2819,7 @@ export function PersonView3D({
   };
 
   useEffect(() => {
+    if (isIndoor) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -2453,7 +2847,7 @@ export function PersonView3D({
             proxyVehicle = v;
             proxyId = v.id;
           } else {
-            cam = makePersonCam(p.gx, p.gy, p.heading, false);
+            cam = makePersonCam(p.gx, p.gy, p.heading, false, p.person);
             proxyVehicle = {
               id: p.person.id,
               x: Math.floor(p.gx),
@@ -2469,7 +2863,7 @@ export function PersonView3D({
           }
         } else {
           const walking = p.person.location.kind === 'walking' || p.person.activity === 'walking';
-          cam = makePersonCam(p.gx, p.gy, p.heading, walking);
+          cam = makePersonCam(p.gx, p.gy, p.heading, walking, p.person);
           proxyVehicle = {
             id: p.person.id,
             x: Math.floor(p.gx),
@@ -2483,7 +2877,12 @@ export function PersonView3D({
           };
           proxyId = p.person.id;
         }
-        drawSky(ctx, w, h, !!proxyVehicle.isMoving);
+        cam = smoothCam(camSmoothRef.current, cam, CAM_SMOOTH);
+        camSmoothRef.current = cam;
+        drawSky(ctx, w, h, cam);
+        const groundFaces: Face[] = [];
+        pushWorldGroundPlane(groundFaces, cam, w, h);
+        drawFaces(ctx, groundFaces);
         const faces = collectFaces(
           cam,
           w,
@@ -2512,20 +2911,50 @@ export function PersonView3D({
       alive = false;
       cancelAnimationFrame(rafRef.current);
     };
-  }, [width, height]);
+  }, [width, height, isIndoor]);
+
+  const indoorType = indoor?.tile?.type || indoor?.fallbackType || 'building-home';
 
   return (
     <div
       className={`relative overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-inner ${className}`}
     >
-      <canvas
-        ref={canvasRef}
-        width={width}
-        height={height}
-        className="block w-full h-auto"
-        style={{ aspectRatio: `${width} / ${height}` }}
-        aria-label="Person 3D view"
-      />
+      {indoor ? (
+        <div
+          className="flex flex-col items-center justify-center gap-1.5 px-2 pt-5 pb-2 bg-gradient-to-b from-slate-700 to-slate-900"
+          style={{ width, height, aspectRatio: `${width} / ${height}` }}
+          data-testid="person-view-indoor"
+          aria-label={`Inside ${indoor.key}`}
+        >
+          <div className="rounded-xl bg-white p-1 shadow-lg border border-white/70 shrink-0">
+            <Tile
+              type={indoorType}
+              rotation={indoor.tile?.rotation ?? 0}
+              size={48}
+              part={indoor.tile?.part}
+              localX={indoor.tile?.localX}
+              localY={indoor.tile?.localY}
+              w={indoor.tile?.w}
+              h={indoor.tile?.h}
+            />
+          </div>
+          <div
+            className="text-xs font-bold text-white drop-shadow tracking-wide shrink-0 text-center leading-tight"
+            data-testid="person-view-indoor-label"
+          >
+            Inside {indoor.key}
+          </div>
+        </div>
+      ) : (
+        <canvas
+          ref={canvasRef}
+          width={width}
+          height={height}
+          className="block w-full h-auto"
+          style={{ aspectRatio: `${width} / ${height}` }}
+          aria-label="Person 3D view"
+        />
+      )}
       <div className="absolute top-1.5 left-2 text-[9px] font-bold uppercase tracking-wider text-white/70 pointer-events-none drop-shadow">
         Person view
       </div>

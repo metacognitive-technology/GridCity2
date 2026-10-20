@@ -1,4 +1,4 @@
-import { LANE_OFFSET_UNIT, TILE_CENTER } from './roadGeometry';
+import { LANE_OFFSET_UNIT, ROAD_INSET_2L, ROAD_INSET_4L, TILE_CENTER, TILE_PX } from './roadGeometry';
 import {
   GridData,
   GridTile,
@@ -42,8 +42,14 @@ export const TILE_CONNECTIONS: Record<string, number[]> = {
   'road-4lane-bridge': [0, 2],
   'road-transition-2to4': [0, 2],
   'road-roundabout': [0, 1, 2, 3],
+  /** Mirror of road-roundabout. Same ports; the art is flipped. */
+  'road-roundabout-reverse': [0, 1, 2, 3],
+  /** 2-lane mouths on N/E/S/W. The entry port is also an exit (U-turn around the circle). */
+  'road-roundabout-4way': [0, 1, 2, 3],
   'road-end': [2],
   'road-4lane-end': [2],
+  /** Bulb end. Port 2 (south before rotation) is the 2-lane stem. */
+  'road-cul-de-sac': [2],
   'road-bus-stop': [0, 2],
   'road-4lane-bus-stop': [0, 2],
   // Driveable bays / lots — full 4-way access (robotaxis exit onto any adjacent road)
@@ -73,6 +79,33 @@ export function isRoadTile(type: string): boolean {
 
 export function isStraightRoadTile(type: string): boolean {
   return STRAIGHT_ROAD_TYPES.has(type);
+}
+
+export const ROUNDABOUT_4WAY_TYPE = 'road-roundabout-4way';
+
+export function isRoundabout4Way(type: string | undefined): boolean {
+  return type === ROUNDABOUT_4WAY_TYPE;
+}
+
+/**
+ * Legal leave ports. A 4-way roundabout keeps the entry port so a vehicle
+ * can loop the circle and come back out the way it came in.
+ */
+export function driveExitPorts(
+  tileType: string,
+  worldPorts: number[],
+  entryPort: number,
+  oneWayExitPort: number | null,
+): number[] {
+  if (oneWayExitPort !== null) return [oneWayExitPort];
+  if (isRoundabout4Way(tileType)) return worldPorts.slice();
+  return worldPorts.filter(p => p !== entryPort);
+}
+
+/** Extra cost so a roundabout U-turn is taken only when it shortens the route. */
+export function routeStepCost(tileType: string | undefined, entryPort: number, exitPort: number): number {
+  if (isRoundabout4Way(tileType) && entryPort === exitPort) return 4;
+  return 1;
 }
 
 /** Road tiles that can host stop signs (straight, T, cross, curve, 2-lane + 4-lane, etc.) */
@@ -237,19 +270,42 @@ export function findStoplightForVehicle(
   return exact ?? lights[0];
 }
 
-/** Progress (0–1) at which a vehicle has reached the stop line for this light */
-export function approachProgressForLight(
-  light: Extract<TrafficControl, { kind: 'stoplight' }>
+/**
+ * Center progress along a straight lane where the center is `margin` px before the light.
+ * Not clamped — a negative value means the stop is on the previous tile.
+ */
+export function rawApproachProgressForLight(
+  light: Extract<TrafficControl, { kind: 'stoplight' }>,
+  margin = 6,
 ): number {
-  const margin = 6;
   const h = normalizeHeading(light.heading);
   const pos = getStoplightPosition(h, light.lane, 0);
-  // Stop line is near the light, which sits toward the exit of this travel direction.
-  if (h === 0) return Math.max(0, Math.min(0.98, (64 - pos.y - margin) / 64));
-  if (h === 180) return Math.max(0, Math.min(0.98, (pos.y - margin) / 64));
-  if (h === 90) return Math.max(0, Math.min(0.98, 0.5 + (pos.x - TILE_CENTER - margin) / 64));
-  if (h === 270) return Math.max(0, Math.min(0.98, 0.5 - (pos.x - TILE_CENTER + margin) / 64));
+  if (h === 0) return (TILE_PX - pos.y - margin) / TILE_PX;
+  if (h === 180) return (pos.y - margin) / TILE_PX;
+  if (h === 90) return 0.5 + (pos.x - TILE_CENTER - margin) / TILE_PX;
+  if (h === 270) return 0.5 - (pos.x - TILE_CENTER + margin) / TILE_PX;
   return 0.65;
+}
+
+/** Progress (0–1) at which a vehicle center has reached the stop line for this light. */
+export function approachProgressForLight(
+  light: Extract<TrafficControl, { kind: 'stoplight' }>,
+  margin = 6,
+): number {
+  return Math.max(0, Math.min(0.98, rawApproachProgressForLight(light, margin)));
+}
+
+/**
+ * Sprite length along travel, in tile pixels. Matches Vehicle.tsx body height
+ * (car 20, semi 10, fire/tow 26, bus 34, train 40). The front bumper is half of this
+ * ahead of the center.
+ */
+export function vehicleBodyLength(type?: string): number {
+  if (type === 'bus') return 34;
+  if (type === 'fire-truck' || type === 'tow-truck') return 26;
+  if (type === 'semi') return 10;
+  if (type === 'train') return 40;
+  return 20;
 }
 
 /** Lanes available for stoplight placement on a road tile */
@@ -259,17 +315,18 @@ export function getAvailableLightSlots(tile: GridTile): { heading: number; lane:
   const ports = TILE_CONNECTIONS[type] || [];
   const slots: { heading: number; lane: number }[] = [];
   const is4Lane = type.includes('4lane');
-  const isOneWay = type.includes('oneway');
+  const oneWay = getOneWayTravel(tile);
+
+  if (oneWay) {
+    slots.push({ heading: oneWay.heading, lane: 1 });
+    slots.push({ heading: oneWay.heading, lane: -1 });
+    return slots;
+  }
 
   for (const port of ports) {
     const worldPort = (port + rot / 90) % 4;
     const heading = worldPort * 90;
     const exitPort = headingToExitPort(heading);
-
-    if (isOneWay) {
-      slots.push({ heading, lane: 1 });
-      continue;
-    }
 
     if (is4Lane) {
       const lanes = heading === 0 || heading === 180
@@ -579,6 +636,78 @@ export function canIgnoreTrafficLights(vehicle: Vehicle): boolean {
   return isEmergencyMode(vehicle);
 }
 
+export function isOneWayTileType(type: string | undefined): boolean {
+  return typeof type === 'string' && type.includes('oneway');
+}
+
+export type OneWayTravel = {
+  /** World edge the vehicle must enter from (0=N, 1=E, 2=S, 3=W) */
+  enterPort: number;
+  /** World edge the vehicle must leave through */
+  exitPort: number;
+  /** Heading while on the tile (direction of entry) */
+  heading: number;
+};
+
+/**
+ * Legal one-way flow, rotated with the tile.
+ * Straight/bridge: local northbound.
+ * Curve (NW): counter-clockwise — west→north (left turn).
+ * Curve reverse (SE): clockwise — south→east (right turn).
+ */
+export function getOneWayTravel(
+  tile: { type: string; rotation?: number } | null | undefined,
+): OneWayTravel | null {
+  if (!tile || !isOneWayTileType(tile.type)) return null;
+  const rotSteps = (((tile.rotation ?? 0) % 360) + 360) % 360 / 90;
+  const step = Math.round(rotSteps) % 4;
+  let localEnter: number;
+  let localExit: number;
+  if (tile.type === 'road-oneway-curve') {
+    localEnter = 3; // west
+    localExit = 0; // north
+  } else if (tile.type === 'road-oneway-curve-reverse') {
+    localEnter = 2; // south
+    localExit = 1; // east
+  } else {
+    localEnter = 2; // south
+    localExit = 0; // north
+  }
+  const enterPort = (localEnter + step) % 4;
+  const exitPort = (localExit + step) % 4;
+  return {
+    enterPort,
+    exitPort,
+    heading: ((enterPort + 2) % 4) * 90,
+  };
+}
+
+/**
+ * One-way roads have two lanes in the same travel direction.
+ * Keep left vs right (±1); collapse 4-lane magnitudes onto those two lanes.
+ */
+export function oneWayKeepLane(lane: number): number {
+  if (!Number.isFinite(lane) || lane === 0) return 1;
+  return lane < 0 ? -1 : 1;
+}
+
+/**
+ * Lane a taxi stores when it enters the next road tile.
+ * User driving keeps the current lane so the sprite does not slide sideways
+ * at the tile edge. Autonomous robotaxis still take the legal right-hand lane.
+ */
+export function taxiLaneEnteringTile(
+  lane: number,
+  userDriving: boolean,
+  nextOneWay: boolean,
+  nextFourLane: boolean,
+): number {
+  if (userDriving && Number.isFinite(lane)) return lane;
+  if (nextOneWay) return oneWayKeepLane(lane);
+  if (nextFourLane) return Number.isFinite(lane) ? lane : 1;
+  return 1;
+}
+
 /** Correct-side lane for this road (right of center relative to heading). */
 export function getEmergencyHomeLane(lane: number, is4Lane: boolean): number {
   if (is4Lane) {
@@ -593,55 +722,158 @@ export function getEmergencyPassLane(lane: number, is4Lane: boolean): number {
   return -getEmergencyHomeLane(lane, is4Lane);
 }
 
-export function shouldStopForLight(
-  vehicle: Vehicle,
-  traffic: TrafficState
-): boolean {
-  // Only emergency vehicles with lights on may run red/yellow
-  // Robotaxis and all other vehicles MUST stop
-  if (isEmergencyMode(vehicle)) return false;
+/** Pixels of daylight between the front bumper and a red/yellow signal. */
+const LIGHT_CLEARANCE_PX = 8;
+/** Pixels of daylight between the front bumper and a junction box. */
+const BOX_CLEARANCE_PX = 4;
 
-  const key = `${vehicle.x},${vehicle.y}`;
-  const light = findStoplightForVehicle(key, vehicle.heading, vehicle.lane, traffic);
-  if (!light) return false;
-  if (normalizeHeading(light.heading) !== normalizeHeading(vehicle.heading)) return false;
-  if (vehicle.progress < approachProgressForLight(light)) return false;
-  // Still enforce until the vehicle actually leaves the tile
-  if (vehicle.progress >= 1) return false;
-  return light.phase === 'red' || light.phase === 'yellow';
+export type SignalContext = {
+  tile?: GridTile | null;
+  grid?: GridData;
+  /** Heading the vehicle will leave this tile on. Defaults to vehicle.heading. */
+  exitHeading?: number;
+};
+
+function isRedOrYellow(phase: string | undefined): boolean {
+  return phase === 'red' || phase === 'yellow';
+}
+
+/** Cross, T, or any road tile with three or more approaches. */
+export function isSignalJunction(tile: { type: string; rotation?: number } | null | undefined): boolean {
+  if (!tile || !tile.type.startsWith('road-')) return false;
+  return getRoadWorldPorts({ type: tile.type as GridTile['type'], rotation: tile.rotation ?? 0 }).length >= 3;
+}
+
+function stepFromHeading(heading: number): { dx: number; dy: number } {
+  const h = normalizeHeading(heading);
+  if (h === 90) return { dx: 1, dy: 0 };
+  if (h === 180) return { dx: 0, dy: 1 };
+  if (h === 270) return { dx: -1, dy: 0 };
+  return { dx: 0, dy: -1 };
 }
 
 /**
- * Clamp a proposed progress so the vehicle cannot jump over a red/yellow stop line
- * in a single frame (large deltaTime / high speed). Returns clamped progress and
- * whether the vehicle must hard-stop at the line.
+ * Center progress where the front bumper is BOX_CLEARANCE_PX short of the junction box.
+ * Negative means the bumper is already in the box at progress 0, so the hold is on the previous tile.
+ */
+export function junctionEntranceProgress(tile: { type: string }, vehicle: Vehicle): number {
+  const inset = tile.type.includes('4lane') ? ROAD_INSET_4L : ROAD_INSET_2L;
+  const half = vehicleBodyLength(vehicle.type) / 2;
+  return (inset - BOX_CLEARANCE_PX - half) / TILE_PX;
+}
+
+type LightHold = { stopAt: number; clearedAt: number };
+
+/**
+ * Hold for a red/yellow light on `gridKey` that governs `vehicle.heading`.
+ * The stop puts the front bumper short of the signal. On a junction (or a turn)
+ * it is pulled back to the entrance so the vehicle does not enter the box.
+ * `clearedAt` is where the bumper reaches the signal; past that, the vehicle may leave.
+ */
+function holdForTile(
+  vehicle: Vehicle,
+  traffic: TrafficState,
+  tile: GridTile | null | undefined,
+  gridKey: string,
+  exitHeading?: number,
+): LightHold | null {
+  const light = findStoplightForVehicle(gridKey, vehicle.heading, vehicle.lane, traffic);
+  if (!light || !isRedOrYellow(light.phase)) return null;
+  const half = vehicleBodyLength(vehicle.type) / 2;
+  const clearedAt = rawApproachProgressForLight(light, half);
+  let stopAt = rawApproachProgressForLight(light, half + LIGHT_CLEARANCE_PX);
+  const turning =
+    exitHeading != null &&
+    normalizeHeading(exitHeading) !== normalizeHeading(vehicle.heading);
+  if (tile && (isSignalJunction(tile) || turning)) {
+    stopAt = Math.min(stopAt, junctionEntranceProgress(tile, vehicle));
+  }
+  return { stopAt, clearedAt };
+}
+
+/**
+ * If the next tile is a junction with a red/yellow light for our exit heading,
+ * return the progress on THIS tile where we must wait so the bumper does not enter that box.
+ */
+function lookAheadLimit(
+  vehicle: Vehicle,
+  traffic: TrafficState,
+  grid: GridData | undefined,
+  exitHeading: number | undefined,
+): number | null {
+  if (!grid) return null;
+  const h = normalizeHeading(exitHeading ?? vehicle.heading);
+  const { dx, dy } = stepFromHeading(h);
+  const nx = vehicle.x + dx;
+  const ny = vehicle.y + dy;
+  const next = getTrafficRoadTile(grid[`${nx},${ny}`]);
+  if (!next || !isSignalJunction(next)) return null;
+  const probe: Vehicle = { ...vehicle, heading: h };
+  const hold = holdForTile(probe, traffic, next, `${nx},${ny}`);
+  if (!hold) return null;
+  // Room to stop after entering — the next tile's own hold will catch them.
+  if (hold.stopAt >= 0.12) return null;
+  const onThis = hold.stopAt <= 0 ? 1 + hold.stopAt : 0.97;
+  return Math.max(0, Math.min(0.97, onThis));
+}
+
+/**
+ * Furthest center progress allowed while a red/yellow signal applies.
+ * Null when the vehicle may proceed (green, no signal, emergency, or already past the signal).
+ */
+export function maxProgressBeforeSignal(
+  vehicle: Vehicle,
+  traffic: TrafficState,
+  context?: SignalContext,
+): number | null {
+  if (isEmergencyMode(vehicle) || vehicle.type === 'train') return null;
+  const key = `${vehicle.x},${vehicle.y}`;
+  const limits: number[] = [];
+  const here = holdForTile(vehicle, traffic, context?.tile, key, context?.exitHeading);
+  if (here && vehicle.progress <= here.clearedAt + 0.012) {
+    limits.push(vehicle.progress > here.stopAt + 1e-4 ? vehicle.progress : here.stopAt);
+  }
+  const ahead = lookAheadLimit(vehicle, traffic, context?.grid, context?.exitHeading);
+  if (ahead != null) {
+    limits.push(vehicle.progress > ahead + 1e-4 ? vehicle.progress : ahead);
+  }
+  if (!limits.length) return null;
+  return Math.min(...limits);
+}
+
+export function shouldStopForLight(
+  vehicle: Vehicle,
+  traffic: TrafficState,
+  context?: SignalContext,
+): boolean {
+  // Emergency vehicles with lights on may run red/yellow.
+  // Every other vehicle, including robotaxis and manual driving, must stop.
+  const limit = maxProgressBeforeSignal(vehicle, traffic, context);
+  if (limit == null) return false;
+  return vehicle.progress >= limit - 1e-3;
+}
+
+/**
+ * Clamp a proposed progress so the vehicle cannot pass a red/yellow signal
+ * in a single frame. The limit is the front bumper short of the light, or
+ * short of the next junction box when that junction is red.
  */
 export function clampProgressForRedLight(
   vehicle: Vehicle,
   targetProgress: number,
-  traffic: TrafficState
+  traffic: TrafficState,
+  context?: SignalContext,
 ): { progress: number; mustStop: boolean } {
-  if (isEmergencyMode(vehicle)) return { progress: targetProgress, mustStop: false };
-  if (targetProgress <= vehicle.progress) return { progress: targetProgress, mustStop: false };
-
-  const key = `${vehicle.x},${vehicle.y}`;
-  const light = findStoplightForVehicle(key, vehicle.heading, vehicle.lane, traffic);
-  if (!light) return { progress: targetProgress, mustStop: false };
-  if (light.phase !== 'red' && light.phase !== 'yellow') {
+  if (isEmergencyMode(vehicle) || vehicle.type === 'train') {
     return { progress: targetProgress, mustStop: false };
   }
+  if (targetProgress <= vehicle.progress) return { progress: targetProgress, mustStop: false };
 
-  const stopAt = approachProgressForLight(light);
-  // Approaching or already at the line: do not pass stopAt while red/yellow
-  if (vehicle.progress <= stopAt + 1e-4) {
-    if (targetProgress > stopAt) {
-      return { progress: stopAt, mustStop: true };
-    }
-  } else if (vehicle.progress < 0.995) {
-    // Already past the painted line but still on tile — hold position on red/yellow
-    return { progress: vehicle.progress, mustStop: true };
-  }
-  return { progress: targetProgress, mustStop: false };
+  const limit = maxProgressBeforeSignal(vehicle, traffic, context);
+  if (limit == null) return { progress: targetProgress, mustStop: false };
+  if (targetProgress <= limit + 1e-6) return { progress: targetProgress, mustStop: false };
+  const progress = vehicle.progress > limit ? vehicle.progress : limit;
+  return { progress, mustStop: true };
 }
 
 export function createStopSign(gridKey: string, edgePort: number, id: number, lane?: number): TrafficControl {

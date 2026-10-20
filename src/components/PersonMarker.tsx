@@ -155,6 +155,7 @@ export interface PersonMapPlacement {
   gy: number;
   crossing?: boolean;
   waiting?: boolean;
+  inVehicle?: boolean;
 }
 
 export function PersonMapIcon({
@@ -166,13 +167,23 @@ export function PersonMapIcon({
   selected?: boolean;
   onClick?: () => void;
 }) {
-  const { person, gx, gy, crossing, waiting } = placement;
+  const { person, gx, gy, crossing, waiting, inVehicle } = placement;
   const size = personIconSize(person.ageYears);
   const tier = personAgeTier(person.ageYears);
   const px = gx * GRID;
   const py = gy * GRID;
   const label = `${personDisplayName(person)} · ${formatAge(person.ageYears)}${
-    crossing ? ' · crossing' : waiting ? ' · waiting' : person.activity ? ` · ${person.activity}` : ''
+    crossing
+      ? ' · crossing'
+      : waiting
+        ? ' · waiting'
+        : inVehicle
+          ? person.location.kind === 'vehicle' && person.location.seat === 'driver'
+            ? ' · driving'
+            : ' · in vehicle'
+          : person.activity
+            ? ` · ${person.activity}`
+            : ''
   }`;
 
   // Selection box padded around the pictogram (map pixels)
@@ -188,25 +199,28 @@ export function PersonMapIcon({
         e.stopPropagation();
         onClick?.();
       }}
-      className={`absolute z-[25] flex flex-col items-center pointer-events-auto transition-transform hover:scale-110 ${
-        selected ? 'scale-110 z-[30]' : ''
+      className={`absolute flex flex-col items-center pointer-events-auto transition-transform hover:scale-110 ${
+        selected ? 'scale-110' : ''
       }`}
       style={{
         left: px,
         top: py,
         transform: 'translate(-50%, -90%)',
         width: Math.max(boxW, size + 6),
+        zIndex: selected ? 140 : inVehicle ? 130 : 110,
       }}
     >
-      {(waiting || crossing) && !selected && (
+      {(waiting || crossing || inVehicle) && !selected && (
         <span
           className={`mb-0.5 px-1 py-px rounded text-[7px] font-bold leading-none border shadow-sm ${
             crossing
               ? 'bg-red-100 text-red-800 border-red-300'
-              : 'bg-amber-100 text-amber-900 border-amber-300'
+              : inVehicle
+                ? 'bg-sky-100 text-sky-900 border-sky-300'
+                : 'bg-amber-100 text-amber-900 border-amber-300'
           }`}
         >
-          {crossing ? 'CROSS' : 'WAIT'}
+          {crossing ? 'CROSS' : inVehicle ? 'CAR' : 'WAIT'}
         </span>
       )}
       <div
