@@ -15,6 +15,8 @@ import { userFromCookieHeader } from './server/auth/sessions.ts';
 import { registerGoalRoutes } from './server/tasks/goals.ts';
 import { registerTaskRoutes } from './server/tasks/routes.ts';
 import { taskCounts } from './server/tasks/counts.ts';
+import { scheduleInGameChecks } from './server/tasks/checker.ts';
+import { presentBotPayload, scriptedBotReply, taskPromptSection } from './server/tasks/botPrompt.ts';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -251,7 +253,9 @@ io.on('connection', (socket) => {
   const sims = db.prepare('SELECT id, name, data FROM simulations').all();
   socket.emit('simulations-updated', sims.map((s: any) => ({ ...s, data: JSON.parse(s.data) })));
 
-  socket.on('update-grid', ({ roomCode, updates }) => {
+  socket.on('update-grid', (payload: { roomCode?: string; updates?: Record<string, unknown>; bot?: boolean }) => {
+    const roomCode = payload?.roomCode;
+    const updates = payload?.updates;
     if (!roomCode || !updates || typeof updates !== 'object') return;
     const world = db.prepare('SELECT grid FROM worlds WHERE id = ?').get(roomCode);
     if (!world) return;
@@ -295,16 +299,33 @@ io.on('connection', (socket) => {
 
     socket.to(roomCode).emit('grid-updated', accepted);
     socket.emit('grid-update-ack', { accepted, rejected });
+    const editor = socket.data.user as { id?: string } | null;
+    scheduleInGameChecks(io, db, roomCode, {
+      bot: payload?.bot === true,
+      actorId: editor?.id ?? null,
+    });
   });
 
-  socket.on('update-vehicles', ({ roomCode, vehicles }) => {
+  socket.on('update-vehicles', (payload: { roomCode?: string; vehicles?: unknown; bot?: boolean }) => {
+    const roomCode = payload?.roomCode;
+    const vehicles = payload?.vehicles;
     db.prepare('UPDATE worlds SET vehicles = ?, updatedAt = ? WHERE id = ?').run(JSON.stringify(vehicles), Date.now(), roomCode);
-    socket.to(roomCode).emit('vehicles-updated', { roomCode, vehicles });
+    socket.to(roomCode as string).emit('vehicles-updated', { roomCode, vehicles });
+    if (roomCode) {
+      const editor = socket.data.user as { id?: string } | null;
+      scheduleInGameChecks(io, db, roomCode, { bot: payload?.bot === true, actorId: editor?.id ?? null });
+    }
   });
 
-  socket.on('update-economy', ({ roomCode, economy }) => {
+  socket.on('update-economy', (payload: { roomCode?: string; economy?: unknown; bot?: boolean }) => {
+    const roomCode = payload?.roomCode;
+    const economy = payload?.economy;
     db.prepare('UPDATE worlds SET economy = ?, updatedAt = ? WHERE id = ?').run(JSON.stringify(economy), Date.now(), roomCode);
-    socket.to(roomCode).emit('economy-updated', { roomCode, economy });
+    socket.to(roomCode as string).emit('economy-updated', { roomCode, economy });
+    if (roomCode) {
+      const editor = socket.data.user as { id?: string } | null;
+      scheduleInGameChecks(io, db, roomCode, { bot: payload?.bot === true, actorId: editor?.id ?? null });
+    }
   });
 
   socket.on('update-traffic', ({ roomCode, traffic }) => {
@@ -546,6 +567,11 @@ app.post('/api/bot/chat', async (req, res) => {
     return res.json({ reply: 'Asking GridBot…', escalate: { status: 'pending', id } });
   }
 
+  const scripted = scriptedBotReply(botUser, db, message);
+  if (scripted) {
+    return res.json(presentBotPayload(botUser, scripted));
+  }
+
   const apiKey = process.env.XAI_API_KEY;
   if (!apiKey) {
     return res.status(503).json({ error: 'XAI_API_KEY not configured' });
@@ -585,7 +611,9 @@ ROAD CRAFT (must follow when placing roads / place_tile / place_road_line / loop
 - T missing-edge: !E→0, !S→90, !W→180, !N→270; cross any rot
 - road-roundabout: quarter ring (SE corner + west spur at rot 0), ports all four. road-roundabout-reverse is the vertical mirror. road-roundabout-4way is one tile: 2-lane arms on N/E/S/W and a single counterclockwise lane around the center; vehicles may go straight, left, right, or U-turn. Any rotation.
 - save road-end / road-cul-de-sac only for true stubs (driveways, temporary dead-ends)
-- no live autoOrient — type+rotation must already share edge ports with neighbors; mismatched rot breaks canEnterNext`;
+- no live autoOrient — type+rotation must already share edge ports with neighbors; mismatched rot breaks canEnterNext
+
+${taskPromptSection(botUser, db)}`;
 
   const messages = [
     { role: 'system', content: system },
@@ -660,7 +688,7 @@ ROAD CRAFT (must follow when placing roads / place_tile / place_road_line / loop
     };
 
     const parsed = parsePayload(replyRaw);
-    return res.json(parsed);
+    return res.json(presentBotPayload(botUser, parsed));
   } catch (err: any) {
     return res.status(502).json({ error: 'Failed to reach xAI' });
   }

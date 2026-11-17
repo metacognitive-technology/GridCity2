@@ -22,6 +22,17 @@ export type BotAsk =
   | { type: 'pick_building'; prompt: string; pendingActions?: BotAction[] }
   | { type: 'choice'; prompt: string; options: string[]; pendingActions?: BotAction[] };
 
+export type BotRegion = { minX: number; minY: number; maxX: number; maxY: number };
+
+/** House tiles planNeighborhood places. homes_in_region counts this list. */
+export const NEIGHBORHOOD_HOME_TILES = ['building-home'] as const;
+
+const TASK_BOT_OPS = new Set(['create_task', 'list_tasks', 'check_goal', 'suggest_goal']);
+
+export function isTaskBotAction(action: { op?: string } | null | undefined): boolean {
+  return !!action && TASK_BOT_OPS.has(action.op || '');
+}
+
 export type BotAction =
   | { op: 'place_tile'; x: number; y: number; tile: string; rotation?: number }
   | { op: 'place_building'; x: number; y: number; tile: string; rotation?: number }
@@ -46,6 +57,29 @@ export type BotAction =
       stores: number;
       busService?: boolean;
       origin?: BotPoint;
+    }
+  | {
+      op: 'create_task';
+      title: string;
+      notes?: string;
+      kind?: 'real_world' | 'in_game';
+      criteria?: unknown;
+      region?: BotRegion;
+      dueDate?: string;
+      goalId?: string;
+      worldId?: string;
+      aim?: BotPoint;
+    }
+  | { op: 'list_tasks'; filter?: 'mine' | 'overdue' | 'in_game' }
+  | { op: 'check_goal'; taskId?: string; goalId?: string }
+  | {
+      op: 'suggest_goal';
+      worldId?: string;
+      aim?: BotPoint;
+      title?: string;
+      notes?: string;
+      criteria?: unknown;
+      region?: BotRegion;
     };
 
 export type BotChatResponse = {
@@ -155,9 +189,64 @@ function parseOneAction(raw: any): BotAction | null {
         origin,
       };
     }
+    case 'create_task': {
+      if (typeof raw.title !== 'string' || !raw.title.trim()) return null;
+      const region = asRegion(raw.region);
+      const aim = raw.aim ? asPoint(raw.aim) || undefined : undefined;
+      const kind = raw.kind === 'in_game' || raw.kind === 'real_world' ? raw.kind : undefined;
+      return {
+        op: 'create_task',
+        title: raw.title.trim().slice(0, 140),
+        notes: typeof raw.notes === 'string' ? raw.notes : undefined,
+        kind,
+        criteria: raw.criteria,
+        region,
+        dueDate: typeof raw.dueDate === 'string' ? raw.dueDate : undefined,
+        goalId: typeof raw.goalId === 'string' ? raw.goalId : undefined,
+        worldId: typeof raw.worldId === 'string' ? raw.worldId : undefined,
+        aim,
+      };
+    }
+    case 'list_tasks': {
+      const filter = raw.filter === 'mine' || raw.filter === 'overdue' || raw.filter === 'in_game'
+        ? raw.filter
+        : undefined;
+      return { op: 'list_tasks', filter };
+    }
+    case 'check_goal':
+      return {
+        op: 'check_goal',
+        taskId: typeof raw.taskId === 'string' ? raw.taskId : undefined,
+        goalId: typeof raw.goalId === 'string' ? raw.goalId : undefined,
+      };
+    case 'suggest_goal': {
+      const region = asRegion(raw.region);
+      const aim = raw.aim ? asPoint(raw.aim) || undefined : undefined;
+      return {
+        op: 'suggest_goal',
+        worldId: typeof raw.worldId === 'string' ? raw.worldId : undefined,
+        aim,
+        title: typeof raw.title === 'string' ? raw.title : undefined,
+        notes: typeof raw.notes === 'string' ? raw.notes : undefined,
+        criteria: raw.criteria,
+        region,
+      };
+    }
     default:
       return null;
   }
+}
+
+function asRegion(raw: any): BotRegion | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const nums = [raw.minX, raw.minY, raw.maxX, raw.maxY].map((n: unknown) => Number(n));
+  if (nums.some((n) => !Number.isFinite(n))) return undefined;
+  return {
+    minX: Math.trunc(nums[0]),
+    minY: Math.trunc(nums[1]),
+    maxX: Math.trunc(nums[2]),
+    maxY: Math.trunc(nums[3]),
+  };
 }
 
 export function parseBotAsk(raw: any): BotAsk | undefined {
@@ -403,7 +492,7 @@ export function planNeighborhood(
     for (let c = 0; c < cols && placed < wantHomes; c++) {
       const hx = ox + c * lotW + 1;
       const hy = oy + r * lotH + 1;
-      if (tryPlaceBuilding(ops, reserved, ctx, hx, hy, 'building-home', { w: 1, h: 1 }, buildingCount)) {
+      if (tryPlaceBuilding(ops, reserved, ctx, hx, hy, NEIGHBORHOOD_HOME_TILES[0], { w: 1, h: 1 }, buildingCount)) {
         placed += 1;
       }
     }

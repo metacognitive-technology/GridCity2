@@ -85,6 +85,7 @@ import {
 import {
   BOT_ACTION_LIMITS,
   expandActions,
+  isTaskBotAction,
   type BotAction,
   type BotAsk,
 } from './botActions';
@@ -244,6 +245,7 @@ import { AccountChip } from './components/auth/AccountChip';
 import { AdminUsersPanel } from './components/auth/AdminUsersPanel';
 import { LobbyAuthLink } from './components/auth/LobbyAuthLink';
 import { QuickTaskButton, QuickTaskProvider } from './components/tasks/QuickTask';
+import { executeTaskBotActions } from './components/tasks/botTaskActions';
 import { TasksPanel } from './components/tasks/TasksPanel';
 import { OverdueBadge } from './components/tasks/OverdueBadge';
 
@@ -9020,6 +9022,7 @@ export default function App() {
   const [rotation, setRotation] = useState(0);
   const [zoom, setZoom] = useState(INITIAL_ZOOM);
   const [offset, setOffset] = useState<Point>({ x: 0, y: 0 });
+  const [showAim, setShowAim] = useState<string | null>(null);
   
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState<Point>({ x: 0, y: 0 });
@@ -9144,6 +9147,9 @@ export default function App() {
   const bufferedKeysRef = useRef<Set<string>>(new Set());
   const [hasBufferedEdits, setHasBufferedEdits] = useState(false);
   const gridSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** True while a GridBot build's grid sync should be audited as gridbot. */
+  const botGridSyncRef = useRef(false);
+  const botGridSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [drivePanels, setDrivePanels] = useState<FloatingDrivePanelState[]>([]);
   const [activeDrivePanelId, setActiveDrivePanelId] = useState<string | null>(null);
   const [personPanels, setPersonPanels] = useState<FloatingPersonPanelState[]>([]);
@@ -9318,6 +9324,24 @@ export default function App() {
     const ch = containerRef.current?.clientHeight ?? 0;
     return clampViewportOffset(next, z, cw, ch);
   }, [zoom]);
+
+  const showTaskOnMap = useCallback((task: { worldId?: string | null; aimX?: number | null; aimY?: number | null }) => {
+    if (task.worldId && task.worldId !== roomCodeRef.current) {
+      setRoomCode(task.worldId);
+    }
+    if (task.aimX == null || task.aimY == null) return;
+    const x = task.aimX;
+    const y = task.aimY;
+    setShowAim(`${x},${y}`);
+    const cw = containerRef.current?.clientWidth ?? 0;
+    const ch = containerRef.current?.clientHeight ?? 0;
+    const targetWorldX = (x + 0.5) * GRID_SIZE;
+    const targetWorldY = (y + 0.5) * GRID_SIZE;
+    setOffset(clampOffset({
+      x: -(targetWorldX * zoom - cw / 2),
+      y: -(targetWorldY * zoom - ch / 2),
+    }));
+  }, [clampOffset, zoom]);
 
   const minimapRef = useRef<HTMLCanvasElement>(null);
   const rightMenuRef = useRef<HTMLDivElement>(null);
@@ -9577,7 +9601,11 @@ export default function App() {
     const updates = diffGrid(localGridRef.current, lastSyncedGrid.current);
     if (Object.keys(updates).length === 0) return;
 
-    socket.emit('update-grid', { roomCode: rc, updates });
+    socket.emit('update-grid', {
+      roomCode: rc,
+      updates,
+      ...(botGridSyncRef.current ? { bot: true } : {}),
+    });
   }, []);
 
   const scheduleGridSync = useCallback(() => {
@@ -13219,18 +13247,46 @@ export default function App() {
     return { aim, selection: null };
   }, [selectionStart, selectionEnd, offset.x, offset.y, zoom, showSidebar]);
 
+  const markBotEdits = useCallback(() => {
+    botGridSyncRef.current = true;
+    if (botGridSyncTimerRef.current) clearTimeout(botGridSyncTimerRef.current);
+    botGridSyncTimerRef.current = setTimeout(() => {
+      botGridSyncRef.current = false;
+      botGridSyncTimerRef.current = null;
+    }, 1500);
+  }, []);
+
   const executeBotActions = useCallback(
     async (
       actions: BotAction[],
       onProgress?: (msg: string) => void,
     ): Promise<{ summary: string }> => {
       const ctxInfo = getBotContext();
+      const dataActions = actions.filter((action) => isTaskBotAction(action));
+      const gridActions = actions.filter((action) => !isTaskBotAction(action));
+      let dataSummary = '';
+      if (dataActions.length) {
+        dataSummary = await executeTaskBotActions(dataActions, {
+          can: {
+            edit: auth.can('tasks.edit'),
+            view: auth.can('tasks.view'),
+            check: auth.can('tasks.ingame.check'),
+            goals: auth.can('goals.view'),
+          },
+          roomCode,
+          aim: ctxInfo.aim,
+        });
+      }
+      if (!gridActions.length) {
+        return { summary: dataSummary || 'No changes applied.' };
+      }
+      markBotEdits();
       const defaultOrigin = ctxInfo.aim;
       const occupied = (x: number, y: number) => {
         const tiles = gridRef.current[`${x},${y}`];
         return !!(tiles && tiles.length);
       };
-      const concrete = expandActions(actions, defaultOrigin, {
+      const concrete = expandActions(gridActions, defaultOrigin, {
         occupied,
         inBounds: isWithinGridCanvas,
       });
@@ -13349,8 +13405,9 @@ export default function App() {
         setVehicles(workingVehicles);
         vehiclesRef.current = workingVehicles;
         if (roomCode) {
-          socket.emit('update-economy', { roomCode, economy: workingEco });
-          socket.emit('update-vehicles', { roomCode, vehicles: workingVehicles });
+          const botFlag = botGridSyncRef.current ? { bot: true } : {};
+          socket.emit('update-economy', { roomCode, economy: workingEco, ...botFlag });
+          socket.emit('update-vehicles', { roomCode, vehicles: workingVehicles, ...botFlag });
         }
       };
 
@@ -13485,9 +13542,10 @@ export default function App() {
       ]
         .filter(Boolean)
         .join(' · ');
-      return { summary: summary || 'No changes applied.' };
+      const gridSummary = summary || 'No changes applied.';
+      return { summary: dataSummary ? `${dataSummary}\n${gridSummary}` : gridSummary };
     },
-    [getBotContext, economy, roomCode, addToHistory],
+    [getBotContext, economy, roomCode, addToHistory, auth, markBotEdits],
   );
 
   const handleGridClick = (e: React.MouseEvent) => {
@@ -16044,6 +16102,7 @@ export default function App() {
       <div 
         ref={containerRef}
         data-testid="map-viewport"
+        data-show-aim={showAim || undefined}
         className={`flex-1 relative overflow-hidden cursor-${
           isPanning
             ? 'grabbing'
@@ -16915,7 +16974,7 @@ export default function App() {
           pickResultRef={botPickResultRef}
         />
         {showTasksPanel && (
-          <TasksPanel open onClose={() => setShowTasksPanel(false)} />
+          <TasksPanel open onClose={() => setShowTasksPanel(false)} onShowMe={showTaskOnMap} />
         )}
         {showAdminUsers && (
           <AdminUsersPanel open onClose={() => setShowAdminUsers(false)} />
