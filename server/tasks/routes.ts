@@ -11,6 +11,8 @@ import { idsExist, parseIdList, replaceTaskGoals, replaceTaskProjects, taskLinkM
 import { publishTaskChange } from './notify.ts';
 import { spawnNextOccurrence } from './recurrence.ts';
 import { withGoalAchievements } from './rollup.ts';
+import { checkTaskNow } from './checker.ts';
+import { parseCriteria } from '../../src/shared/taskCriteria.ts';
 
 const STATUSES = ['todo', 'in_progress', 'blocked', 'done', 'cancelled'] as const;
 const PRIORITIES = ['low', 'medium', 'high'] as const;
@@ -172,7 +174,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
     const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
     const id = withGoalAchievements(db, actor, () => {
-      const created = insertTask(db, { ...parsed, createdById: user.id, source: 'form' });
+      const created = insertTask(db, { ...parsed, createdById: user.id, source: parsed.source });
       if (parsed.goalIds) replaceTaskGoals(db, created, parsed.goalIds);
       if (parsed.projectIds) replaceTaskProjects(db, created, parsed.projectIds);
       if ((parsed.status || 'todo') === 'done') spawnNextOccurrence(db, created, Date.now());
@@ -297,6 +299,14 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     publishTaskChange(io, db, existing.id);
     if (spawnedTaskId) publishTaskChange(io, db, spawnedTaskId);
     return res.json({ task: loadTask(db, existing.id), spawnedTaskId });
+  }));
+
+  app.post('/api/tasks/:id/check', asyncRoute(async (req, res) => {
+    const user = requirePerm(req, res, 'tasks.ingame.check');
+    if (!user) return;
+    const result = checkTaskNow(io, db, req.params.id, user.id);
+    if (result.ok === false) return res.status(result.status).json({ error: result.error });
+    return res.json({ checkState: result.checkState, task: loadTask(db, req.params.id) });
   }));
 
   app.post('/api/tasks/:id/comments', asyncRoute(async (req, res) => {
@@ -501,10 +511,11 @@ function parseTaskBody(db: Database, body: any, creating: boolean): TaskWrite | 
   const aimY = finiteInt(body?.aimY);
   if (aimX === undefined || aimY === undefined) return { error: 'invalid aim' };
   const criteria = cleanCriteria(body?.criteria);
-  if (criteria === undefined) return { error: 'criteria must be JSON' };
+  if (criteria.ok === false) return { error: criteria.error };
   const links = readLinkFields(db, body);
   if ('error' in links) return links;
   void creating;
+  const source = body?.source === 'bot' ? 'bot' : 'form';
   return {
     title,
     description,
@@ -513,12 +524,12 @@ function parseTaskBody(db: Database, body: any, creating: boolean): TaskWrite | 
     dueDate,
     assigneeId,
     createdById: '',
-    source: 'form',
+    source,
     recurrence,
     worldId: typeof body?.worldId === 'string' && body.worldId.trim() ? body.worldId.trim().slice(0, 80) : null,
     aimX,
     aimY,
-    criteria,
+    criteria: criteria.value,
     status,
     ...links,
   };
@@ -597,8 +608,8 @@ function parseTaskPatch(db: Database, body: any): TaskPatch | { error: string } 
   }
   if ('criteria' in body) {
     const criteria = cleanCriteria(body.criteria);
-    if (criteria === undefined) return { error: 'criteria must be JSON' };
-    patch.criteria = criteria;
+    if (criteria.ok === false) return { error: criteria.error };
+    patch.criteria = criteria.value;
   }
   const links = readLinkFields(db, body);
   if ('error' in links) return links;
@@ -611,16 +622,21 @@ function finiteInt(raw: unknown): number | null | undefined {
   return Math.trunc(raw);
 }
 
-function cleanCriteria(raw: unknown): string | null | undefined {
-  if (raw == null || raw === '') return null;
-  if (typeof raw === 'object') return JSON.stringify(raw);
-  if (typeof raw !== 'string') return undefined;
-  try {
-    JSON.parse(raw);
-    return raw;
-  } catch {
-    return undefined;
+function cleanCriteria(raw: unknown): { ok: true; value: string | null } | { ok: false; error: string } {
+  if (raw == null || raw === '') return { ok: true, value: null };
+  let value: unknown = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return { ok: false, error: 'criteria must be JSON' };
+    }
+  } else if (typeof raw !== 'object') {
+    return { ok: false, error: 'criteria must be JSON' };
   }
+  const parsed = parseCriteria(value);
+  if (!parsed.ok) return { ok: false, error: 'invalid criteria' };
+  return { ok: true, value: JSON.stringify(parsed.value) };
 }
 
 function completionFields(

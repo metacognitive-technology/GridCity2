@@ -1,6 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api } from '../../api';
+import { parseCriteria } from '../../shared/taskCriteria';
 import { blockGridPointerEvents } from '../dockEvents';
+import { CriteriaFields } from './CriteriaFields';
 import type { GoalItem, PersonOption, ProjectItem, TaskItem } from './types';
 
 type Draft = {
@@ -134,6 +136,20 @@ export function TaskDialog({
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    if (draft.kind === 'in_game' && draft.criteria.trim()) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(draft.criteria);
+      } catch {
+        setError('criteria must be JSON');
+        return;
+      }
+      const parsed = parseCriteria(raw);
+      if (!parsed.ok) {
+        setError('invalid criteria');
+        return;
+      }
+    }
     setBusy(true);
     setError(null);
     try {
@@ -353,6 +369,7 @@ export function TaskDialog({
                     className="px-3 py-2 rounded-xl border border-slate-200"
                   />
                 </div>
+                <CriteriaFields value={draft.criteria} onChange={(json) => set('criteria', json)} />
                 <textarea
                   data-testid="task-criteria"
                   value={draft.criteria}

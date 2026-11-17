@@ -1,4 +1,7 @@
 import { LANE_OFFSET_UNIT, ROAD_INSET_2L, ROAD_INSET_4L, TILE_CENTER, TILE_PX } from './roadGeometry';
+import { TILE_CONNECTIONS, worldPorts } from './shared/roadPorts';
+
+export { TILE_CONNECTIONS };
 import {
   GridData,
   GridTile,
@@ -24,48 +27,6 @@ const EDGE_LABELS = ['N', 'E', 'S', 'W'];
 export function edgePortLabel(edgePort: number): string {
   return EDGE_LABELS[edgePort] ?? String(edgePort);
 }
-
-export const TILE_CONNECTIONS: Record<string, number[]> = {
-  'road-straight': [0, 2],
-  'road-curve': [0, 3],
-  'road-t': [0, 2, 3],
-  'road-cross': [0, 1, 2, 3],
-  'road-bridge': [0, 2],
-  'road-oneway-straight': [0, 2],
-  'road-oneway-bridge': [0, 2],
-  'road-oneway-curve': [0, 3],
-  'road-oneway-curve-reverse': [1, 2],
-  'road-4lane-straight': [0, 2],
-  'road-4lane-curve': [0, 3],
-  'road-4lane-t': [0, 2, 3],
-  'road-4lane-cross': [0, 1, 2, 3],
-  'road-4lane-bridge': [0, 2],
-  'road-transition-2to4': [0, 2],
-  'road-roundabout': [0, 1, 2, 3],
-  /** Mirror of road-roundabout. Same ports; the art is flipped. */
-  'road-roundabout-reverse': [0, 1, 2, 3],
-  /** 2-lane mouths on N/E/S/W. The entry port is also an exit (U-turn around the circle). */
-  'road-roundabout-4way': [0, 1, 2, 3],
-  'road-end': [2],
-  'road-4lane-end': [2],
-  /** Bulb end. Port 2 (south before rotation) is the 2-lane stem. */
-  'road-cul-de-sac': [2],
-  'road-bus-stop': [0, 2],
-  'road-4lane-bus-stop': [0, 2],
-  // Driveable bays / lots — full 4-way access (robotaxis exit onto any adjacent road)
-  'parking-1x1': [0, 1, 2, 3],
-  'parking-1x2': [0, 1, 2, 3],
-  'parking-1x3': [0, 1, 2, 3],
-  'parking-2x2': [0, 1, 2, 3],
-  'parking-2x4': [0, 1, 2, 3],
-  'parking-4x4': [0, 1, 2, 3],
-  'building-repair-shop': [0, 1, 2, 3],
-  'building-hospital': [0, 1, 2, 3],
-  'building-taxi-station': [0, 1, 2, 3],
-  'building-bus-station': [0, 1, 2, 3],
-  'building-home': [0, 1, 2, 3],
-  'building-apartment': [0, 1, 2, 3],
-};
 
 const STRAIGHT_ROAD_TYPES = new Set([
   'road-straight', 'road-bridge', 'road-oneway-straight', 'road-oneway-bridge',
@@ -145,9 +106,7 @@ export function headingToEntryPort(heading: number): number {
 
 /** World-space connection ports for a road tile (straight, T, cross, curve, …) */
 export function getRoadWorldPorts(tile: GridTile): number[] {
-  const ports = TILE_CONNECTIONS[tile.type] || [];
-  const rotSteps = (((tile.rotation % 360) + 360) % 360) / 90;
-  return ports.map(p => (p + rotSteps) % 4);
+  return worldPorts(tile.type, tile.rotation);
 }
 
 /** @deprecated Use getRoadWorldPorts — kept for call-site compatibility */

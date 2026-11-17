@@ -1,3 +1,5 @@
+import type { CheckResult } from '../../shared/taskCriteria';
+
 export type TaskComment = {
   id: string;
   authorId: string | null;
@@ -26,6 +28,8 @@ export type TaskItem = {
   aimX: number | null;
   aimY: number | null;
   criteria: unknown;
+  checkState: CheckResult | null;
+  completedBy: string | null;
   completedAt: number | null;
   archivedAt: number | null;
   createdAt: number;

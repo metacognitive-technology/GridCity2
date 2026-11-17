@@ -20,7 +20,15 @@ function dueChip(task: TaskItem): { label: string; className: string } {
   return { label: 'No date', className: 'bg-slate-100 text-slate-500' };
 }
 
-export function TasksPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function TasksPanel({
+  open,
+  onClose,
+  onShowMe,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onShowMe?: (task: TaskItem) => void;
+}) {
   const auth = useAuth();
   const quick = useQuickTask();
   const [tab, setTab] = useState<'mine' | 'all' | 'goals' | 'projects'>('mine');
@@ -200,8 +208,26 @@ export function TasksPanel({ open, onClose }: { open: boolean; onClose: () => vo
                 <div className="flex flex-wrap gap-1 mt-1">
                   <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${chip.className}`}>{chip.label}</span>
                   <span className="text-[10px] text-slate-400">{task.kind === 'in_game' ? '🌍' : '✅'} {task.priority}</span>
+                  {task.checkState?.detail && (
+                    <span data-testid="task-progress-chip" className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-800">
+                      {task.checkState.detail}
+                    </span>
+                  )}
                 </div>
               </div>
+              {task.kind === 'in_game' && (task.worldId || task.aimX != null || task.aimY != null) && (
+                <button
+                  type="button"
+                  data-testid="task-show-me"
+                  className="text-[11px] font-bold text-emerald-700 shrink-0"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onShowMe?.(task);
+                  }}
+                >
+                  Show me
+                </button>
+              )}
               {auth.can('tasks.edit') && task.status !== 'done' && task.status !== 'cancelled' && (
                 <button
                   type="button"

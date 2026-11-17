@@ -73,6 +73,7 @@ export default defineConfig({
           GRIDBOT_ESCALATE_WEBHOOK_AUTH: '',
           QUICK_TASK_DEFAULT_ASSIGNEE: TEST_ADMIN_EMAIL,
           QUICK_TASK_PLAYER_TOAST: 'Task added.',
+          GRIDBOT_FAKE_LLM: '1',
         },
       }
     : undefined,
