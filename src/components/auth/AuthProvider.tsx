@@ -119,10 +119,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
     socket.on('task-counts', onCounts);
     socket.on('task-updated', onUpdated);
+    socket.on('goals-updated', onUpdated);
     socket.on('auth-changed', onAuth);
     return () => {
       socket.off('task-counts', onCounts);
       socket.off('task-updated', onUpdated);
+      socket.off('goals-updated', onUpdated);
       socket.off('auth-changed', onAuth);
     };
   }, [refresh]);

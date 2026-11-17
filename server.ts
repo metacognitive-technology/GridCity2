@@ -12,6 +12,7 @@ import { seedAdmin } from './server/auth/seed.ts';
 import { bearerOk } from './server/auth/bearer.ts';
 import { effectivePerms, permsInclude } from './server/auth/permissions.ts';
 import { userFromCookieHeader } from './server/auth/sessions.ts';
+import { registerGoalRoutes } from './server/tasks/goals.ts';
 import { registerTaskRoutes } from './server/tasks/routes.ts';
 import { taskCounts } from './server/tasks/counts.ts';
 
@@ -97,6 +98,7 @@ app.get('/health', (req, res) => {
 
 registerAuthRoutes(app, { db, io });
 registerTaskRoutes(app, { db, io });
+registerGoalRoutes(app, { db, io });
 
 // One sim leader per room runs vehicle/economy/traffic ticks; others receive broadcasts.
 const roomSimLeaders = new Map<string, string>();

@@ -7,7 +7,10 @@ import { can } from '../auth/permissions.ts';
 import type { SessionUser } from '../auth/sessions.ts';
 import { taskCounts } from './counts.ts';
 import { addDays, dueBucket, todayISO, type DueBucket } from './due.ts';
+import { idsExist, parseIdList, replaceTaskGoals, replaceTaskProjects, taskLinkMap } from './links.ts';
 import { publishTaskChange } from './notify.ts';
+import { spawnNextOccurrence } from './recurrence.ts';
+import { withGoalAchievements } from './rollup.ts';
 
 const STATUSES = ['todo', 'in_progress', 'blocked', 'done', 'cancelled'] as const;
 const PRIORITIES = ['low', 'medium', 'high'] as const;
@@ -78,6 +81,16 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
       where.push('t.world_id = ?');
       args.push(world);
     }
+    const goal = typeof req.query.goal === 'string' ? req.query.goal : '';
+    const project = typeof req.query.project === 'string' ? req.query.project : '';
+    if (goal) {
+      where.push('EXISTS (SELECT 1 FROM task_goals tg WHERE tg.task_id = t.id AND tg.goal_id = ?)');
+      args.push(goal);
+    }
+    if (project) {
+      where.push('EXISTS (SELECT 1 FROM task_projects tp WHERE tp.task_id = t.id AND tp.project_id = ?)');
+      args.push(project);
+    }
 
     const sql = `
       SELECT t.*, au.name AS assignee_name, cu.name AS created_by_name
@@ -88,11 +101,12 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
       ORDER BY t.created_at DESC`;
     const rows = db.prepare(sql).all(...args) as TaskRow[];
     const comments = commentsByTask(db, rows.map((row) => row.id));
+    const links = taskLinkMap(db, rows.map((row) => row.id));
     const people = db.prepare(
       'SELECT id, name FROM users WHERE active = 1 ORDER BY name COLLATE NOCASE',
     ).all() as { id: string; name: string }[];
     return res.json({
-      tasks: rows.map((row) => mapTask(row, comments.get(row.id) || [], today)),
+      tasks: rows.map((row) => mapTask(row, comments.get(row.id) || [], today, links.get(row.id))),
       people,
     });
   }));
@@ -156,13 +170,20 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     }
     const parsed = parseTaskBody(db, req.body, true);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
-    const id = insertTask(db, { ...parsed, createdById: user.id, source: 'form' });
+    const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
+    const id = withGoalAchievements(db, actor, () => {
+      const created = insertTask(db, { ...parsed, createdById: user.id, source: 'form' });
+      if (parsed.goalIds) replaceTaskGoals(db, created, parsed.goalIds);
+      if (parsed.projectIds) replaceTaskProjects(db, created, parsed.projectIds);
+      if ((parsed.status || 'todo') === 'done') spawnNextOccurrence(db, created, Date.now());
+      return created;
+    });
     audit(db, {
       actorId: user.id,
       action: 'task.create',
       entity: 'task',
       entityId: id,
-      ip: (req.ip || '').slice(0, 64),
+      ip: actor.ip,
       detail: { source: 'form' },
     });
     publishTaskChange(io, db, id);
@@ -176,48 +197,60 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     if (!existing) return res.status(404).json({ error: 'not found' });
     const parsed = parseTaskPatch(db, req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
-    const now = Date.now();
-    const nextStatus = (parsed.status ?? existing.status) as Status;
-    const completed = completionFields(nextStatus, existing.status, user.id, now, existing);
-    db.prepare(
-      `UPDATE tasks SET
-         title = ?, description = ?, kind = ?, status = ?, priority = ?, due_date = ?,
-         assignee_id = ?, recurrence = ?, world_id = ?, aim_x = ?, aim_y = ?, criteria = ?,
-         completed_at = ?, completed_by = ?, updated_at = ?
-       WHERE id = ?`,
-    ).run(
-      parsed.title ?? existing.title,
-      parsed.description ?? existing.description,
-      parsed.kind ?? existing.kind,
-      nextStatus,
-      parsed.priority ?? existing.priority,
-      parsed.dueDate !== undefined ? parsed.dueDate : existing.due_date,
-      parsed.assigneeId !== undefined ? parsed.assigneeId : existing.assignee_id,
-      parsed.recurrence ?? existing.recurrence,
-      parsed.worldId !== undefined ? parsed.worldId : existing.world_id,
-      parsed.aimX !== undefined ? parsed.aimX : existing.aim_x,
-      parsed.aimY !== undefined ? parsed.aimY : existing.aim_y,
-      parsed.criteria !== undefined ? parsed.criteria : existing.criteria,
-      completed.completed_at,
-      completed.completed_by,
-      now,
-      existing.id,
-    );
+    const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
+    const spawnedTaskId = withGoalAchievements(db, actor, () => {
+      const now = Date.now();
+      const nextStatus = (parsed.status ?? existing.status) as Status;
+      const completed = completionFields(nextStatus, existing.status, user.id, now, existing);
+      const leavingDone = nextStatus !== 'done' ? 1 : 0;
+      db.prepare(
+        `UPDATE tasks SET
+           title = ?, description = ?, kind = ?, status = ?, priority = ?, due_date = ?,
+           assignee_id = ?, recurrence = ?, world_id = ?, aim_x = ?, aim_y = ?, criteria = ?,
+           completed_at = ?, completed_by = ?,
+           archived_at = CASE WHEN ? = 1 THEN NULL ELSE archived_at END,
+           updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        parsed.title ?? existing.title,
+        parsed.description ?? existing.description,
+        parsed.kind ?? existing.kind,
+        nextStatus,
+        parsed.priority ?? existing.priority,
+        parsed.dueDate !== undefined ? parsed.dueDate : existing.due_date,
+        parsed.assigneeId !== undefined ? parsed.assigneeId : existing.assignee_id,
+        parsed.recurrence ?? existing.recurrence,
+        parsed.worldId !== undefined ? parsed.worldId : existing.world_id,
+        parsed.aimX !== undefined ? parsed.aimX : existing.aim_x,
+        parsed.aimY !== undefined ? parsed.aimY : existing.aim_y,
+        parsed.criteria !== undefined ? parsed.criteria : existing.criteria,
+        completed.completed_at,
+        completed.completed_by,
+        leavingDone,
+        now,
+        existing.id,
+      );
+      if (parsed.goalIds) replaceTaskGoals(db, existing.id, parsed.goalIds);
+      if (parsed.projectIds) replaceTaskProjects(db, existing.id, parsed.projectIds);
+      if (nextStatus === 'done' && existing.status !== 'done') return spawnNextOccurrence(db, existing.id, now);
+      return null;
+    });
     audit(db, {
       actorId: user.id,
       action: 'task.update',
       entity: 'task',
       entityId: existing.id,
-      ip: (req.ip || '').slice(0, 64),
+      ip: actor.ip,
     });
     publishTaskChange(io, db, existing.id);
-    return res.json({ task: loadTask(db, existing.id) });
+    return res.json({ task: loadTask(db, existing.id), spawnedTaskId });
   }));
 
   app.delete('/api/tasks/:id', asyncRoute(async (req, res) => {
     const user = requirePerm(req, res, 'tasks.edit');
     if (!user) return;
-    const info = db.prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id);
+    const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
+    const info = withGoalAchievements(db, actor, () => db.prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id));
     if (!info.changes) return res.status(404).json({ error: 'not found' });
     audit(db, {
       actorId: user.id,
@@ -239,21 +272,31 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     }
     const existing = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id) as TaskRow | undefined;
     if (!existing) return res.status(404).json({ error: 'not found' });
-    const now = Date.now();
-    const completed = completionFields(status, existing.status, user.id, now, existing);
-    db.prepare(
-      `UPDATE tasks SET status = ?, completed_at = ?, completed_by = ?, updated_at = ? WHERE id = ?`,
-    ).run(status, completed.completed_at, completed.completed_by, now, existing.id);
+    const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
+    const spawnedTaskId = withGoalAchievements(db, actor, () => {
+      const now = Date.now();
+      const completed = completionFields(status, existing.status, user.id, now, existing);
+      const leavingDone = status !== 'done' ? 1 : 0;
+      db.prepare(
+        `UPDATE tasks SET status = ?, completed_at = ?, completed_by = ?,
+           archived_at = CASE WHEN ? = 1 THEN NULL ELSE archived_at END,
+           updated_at = ?
+         WHERE id = ?`,
+      ).run(status, completed.completed_at, completed.completed_by, leavingDone, now, existing.id);
+      if (status === 'done' && existing.status !== 'done') return spawnNextOccurrence(db, existing.id, now);
+      return null;
+    });
     audit(db, {
       actorId: user.id,
       action: 'task.status',
       entity: 'task',
       entityId: existing.id,
-      ip: (req.ip || '').slice(0, 64),
+      ip: actor.ip,
       detail: { status, previous: existing.status },
     });
     publishTaskChange(io, db, existing.id);
-    return res.json({ task: loadTask(db, existing.id) });
+    if (spawnedTaskId) publishTaskChange(io, db, spawnedTaskId);
+    return res.json({ task: loadTask(db, existing.id), spawnedTaskId });
   }));
 
   app.post('/api/tasks/:id/comments', asyncRoute(async (req, res) => {
@@ -394,6 +437,8 @@ type TaskWrite = {
   aimY: number | null;
   criteria?: string | null;
   status?: Status;
+  goalIds?: string[];
+  projectIds?: string[];
 };
 
 function insertTask(db: Database, task: TaskWrite): string {
@@ -457,6 +502,8 @@ function parseTaskBody(db: Database, body: any, creating: boolean): TaskWrite | 
   if (aimX === undefined || aimY === undefined) return { error: 'invalid aim' };
   const criteria = cleanCriteria(body?.criteria);
   if (criteria === undefined) return { error: 'criteria must be JSON' };
+  const links = readLinkFields(db, body);
+  if ('error' in links) return links;
   void creating;
   return {
     title,
@@ -473,6 +520,7 @@ function parseTaskBody(db: Database, body: any, creating: boolean): TaskWrite | 
     aimY,
     criteria,
     status,
+    ...links,
   };
 }
 
@@ -489,6 +537,8 @@ type TaskPatch = {
   aimX?: number | null;
   aimY?: number | null;
   criteria?: string | null;
+  goalIds?: string[];
+  projectIds?: string[];
 };
 
 function parseTaskPatch(db: Database, body: any): TaskPatch | { error: string } {
@@ -550,7 +600,9 @@ function parseTaskPatch(db: Database, body: any): TaskPatch | { error: string } 
     if (criteria === undefined) return { error: 'criteria must be JSON' };
     patch.criteria = criteria;
   }
-  return patch;
+  const links = readLinkFields(db, body);
+  if ('error' in links) return links;
+  return { ...patch, ...links };
 }
 
 function finiteInt(raw: unknown): number | null | undefined {
@@ -653,7 +705,24 @@ function commentsByTask(db: Database, ids: string[]): Map<string, CommentJson[]>
   return map;
 }
 
-function mapTask(row: TaskRow, comments: CommentJson[], today: string) {
+function readLinkFields(db: Database, body: any): { goalIds?: string[]; projectIds?: string[] } | { error: string } {
+  const out: { goalIds?: string[]; projectIds?: string[] } = {};
+  if (body && Object.prototype.hasOwnProperty.call(body, 'goalIds')) {
+    const parsed = parseIdList(body.goalIds);
+    if (parsed.ok === false) return { error: parsed.error };
+    if (!idsExist(db, 'goals', parsed.ids)) return { error: 'invalid links' };
+    out.goalIds = parsed.ids;
+  }
+  if (body && Object.prototype.hasOwnProperty.call(body, 'projectIds')) {
+    const parsed = parseIdList(body.projectIds);
+    if (parsed.ok === false) return { error: parsed.error };
+    if (!idsExist(db, 'projects', parsed.ids)) return { error: 'invalid links' };
+    out.projectIds = parsed.ids;
+  }
+  return out;
+}
+
+function mapTask(row: TaskRow, comments: CommentJson[], today: string, links?: { goalIds: string[]; projectIds: string[] }) {
   const bucket: DueBucket = dueBucket(row.due_date, row.status, row.archived_at, today);
   return {
     id: row.id,
@@ -681,6 +750,8 @@ function mapTask(row: TaskRow, comments: CommentJson[], today: string) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     comments,
+    goalIds: links?.goalIds || [],
+    projectIds: links?.projectIds || [],
   };
 }
 
@@ -694,7 +765,7 @@ function loadTask(db: Database, id: string) {
      WHERE t.id = ?`,
   ).get(id) as TaskRow;
   const comments = commentsByTask(db, [id]).get(id) || [];
-  return mapTask(row, comments, today);
+  return mapTask(row, comments, today, taskLinkMap(db, [id]).get(id));
 }
 
 function parseJson(raw: string | null): unknown {

@@ -27,9 +27,42 @@ export type TaskItem = {
   aimY: number | null;
   criteria: unknown;
   completedAt: number | null;
+  archivedAt: number | null;
   createdAt: number;
   updatedAt: number;
   comments: TaskComment[];
+  goalIds: string[];
+  projectIds: string[];
+};
+
+export type GoalItem = {
+  id: string;
+  title: string;
+  description: string;
+  status: 'active' | 'achieved' | 'paused' | 'cancelled';
+  ownerId: string | null;
+  dueDate: string | null;
+  progressMode: 'auto' | 'manual';
+  targetAmount: number | null;
+  currentAmount: number | null;
+  unit: string | null;
+  icon: string | null;
+  progress: number | null;
+  projectIds: string[];
+  taskIds: string[];
+};
+
+export type ProjectItem = {
+  id: string;
+  name: string;
+  description: string;
+  status: 'draft' | 'active' | 'on_hold' | 'completed' | 'cancelled';
+  ownerId: string | null;
+  startDate: string | null;
+  endDate: string | null;
+  progress: number | null;
+  taskIds: string[];
+  goalIds: string[];
 };
 
 export type PersonOption = { id: string; name: string };

@@ -2,7 +2,8 @@ import type { Database } from 'better-sqlite3';
 
 /**
  * Ordered schema migrations. Worlds, layouts, and simulations stay in server.ts.
- * Goals and projects are migration 2+ (Phase 2); permission keys already exist.
+ * Version 2 adds goals and projects. It only creates tables, so an existing
+ * Phase 1 database keeps its users, sessions, tasks, and audit rows.
  */
 const MIGRATIONS: { version: number; sql: string }[] = [
   {
@@ -84,6 +85,58 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         ip TEXT
       );
       CREATE INDEX idx_audit_at ON audit_log(at);
+    `,
+  },
+  {
+    version: 2,
+    sql: `
+      CREATE TABLE goals (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','achieved','paused','cancelled')),
+        owner_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        due_date TEXT,
+        progress_mode TEXT NOT NULL DEFAULT 'auto' CHECK (progress_mode IN ('auto','manual')),
+        target_amount REAL,
+        current_amount REAL,
+        unit TEXT,
+        icon TEXT,
+        created_by_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft','active','on_hold','completed','cancelled')),
+        owner_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        start_date TEXT,
+        end_date TEXT,
+        created_by_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE task_goals (
+        task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        goal_id TEXT REFERENCES goals(id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, goal_id)
+      );
+
+      CREATE TABLE task_projects (
+        task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, project_id)
+      );
+
+      CREATE TABLE project_goals (
+        project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+        goal_id TEXT REFERENCES goals(id) ON DELETE CASCADE,
+        PRIMARY KEY (project_id, goal_id)
+      );
     `,
   },
 ];
