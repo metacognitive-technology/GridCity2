@@ -74,6 +74,7 @@ import {
   ShipWheel,
   Clock,
   CircleHelp,
+  ListChecks,
 } from 'lucide-react';
 import {
   BotPanel,
@@ -238,6 +239,13 @@ import {
   snapTowedVehicle,
 } from './tow';
 import socket from './socket';
+import { useAuth } from './components/auth/AuthProvider';
+import { AccountChip } from './components/auth/AccountChip';
+import { AdminUsersPanel } from './components/auth/AdminUsersPanel';
+import { LobbyAuthLink } from './components/auth/LobbyAuthLink';
+import { QuickTaskButton, QuickTaskProvider } from './components/tasks/QuickTask';
+import { TasksPanel } from './components/tasks/TasksPanel';
+import { OverdueBadge } from './components/tasks/OverdueBadge';
 
 const GRID_SIZE = 64;
 /** Retry delayed grid edits after server rejects due to another user's cell lock. */
@@ -284,10 +292,12 @@ function openRightDockWidthPx(flags: {
   train: boolean;
   service: boolean;
   bot: boolean;
+  tasks: boolean;
+  users: boolean;
 }): number {
   return Math.max(
     flags.people ? RIGHT_DOCK_WIDTH_PX.people : 0,
-    flags.logistics || flags.bot ? RIGHT_DOCK_WIDTH_PX.wide : 0,
+    flags.logistics || flags.bot || flags.tasks || flags.users ? RIGHT_DOCK_WIDTH_PX.wide : 0,
     flags.semi || flags.train || flags.service ? RIGHT_DOCK_WIDTH_PX.wide : 0,
     flags.plant || flags.traffic || flags.cars ? RIGHT_DOCK_WIDTH_PX.narrow : 0,
   );
@@ -9223,6 +9233,9 @@ export default function App() {
   const [burnUiTick, setBurnUiTick] = useState(0);
   const [showPeoplePanel, setShowPeoplePanel] = useState(false);
   const [showBotPanel, setShowBotPanel] = useState(false);
+  const [showTasksPanel, setShowTasksPanel] = useState(false);
+  const [showAdminUsers, setShowAdminUsers] = useState(false);
+  const auth = useAuth();
   const [botPickMode, setBotPickMode] = useState<BotPickMode>(null);
   const [botPickAsk, setBotPickAsk] = useState<BotAsk | null>(null);
   const botPickResultRef = useRef<((result: BotPickResult) => void) | null>(null);
@@ -9497,7 +9510,9 @@ export default function App() {
   // Sync library from backend
   useEffect(() => {
     if (!roomCode) {
-      socket.emit('join-room', 'lobby');
+      const joinLobby = () => socket.emit('join-room', 'lobby');
+      joinLobby();
+      socket.on('connect', joinLobby);
       
       const handleAvailableRooms = (rooms: any[]) => {
         setAvailableRooms(rooms);
@@ -9505,6 +9520,7 @@ export default function App() {
       
       socket.on('available-rooms', handleAvailableRooms);
       return () => {
+        socket.off('connect', joinLobby);
         socket.emit('leave-room', 'lobby');
         socket.off('available-rooms', handleAvailableRooms);
       };
@@ -9582,7 +9598,9 @@ export default function App() {
     resetTrafficState();
     bufferedKeysRef.current.clear();
     updateBufferedState();
-    socket.emit('join-room', roomCode);
+    const joinThisRoom = () => socket.emit('join-room', roomCode);
+    joinThisRoom();
+    socket.on('connect', joinThisRoom);
 
     const handleWorldState = (data: any) => {
       if (data.roomCode && data.roomCode !== roomCodeRef.current) return;
@@ -9843,6 +9861,7 @@ export default function App() {
     socket.on('room-sim-role', handleRoomSimRole);
 
     return () => {
+      socket.off('connect', joinThisRoom);
       socket.emit('leave-room', roomCode);
       isSimLeaderRef.current = false;
       setIsSimLeader(false);
@@ -14674,6 +14693,8 @@ export default function App() {
     train: showTrainPanel,
     service: showServicePanel,
     bot: showBotPanel,
+    tasks: showTasksPanel,
+    users: showAdminUsers,
   });
   const overviewRightOffsetPx =
     (rightDockWidthPx > 0 ? rightDockWidthPx : rightMenuClearancePx) + RIGHT_HUD_GAP_PX;
@@ -15561,6 +15582,7 @@ export default function App() {
   };
 
   return (
+    <QuickTaskProvider roomCode={roomCode} getContext={getBotContext}>
     <div className="flex h-screen w-full bg-slate-50 overflow-hidden font-sans text-slate-900 select-none">
       <AnimatePresence>
         {!roomCode && (
@@ -15599,6 +15621,7 @@ export default function App() {
                   <CircleHelp className="w-6 h-6" />
                 </a>
               </div>
+              <LobbyAuthLink />
               <p className="text-slate-500 mb-10 text-lg leading-relaxed">
                 Design cities together in real-time. Create a new room or join an existing one.
               </p>
@@ -15719,6 +15742,15 @@ export default function App() {
               >
                 <CircleHelp className="w-5 h-5" />
               </a>
+              <AccountChip
+                onOpenUsers={() => {
+                  setShowAdminUsers(true);
+                  setShowTasksPanel(false);
+                  setShowBotPanel(false);
+                  setBotPickMode(null);
+                  setBotPickAsk(null);
+                }}
+              />
             </div>
             <button
               type="button"
@@ -15729,6 +15761,8 @@ export default function App() {
               <PanelLeftClose className="w-5 h-5" />
             </button>
           </div>
+
+          <QuickTaskButton variant="pill" />
 
           {roomCode && (
             <div
@@ -16038,19 +16072,22 @@ export default function App() {
         onClick={handleGridClick}
       >
         {!showSidebar && (
-          <button
-            type="button"
-            className="absolute top-4 left-4 z-[60] p-3 bg-white rounded-xl shadow-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors"
-            title="Show tile palette"
-            data-grid-control
-            {...blockGridPointerEvents}
-            onClick={(e) => {
-              stopGridPropagation(e);
-              setShowSidebar(true);
-            }}
-          >
-            <PanelLeftOpen className="w-5 h-5" />
-          </button>
+          <>
+            <button
+              type="button"
+              className="absolute top-4 left-4 z-[60] p-3 bg-white rounded-xl shadow-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors"
+              title="Show tile palette"
+              data-grid-control
+              {...blockGridPointerEvents}
+              onClick={(e) => {
+                stopGridPropagation(e);
+                setShowSidebar(true);
+              }}
+            >
+              <PanelLeftOpen className="w-5 h-5" />
+            </button>
+            <QuickTaskButton variant="compact" />
+          </>
         )}
 
         {/* City system clock (HH:MM:SS AM/PM) — drives people schedules */}
@@ -16806,10 +16843,32 @@ export default function App() {
               <Sprout className="w-5 h-5 mx-auto" />
             </button>
 
+            {auth.can('tasks.view') && (
+              <button
+                type="button"
+                data-testid="tasks-panel-toggle"
+                title="Tasks"
+                onClick={() => {
+                  setShowTasksPanel(v => !v);
+                  setShowBotPanel(false);
+                  setShowAdminUsers(false);
+                  setBotPickMode(null);
+                  setBotPickAsk(null);
+                }}
+                className={`relative p-3 rounded-xl transition-colors ${showTasksPanel ? 'text-blue-600 bg-blue-50' : 'text-slate-400 hover:bg-slate-50'}`}
+              >
+                <ListChecks className="w-5 h-5 mx-auto" />
+                <OverdueBadge counts={auth.counts} testId="tasks-overdue-badge" />
+              </button>
+            )}
             <button
               type="button"
               data-testid="bot-panel-toggle"
-              onClick={() => setShowBotPanel(v => !v)}
+              onClick={() => {
+                setShowBotPanel(v => !v);
+                setShowTasksPanel(false);
+                setShowAdminUsers(false);
+              }}
               className={`p-3 rounded-xl transition-colors ${showBotPanel ? 'text-sky-600 bg-sky-50' : 'text-slate-400 hover:bg-slate-50'}`}
               title="GrokBot"
             >
@@ -16855,6 +16914,12 @@ export default function App() {
           }}
           pickResultRef={botPickResultRef}
         />
+        {showTasksPanel && (
+          <TasksPanel open onClose={() => setShowTasksPanel(false)} />
+        )}
+        {showAdminUsers && (
+          <AdminUsersPanel open onClose={() => setShowAdminUsers(false)} />
+        )}
 
         {/* Logistics & Economy Panel (new) */}
         <AnimatePresence>
@@ -19585,5 +19650,6 @@ export default function App() {
         </AnimatePresence>
       </div>
     </div>
+    </QuickTaskProvider>
   );
 }

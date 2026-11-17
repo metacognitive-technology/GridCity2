@@ -54,6 +54,18 @@ docker ps
 
 All features work out of the box for anonymous users in collaborative rooms. No Google Sign-In or social logins are used.
 
+## Accounts
+
+GridCity has no self-signup and no social login. An admin creates each account under Admin > Users. Anonymous visitors can still create rooms, join rooms, and edit the grid.
+
+On boot, if the users table is empty and both `GRIDCITY_ADMIN_EMAIL` and `GRIDCITY_ADMIN_INITIAL_PASSWORD` are set, the server creates one admin. `GRIDCITY_ADMIN_PASSWORD` is an alias for the initial password. `GRIDCITY_ADMIN_NAME` defaults to Admin. `GRIDCITY_ADMIN_FORCE_CHANGE=0` leaves that account free to keep the initial password; any other value requires a new password at first login. A later restart does not create another admin and does not reset the password. The password is never written to the log. If the email or password is missing, startup continues with a warning and no admin account.
+
+Sessions live in SQLite. The browser stores only the raw token in an HttpOnly cookie named `gc_session` (SameSite=Lax, Path=/, 30-day sliding expiry). The cookie is marked Secure only when the request is HTTPS (`trust proxy` is on, so `X-Forwarded-Proto: https` counts).
+
+**HTTPS and the direct port.** A sign-in on `https://grid.metacognitive-bot.tech` sets a Secure cookie. Browsers will not send that cookie to `http://host:3001`. Sign in on the same origin you are using. Plain `http://host:3001` (and local dev) sets a non-Secure cookie that works on that HTTP origin.
+
+State-changing `/api/*` calls send `X-GridCity: 1`. Pass the deploy variables in `.env.example` through the host environment; `docker-compose.yml` forwards the names with empty defaults.
+
 ## Tests (Playwright)
 
 Browser and API smoke tests live in `e2e/`. First-time setup:

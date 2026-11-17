@@ -1,5 +1,5 @@
 /** App display version. Bumped by 0.1 after each production Vite build. */
-export const APP_VERSION = '1.21';
+export const APP_VERSION = '1.22';
 
 /** `1.0` → `v1`, `1.1` → `v1.1`, `1.10` → `v1.10` */
 export function formatAppVersion(version: string = APP_VERSION): string {
