@@ -5,13 +5,28 @@ import { Server, Socket } from 'socket.io';
 import path from 'path';
 import fs from 'fs';
 import Database from 'better-sqlite3';
+import { migrate } from './server/db/migrations.ts';
+import { installGuards, gcUser } from './server/auth/guards.ts';
+import { registerAuthRoutes } from './server/auth/routes.ts';
+import { seedAdmin } from './server/auth/seed.ts';
+import { bearerOk } from './server/auth/bearer.ts';
+import { effectivePerms, permsInclude } from './server/auth/permissions.ts';
+import { userFromCookieHeader } from './server/auth/sessions.ts';
+import { registerTaskRoutes } from './server/tasks/routes.ts';
+import { taskCounts } from './server/tasks/counts.ts';
 
 const app = express();
+app.set('trust proxy', 1);
 const httpServer = createServer(app);
+const socketOrigins = (process.env.GRIDCITY_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 const io = new Server(httpServer, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
+    origin: socketOrigins.length > 0 ? socketOrigins : true,
+    methods: ["GET", "POST"],
+    credentials: true,
   },
   transports: ['websocket', 'polling'], // WebSocket first, with polling fallback for proxies
   allowEIO3: true,
@@ -24,8 +39,11 @@ const DB_PATH =
   process.env.GRIDCITY_DB ||
   (process.env.NODE_ENV === 'production' ? '/app/data/gridcity.db' : './gridcity.db');
 
-// Ensure data directory exists if needed
+fs.mkdirSync(path.dirname(path.resolve(DB_PATH)), { recursive: true });
 const db = new Database(DB_PATH);
+db.pragma('foreign_keys = ON');
+migrate(db);
+seedAdmin(db);
 
 // Initialize Database Schema
 db.exec(`
@@ -64,7 +82,8 @@ try {
   // column already exists
 }
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+installGuards(app, db);
 
 // API Routes
 app.get('/api/health', (req, res) => {
@@ -75,6 +94,9 @@ app.get('/api/health', (req, res) => {
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', service: 'gridcity' });
 });
+
+registerAuthRoutes(app, { db, io });
+registerTaskRoutes(app, { db, io });
 
 // One sim leader per room runs vehicle/economy/traffic ticks; others receive broadcasts.
 const roomSimLeaders = new Map<string, string>();
@@ -139,9 +161,34 @@ function ensureRoomSimLeader(roomCode: string, preferredSocketId?: string) {
   }
 }
 
+io.use((socket, next) => {
+  try {
+    const sessionUser = userFromCookieHeader(db, socket.handshake.headers.cookie);
+    socket.data.user = sessionUser
+      ? { id: sessionUser.id, role: sessionUser.role, perms: effectivePerms(sessionUser) }
+      : null;
+  } catch {
+    socket.data.user = null;
+  }
+  next();
+});
+
+function socketCanDelete(socket: Socket): boolean {
+  const perms = (socket.data.user as { perms?: string[] } | null)?.perms;
+  return permsInclude(perms, 'world.delete');
+}
+
 // Socket.io Real-time Logic
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id} (transport: ${socket.conn.transport.name})`);
+  const socketUser = socket.data.user as { id: string; role: string; perms: string[] } | null;
+  if (socketUser) {
+    socket.join(`user:${socketUser.id}`);
+    if (socketUser.role === 'admin') {
+      socket.join('role:admin');
+      socket.emit('task-counts', taskCounts(db));
+    }
+  }
 
   socket.on('leave-room', (roomCode) => {
     const wasLeader = roomSimLeaders.get(roomCode) === socket.id;
@@ -280,18 +327,30 @@ io.on('connection', (socket) => {
   });
 
   socket.on('delete-layout', (id) => {
+    if (!socketCanDelete(socket)) {
+      socket.emit('action-denied', { event: 'delete-layout' });
+      return;
+    }
     db.prepare('DELETE FROM layouts WHERE id = ?').run(id);
     const allLayouts = db.prepare('SELECT id, name, data FROM layouts').all();
     io.emit('layouts-updated', allLayouts.map((l: any) => ({ ...l, data: JSON.parse(l.data) })));
   });
 
   socket.on('delete-simulation', (id) => {
+    if (!socketCanDelete(socket)) {
+      socket.emit('action-denied', { event: 'delete-simulation' });
+      return;
+    }
     db.prepare('DELETE FROM simulations WHERE id = ?').run(id);
     const allSims = db.prepare('SELECT id, name, data FROM simulations').all();
     io.emit('simulations-updated', allSims.map((s: any) => ({ ...s, data: JSON.parse(s.data) })));
   });
 
   socket.on('delete-room', (roomCode) => {
+    if (!socketCanDelete(socket)) {
+      socket.emit('action-denied', { event: 'delete-room' });
+      return;
+    }
     db.prepare('DELETE FROM worlds WHERE id = ?').run(roomCode);
     const rooms = db.prepare('SELECT id, updatedAt FROM worlds ORDER BY updatedAt DESC').all();
     io.emit('available-rooms', rooms);
@@ -396,6 +455,11 @@ function emitEscalation(rec: EscalationRecord) {
 // In-game GrokBot text chat (xAI). Key via process.env.XAI_API_KEY only.
 // Returns { reply, actions?, ask? } — client executes actions / handles ask+pick.
 app.post('/api/bot/chat', async (req, res) => {
+  const botUser = gcUser(req);
+  if (!botUser) return res.status(401).json({ error: 'unauthorized' });
+  if (!permsInclude(effectivePerms(botUser), 'bot.use')) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
   const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
   if (!message) {
     return res.status(400).json({ error: 'message required' });
@@ -607,6 +671,9 @@ app.get('/api/bot/escalate/:id', (req, res) => {
 });
 
 app.post('/api/bot/escalate/:id/reply', (req, res) => {
+  const injectUser = gcUser(req);
+  const adminOk = !!injectUser && injectUser.role === 'admin' && !injectUser.mustChangePassword;
+  if (!adminOk && !bearerOk(req)) return res.status(401).json({ error: 'unauthorized' });
   const rec = escalations.get(req.params.id);
   if (!rec) return res.status(404).json({ error: 'not found' });
   if (typeof req.body?.reply === 'string') rec.reply = req.body.reply;

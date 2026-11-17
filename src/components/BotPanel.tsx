@@ -4,6 +4,7 @@ import { Bot, MapPin, X } from 'lucide-react';
 import type { BotAction, BotAsk, BotPoint } from '../botActions';
 import { injectOrigin, parseBotAsk } from '../botActions';
 import socket from '../socket';
+import { api } from '../api';
 
 export type BotChatRole = 'user' | 'assistant';
 
@@ -191,9 +192,8 @@ export function BotPanel({
       const context = getContext();
       const escalate =
         askGridBot || /ask gridbot|hand off to gridbot|escalate/i.test(message);
-      const res = await fetch('/api/bot/chat', {
+      const res = await api('/api/bot/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message,
           history,
@@ -202,6 +202,10 @@ export function BotPanel({
           escalate,
         }),
       });
+      if (res.status === 401) {
+        setError('Log in to use GridBot');
+        return;
+      }
       const data = (await res.json().catch(() => null)) as {
         reply?: unknown;
         actions?: unknown;
@@ -293,7 +297,7 @@ export function BotPanel({
               setError('GridBot escalation timed out');
               return;
             }
-            void fetch(`/api/bot/escalate/${escalateId}`)
+            void api(`/api/bot/escalate/${escalateId}`)
               .then(r => r.json())
               .then(body => apply(body))
               .catch(() => undefined);
