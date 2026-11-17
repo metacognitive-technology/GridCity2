@@ -3,6 +3,8 @@ import { X } from 'lucide-react';
 import { api } from '../../api';
 import { useAuth } from '../auth/AuthProvider';
 import { blockGridPointerEvents } from '../dockEvents';
+import { GoalsTab } from './GoalsTab';
+import { ProjectsTab } from './ProjectsTab';
 import { useQuickTask } from './QuickTask';
 import { TaskDialog } from './TaskDialog';
 import { sortMyTasks, type PersonOption, type TaskItem } from './types';
@@ -21,7 +23,7 @@ function dueChip(task: TaskItem): { label: string; className: string } {
 export function TasksPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const auth = useAuth();
   const quick = useQuickTask();
-  const [tab, setTab] = useState<'mine' | 'all'>('mine');
+  const [tab, setTab] = useState<'mine' | 'all' | 'goals' | 'projects'>('mine');
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [people, setPeople] = useState<PersonOption[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -57,7 +59,7 @@ export function TasksPanel({ open, onClose }: { open: boolean; onClose: () => vo
   };
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || tab === 'goals' || tab === 'projects') return;
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, tab, status, assignee, kind, due, auth.tasksEpoch]);
@@ -111,8 +113,24 @@ export function TasksPanel({ open, onClose }: { open: boolean; onClose: () => vo
       <div className="flex border-b text-xs font-bold">
         <button type="button" data-testid="tasks-tab-mine" className={`flex-1 py-2 ${tab === 'mine' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400'}`} onClick={() => setTab('mine')}>My Tasks</button>
         <button type="button" data-testid="tasks-tab-all" className={`flex-1 py-2 ${tab === 'all' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400'}`} onClick={() => setTab('all')}>All</button>
-        <button type="button" data-testid="tasks-tab-goals" disabled title="Available in a later update" className="flex-1 py-2 text-slate-300 cursor-not-allowed">Goals</button>
-        <button type="button" data-testid="tasks-tab-projects" disabled title="Available in a later update" className="flex-1 py-2 text-slate-300 cursor-not-allowed">Projects</button>
+        <button
+          type="button"
+          data-testid="goals-tab"
+          disabled={!auth.can('goals.view')}
+          className={`flex-1 py-2 ${tab === 'goals' ? 'text-blue-600 border-b-2 border-blue-600' : auth.can('goals.view') ? 'text-slate-400' : 'text-slate-300 cursor-not-allowed'}`}
+          onClick={() => { if (auth.can('goals.view')) setTab('goals'); }}
+        >
+          Goals
+        </button>
+        <button
+          type="button"
+          data-testid="projects-tab"
+          disabled={!auth.can('goals.view')}
+          className={`flex-1 py-2 ${tab === 'projects' ? 'text-blue-600 border-b-2 border-blue-600' : auth.can('goals.view') ? 'text-slate-400' : 'text-slate-300 cursor-not-allowed'}`}
+          onClick={() => { if (auth.can('goals.view')) setTab('projects'); }}
+        >
+          Projects
+        </button>
       </div>
       {tab === 'all' && (
         <div className="p-3 border-b space-y-2">
@@ -158,9 +176,11 @@ export function TasksPanel({ open, onClose }: { open: boolean; onClose: () => vo
         </div>
       )}
       <div className="flex-1 overflow-y-auto p-3 space-y-2">
-        {error && <p className="text-xs text-red-600">{error}</p>}
-        {shown.length === 0 && !error && <p className="text-xs text-slate-400">No tasks.</p>}
-        {shown.map((task) => {
+        {tab === 'goals' && <GoalsTab epoch={auth.tasksEpoch} onComplete={complete} />}
+        {tab === 'projects' && <ProjectsTab epoch={auth.tasksEpoch} onComplete={complete} />}
+        {(tab === 'mine' || tab === 'all') && error && <p className="text-xs text-red-600">{error}</p>}
+        {(tab === 'mine' || tab === 'all') && shown.length === 0 && !error && <p className="text-xs text-slate-400">No tasks.</p>}
+        {(tab === 'mine' || tab === 'all') && shown.map((task) => {
           const chip = dueChip(task);
           return (
             <div

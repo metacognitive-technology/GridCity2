@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { api } from '../../api';
 import { blockGridPointerEvents } from '../dockEvents';
-import type { PersonOption, TaskItem } from './types';
+import type { GoalItem, PersonOption, ProjectItem, TaskItem } from './types';
 
 type Draft = {
   title: string;
@@ -15,6 +15,8 @@ type Draft = {
   aimX: string;
   aimY: string;
   criteria: string;
+  goalIds: string[];
+  projectIds: string[];
 };
 
 const emptyDraft = (): Draft => ({
@@ -29,6 +31,8 @@ const emptyDraft = (): Draft => ({
   aimX: '',
   aimY: '',
   criteria: '',
+  goalIds: [],
+  projectIds: [],
 });
 
 function fromTask(task: TaskItem): Draft {
@@ -44,6 +48,8 @@ function fromTask(task: TaskItem): Draft {
     aimX: task.aimX == null ? '' : String(task.aimX),
     aimY: task.aimY == null ? '' : String(task.aimY),
     criteria: task.criteria == null ? '' : JSON.stringify(task.criteria, null, 2),
+    goalIds: task.goalIds ? [...task.goalIds] : [],
+    projectIds: task.projectIds ? [...task.projectIds] : [],
   };
 }
 
@@ -64,6 +70,9 @@ export function TaskDialog({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [comments, setComments] = useState(task?.comments || []);
+  const [goals, setGoals] = useState<GoalItem[]>([]);
+  const [projects, setProjects] = useState<ProjectItem[]>([]);
+  const [linksReady, setLinksReady] = useState(false);
 
   useEffect(() => {
     setDraft(task ? fromTask(task) : emptyDraft());
@@ -72,6 +81,28 @@ export function TaskDialog({
     setError(null);
     setComment('');
   }, [task]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadLinks = async () => {
+      const [goalRes, projectRes] = await Promise.all([api('/api/goals'), api('/api/projects')]);
+      if (cancelled) return;
+      if (!goalRes.ok || !projectRes.ok) {
+        setLinksReady(false);
+        return;
+      }
+      const goalData = await goalRes.json().catch(() => null);
+      const projectData = await projectRes.json().catch(() => null);
+      if (cancelled) return;
+      setGoals(Array.isArray(goalData?.goals) ? goalData.goals : []);
+      setProjects(Array.isArray(projectData?.projects) ? projectData.projects : []);
+      setLinksReady(true);
+    };
+    void loadLinks();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) => {
     setDraft((prev) => ({ ...prev, [key]: value }));
@@ -94,6 +125,10 @@ export function TaskDialog({
     else body.aimY = null;
     if (draft.criteria.trim()) body.criteria = draft.criteria;
     else body.criteria = null;
+    if (linksReady) {
+      body.goalIds = draft.goalIds;
+      body.projectIds = draft.projectIds;
+    }
     return body;
   };
 
@@ -249,7 +284,50 @@ export function TaskDialog({
               <option value="weekly">Weekly</option>
               <option value="monthly">Monthly</option>
             </select>
-            <p className="text-[11px] text-slate-400">Goals and projects are available in a later update.</p>
+            {linksReady && (
+              <>
+                <fieldset data-testid="task-goals">
+                  <legend className="text-xs font-bold text-slate-500">Goals</legend>
+                  <div className="max-h-28 overflow-y-auto space-y-1">
+                    {goals.length === 0 && <p className="text-[11px] text-slate-400">No goals yet.</p>}
+                    {goals.map((goal) => (
+                      <label key={goal.id} className="flex items-center gap-2 text-xs">
+                        <input
+                          type="checkbox"
+                          data-testid="task-goal-option"
+                          data-goal-id={goal.id}
+                          checked={draft.goalIds.includes(goal.id)}
+                          onChange={(e) => set('goalIds', e.target.checked
+                            ? (draft.goalIds.includes(goal.id) ? draft.goalIds : [...draft.goalIds, goal.id])
+                            : draft.goalIds.filter((id) => id !== goal.id))}
+                        />
+                        <span className="truncate">{goal.icon ? `${goal.icon} ` : ''}{goal.title}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+                <fieldset data-testid="task-projects">
+                  <legend className="text-xs font-bold text-slate-500">Projects</legend>
+                  <div className="max-h-28 overflow-y-auto space-y-1">
+                    {projects.length === 0 && <p className="text-[11px] text-slate-400">No projects yet.</p>}
+                    {projects.map((project) => (
+                      <label key={project.id} className="flex items-center gap-2 text-xs">
+                        <input
+                          type="checkbox"
+                          data-testid="task-project-option"
+                          data-project-id={project.id}
+                          checked={draft.projectIds.includes(project.id)}
+                          onChange={(e) => set('projectIds', e.target.checked
+                            ? (draft.projectIds.includes(project.id) ? draft.projectIds : [...draft.projectIds, project.id])
+                            : draft.projectIds.filter((id) => id !== project.id))}
+                        />
+                        <span className="truncate">{project.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              </>
+            )}
             {draft.kind === 'in_game' && (
               <>
                 <input

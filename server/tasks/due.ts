@@ -30,6 +30,25 @@ export function addDays(iso: string, days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
+/** Calendar months. Day 31 lands on the last day of a shorter month. */
+export function addMonths(iso: string, months: number): string {
+  const [year, month, day] = iso.split('-').map(Number);
+  if (!year || !month || !day) return iso;
+  const first = new Date(Date.UTC(year, month - 1 + months, 1));
+  const last = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
+  const clamped = Math.min(day, last);
+  return new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), clamped)).toISOString().slice(0, 10);
+}
+
+/** Next due date for a spawned occurrence. A blank due date stays blank. */
+export function advanceDueDate(iso: string | null, recurrence: string): string | null {
+  if (!iso) return null;
+  if (recurrence === 'daily') return addDays(iso, 1);
+  if (recurrence === 'weekly') return addDays(iso, 7);
+  if (recurrence === 'monthly') return addMonths(iso, 1);
+  return iso;
+}
+
 export type DueBucket = 'overdue' | 'today' | 'soon' | 'later' | 'none';
 
 /** Done, cancelled, and archived tasks are never overdue. Soon is 1–3 days ahead. */
