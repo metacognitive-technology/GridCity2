@@ -5,7 +5,7 @@ import { audit } from '../auth/audit.ts';
 import { asyncRoute, gcUser } from '../auth/guards.ts';
 import { can } from '../auth/permissions.ts';
 import type { SessionUser } from '../auth/sessions.ts';
-import { taskCounts } from './counts.ts';
+import { taskCounts, taskCountsForAssignee } from './counts.ts';
 import { addDays, dueBucket, todayISO, type DueBucket } from './due.ts';
 import { idsExist, parseIdList, replaceTaskGoals, replaceTaskProjects, taskLinkMap } from './links.ts';
 import { publishTaskChange } from './notify.ts';
@@ -33,7 +33,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
   app.get('/api/tasks/counts', asyncRoute(async (req, res) => {
     const user = requirePerm(req, res, 'tasks.view');
     if (!user) return;
-    return res.json(taskCounts(db));
+    return res.json(user.role === 'admin' ? taskCounts(db) : taskCountsForAssignee(db, user.id));
   }));
 
   app.get('/api/tasks', asyncRoute(async (req, res) => {
@@ -54,7 +54,10 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
       where.push('t.status = ?');
       args.push(status);
     }
-    if (assignee === 'me') {
+    if (user.role !== 'admin') {
+      where.push('t.assignee_id = ?');
+      args.push(user.id);
+    } else if (assignee === 'me') {
       where.push('t.assignee_id = ?');
       args.push(user.id);
     } else if (assignee === 'unassigned') {
@@ -104,9 +107,11 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     const rows = db.prepare(sql).all(...args) as TaskRow[];
     const comments = commentsByTask(db, rows.map((row) => row.id));
     const links = taskLinkMap(db, rows.map((row) => row.id));
-    const people = db.prepare(
-      'SELECT id, name FROM users WHERE active = 1 ORDER BY name COLLATE NOCASE',
-    ).all() as { id: string; name: string }[];
+    const people = user.role === 'admin'
+      ? db.prepare(
+        'SELECT id, name FROM users WHERE active = 1 ORDER BY name COLLATE NOCASE',
+      ).all() as { id: string; name: string }[]
+      : [{ id: user.id, name: user.name }];
     return res.json({
       tasks: rows.map((row) => mapTask(row, comments.get(row.id) || [], today, links.get(row.id))),
       people,
@@ -172,6 +177,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     }
     const parsed = parseTaskBody(db, req.body, true);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+    if (user.role !== 'admin' && !parsed.assigneeId) parsed.assigneeId = user.id;
     const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
     const id = withGoalAchievements(db, actor, () => {
       const created = insertTask(db, { ...parsed, createdById: user.id, source: parsed.source });
@@ -197,6 +203,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     if (!user) return;
     const existing = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id) as TaskRow | undefined;
     if (!existing) return res.status(404).json({ error: 'not found' });
+    if (!ownTask(user, existing)) return res.status(403).json({ error: 'forbidden' });
     const parsed = parseTaskPatch(db, req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
     const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
@@ -244,13 +251,18 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
       entityId: existing.id,
       ip: actor.ip,
     });
-    publishTaskChange(io, db, existing.id);
+    publishTaskChange(io, db, existing.id, existing.assignee_id);
     return res.json({ task: loadTask(db, existing.id), spawnedTaskId });
   }));
 
   app.delete('/api/tasks/:id', asyncRoute(async (req, res) => {
     const user = requirePerm(req, res, 'tasks.edit');
     if (!user) return;
+    const existing = db.prepare('SELECT id, assignee_id FROM tasks WHERE id = ?').get(req.params.id) as
+      | { id: string; assignee_id: string | null }
+      | undefined;
+    if (!existing) return res.status(404).json({ error: 'not found' });
+    if (!ownTask(user, existing)) return res.status(403).json({ error: 'forbidden' });
     const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
     const info = withGoalAchievements(db, actor, () => db.prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id));
     if (!info.changes) return res.status(404).json({ error: 'not found' });
@@ -261,7 +273,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
       entityId: req.params.id,
       ip: (req.ip || '').slice(0, 64),
     });
-    publishTaskChange(io, db, req.params.id);
+    publishTaskChange(io, db, req.params.id, existing.assignee_id);
     return res.json({ ok: true });
   }));
 
@@ -274,6 +286,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     }
     const existing = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id) as TaskRow | undefined;
     if (!existing) return res.status(404).json({ error: 'not found' });
+    if (!ownTask(user, existing)) return res.status(403).json({ error: 'forbidden' });
     const actor = { id: user.id, ip: (req.ip || '').slice(0, 64) };
     const spawnedTaskId = withGoalAchievements(db, actor, () => {
       const now = Date.now();
@@ -312,8 +325,11 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
   app.post('/api/tasks/:id/comments', asyncRoute(async (req, res) => {
     const user = requirePerm(req, res, 'tasks.edit');
     if (!user) return;
-    const task = db.prepare('SELECT id FROM tasks WHERE id = ?').get(req.params.id) as { id: string } | undefined;
+    const task = db.prepare('SELECT id, assignee_id FROM tasks WHERE id = ?').get(req.params.id) as
+      | { id: string; assignee_id: string | null }
+      | undefined;
     if (!task) return res.status(404).json({ error: 'not found' });
+    if (!ownTask(user, task)) return res.status(403).json({ error: 'forbidden' });
     const body = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
     if (!body || body.length > 2000) return res.status(400).json({ error: 'Comment must be 1-2000 characters' });
     const id = crypto.randomUUID();
@@ -342,6 +358,11 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
   app.delete('/api/tasks/:id/comments/:cid', asyncRoute(async (req, res) => {
     const user = requirePerm(req, res, 'tasks.edit');
     if (!user) return;
+    const task = db.prepare('SELECT id, assignee_id FROM tasks WHERE id = ?').get(req.params.id) as
+      | { id: string; assignee_id: string | null }
+      | undefined;
+    if (!task) return res.status(404).json({ error: 'not found' });
+    if (!ownTask(user, task)) return res.status(403).json({ error: 'forbidden' });
     const row = db.prepare(
       'SELECT id FROM task_comments WHERE id = ? AND task_id = ?',
     ).get(req.params.cid, req.params.id) as { id: string } | undefined;
@@ -357,6 +378,11 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     publishTaskChange(io, db, req.params.id);
     return res.json({ ok: true });
   }));
+}
+
+/** Admins can change any task. A player with tasks.edit can change only tasks assigned to them. */
+function ownTask(user: SessionUser, task: { assignee_id: string | null }): boolean {
+  return user.role === 'admin' || task.assignee_id === user.id;
 }
 
 function requirePerm(

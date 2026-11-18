@@ -31,6 +31,8 @@ export function TasksPanel({
 }) {
   const auth = useAuth();
   const quick = useQuickTask();
+  const kid = auth.user?.role === 'player';
+  const canGoals = auth.can('goals.view');
   const [tab, setTab] = useState<'mine' | 'all' | 'goals' | 'projects'>('mine');
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [people, setPeople] = useState<PersonOption[]>([]);
@@ -78,6 +80,11 @@ export function TasksPanel({
     return () => window.clearTimeout(timer);
   }, [undo]);
 
+  useEffect(() => {
+    if (kid && tab === 'all') setTab('mine');
+    else if (!canGoals && (tab === 'goals' || tab === 'projects')) setTab('mine');
+  }, [kid, canGoals, tab]);
+
   if (!open) return null;
 
   const complete = async (task: TaskItem) => {
@@ -113,32 +120,38 @@ export function TasksPanel({
       {...blockGridPointerEvents}
     >
       <div className="p-4 border-b flex items-center justify-between bg-slate-50">
-        <span className="font-bold">Tasks</span>
+        <span className="font-bold">{kid ? (tab === 'goals' ? 'Goals' : tab === 'projects' ? 'Projects' : 'My Tasks') : 'Tasks'}</span>
         <button type="button" onClick={onClose} title="Close" className="p-1 rounded-lg hover:bg-slate-200">
           <X className="w-4 h-4" />
         </button>
       </div>
       <div className="flex border-b text-xs font-bold">
         <button type="button" data-testid="tasks-tab-mine" className={`flex-1 py-2 ${tab === 'mine' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400'}`} onClick={() => setTab('mine')}>My Tasks</button>
-        <button type="button" data-testid="tasks-tab-all" className={`flex-1 py-2 ${tab === 'all' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400'}`} onClick={() => setTab('all')}>All</button>
-        <button
-          type="button"
-          data-testid="goals-tab"
-          disabled={!auth.can('goals.view')}
-          className={`flex-1 py-2 ${tab === 'goals' ? 'text-blue-600 border-b-2 border-blue-600' : auth.can('goals.view') ? 'text-slate-400' : 'text-slate-300 cursor-not-allowed'}`}
-          onClick={() => { if (auth.can('goals.view')) setTab('goals'); }}
-        >
-          Goals
-        </button>
-        <button
-          type="button"
-          data-testid="projects-tab"
-          disabled={!auth.can('goals.view')}
-          className={`flex-1 py-2 ${tab === 'projects' ? 'text-blue-600 border-b-2 border-blue-600' : auth.can('goals.view') ? 'text-slate-400' : 'text-slate-300 cursor-not-allowed'}`}
-          onClick={() => { if (auth.can('goals.view')) setTab('projects'); }}
-        >
-          Projects
-        </button>
+        {!kid && (
+          <button type="button" data-testid="tasks-tab-all" className={`flex-1 py-2 ${tab === 'all' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-400'}`} onClick={() => setTab('all')}>All</button>
+        )}
+        {(!kid || canGoals) && (
+          <button
+            type="button"
+            data-testid="goals-tab"
+            disabled={!canGoals}
+            className={`flex-1 py-2 ${tab === 'goals' ? 'text-blue-600 border-b-2 border-blue-600' : canGoals ? 'text-slate-400' : 'text-slate-300 cursor-not-allowed'}`}
+            onClick={() => { if (canGoals) setTab('goals'); }}
+          >
+            Goals
+          </button>
+        )}
+        {(!kid || canGoals) && (
+          <button
+            type="button"
+            data-testid="projects-tab"
+            disabled={!canGoals}
+            className={`flex-1 py-2 ${tab === 'projects' ? 'text-blue-600 border-b-2 border-blue-600' : canGoals ? 'text-slate-400' : 'text-slate-300 cursor-not-allowed'}`}
+            onClick={() => { if (canGoals) setTab('projects'); }}
+          >
+            Projects
+          </button>
+        )}
       </div>
       {tab === 'all' && (
         <div className="p-3 border-b space-y-2">
@@ -187,7 +200,11 @@ export function TasksPanel({
         {tab === 'goals' && <GoalsTab epoch={auth.tasksEpoch} onComplete={complete} />}
         {tab === 'projects' && <ProjectsTab epoch={auth.tasksEpoch} onComplete={complete} />}
         {(tab === 'mine' || tab === 'all') && error && <p className="text-xs text-red-600">{error}</p>}
-        {(tab === 'mine' || tab === 'all') && shown.length === 0 && !error && <p className="text-xs text-slate-400">No tasks.</p>}
+        {(tab === 'mine' || tab === 'all') && shown.length === 0 && !error && (
+          <p className={kid ? 'text-base font-bold text-slate-500' : 'text-xs text-slate-400'}>
+            {kid ? 'Nothing to do yet.' : 'No tasks.'}
+          </p>
+        )}
         {(tab === 'mine' || tab === 'all') && shown.map((task) => {
           const chip = dueChip(task);
           return (
@@ -199,12 +216,14 @@ export function TasksPanel({
               data-assignee={task.assigneeId || ''}
               data-status={task.status}
               data-due={task.dueBucket}
-              className="border border-slate-100 rounded-xl p-3 flex items-start gap-2 cursor-pointer hover:border-blue-200"
-              onClick={() => setEditing(task)}
+              className={`border border-slate-100 rounded-xl flex items-start gap-2 hover:border-blue-200 ${kid ? 'p-4' : 'p-3'} ${auth.can('tasks.edit') ? 'cursor-pointer' : ''}`}
+              onClick={() => {
+                if (auth.can('tasks.edit')) setEditing(task);
+              }}
             >
               <span className={`mt-1 w-2 h-2 rounded-full shrink-0 ${task.status === 'in_progress' ? 'bg-blue-500' : task.status === 'blocked' ? 'bg-amber-500' : 'bg-slate-300'}`} />
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-bold text-slate-800 truncate">{task.title}</div>
+                <div className={`font-bold text-slate-800 truncate ${kid ? 'text-base' : 'text-sm'}`}>{task.title}</div>
                 <div className="flex flex-wrap gap-1 mt-1">
                   <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${chip.className}`}>{chip.label}</span>
                   <span className="text-[10px] text-slate-400">{task.kind === 'in_game' ? '🌍' : '✅'} {task.priority}</span>
@@ -232,7 +251,9 @@ export function TasksPanel({
                 <button
                   type="button"
                   data-testid="task-complete"
-                  className="text-[11px] font-bold text-blue-600 shrink-0"
+                  className={kid
+                    ? 'text-sm font-black text-white bg-blue-600 px-3 py-1.5 rounded-full shrink-0'
+                    : 'text-[11px] font-bold text-blue-600 shrink-0'}
                   onClick={(event) => {
                     event.stopPropagation();
                     void complete(task);

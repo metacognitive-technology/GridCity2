@@ -357,7 +357,9 @@ test('P3-05 admin lists tasks and a player files a quick task', async ({ page, r
     await expect(kid.getByTestId('bot-panel')).not.toContainText(secret);
 
     await askBot(kid, 'remind Grandpa to get me a train set');
-    await expect(kid.getByTestId('bot-chat-message').filter({ hasText: /train set/i })).toBeVisible();
+    await expect(
+      kid.getByTestId('bot-chat-message').and(kid.locator('[data-role="assistant"]')).filter({ hasText: /train set/i }),
+    ).toBeVisible();
     await expect(kid.getByTestId('bot-panel')).not.toContainText(secret);
 
     expect((await browserJson(kid, '/api/tasks')).status).toBe(403);

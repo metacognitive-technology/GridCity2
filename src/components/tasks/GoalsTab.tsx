@@ -38,14 +38,14 @@ export function GoalsTab({
       const projectData = await projectRes.json().catch(() => null);
       const taskData = await taskRes.json().catch(() => null);
       if (cancelled) return;
-      if (!goalRes.ok || !projectRes.ok || !taskRes.ok) {
+      if (!goalRes.ok || !projectRes.ok || (!taskRes.ok && taskRes.status !== 403)) {
         setError('Could not load goals');
         return;
       }
       setError(null);
       setGoals(Array.isArray(goalData?.goals) ? goalData.goals : []);
       setProjects(Array.isArray(projectData?.projects) ? projectData.projects : []);
-      setTasks(Array.isArray(taskData?.tasks) ? taskData.tasks : []);
+      setTasks(taskRes.ok && Array.isArray(taskData?.tasks) ? taskData.tasks : []);
     };
     void load();
     return () => {
@@ -64,13 +64,21 @@ export function GoalsTab({
   const canFinish = (task: TaskItem) => (
     auth.can('tasks.edit') && task.status !== 'done' && task.status !== 'cancelled' && !task.archivedAt
   );
+  const friendly = auth.user?.role === 'player';
 
   const linkedTask = (task: TaskItem) => (
     <div key={task.id} data-testid="goal-linked-task" data-title={task.title} data-status={task.status} className="flex items-center gap-2 text-xs">
       <span className="flex-1 truncate">{task.title}</span>
       <span className="text-[10px] uppercase text-slate-400">{task.status === 'in_progress' ? 'In progress' : task.status}</span>
       {canFinish(task) && (
-        <button type="button" data-testid="task-complete" className="font-bold text-blue-600" onClick={() => void complete(task)}>
+        <button
+          type="button"
+          data-testid="task-complete"
+          className={friendly
+            ? 'font-black text-white bg-blue-600 px-3 py-1 rounded-full'
+            : 'font-bold text-blue-600'}
+          onClick={() => void complete(task)}
+        >
           Complete
         </button>
       )}
@@ -78,19 +86,25 @@ export function GoalsTab({
   );
 
   return (
-    <div className="space-y-2">
+    <div className={friendly ? 'space-y-3' : 'space-y-2'}>
       {auth.can('goals.edit') && (
         <button
           type="button"
           data-testid="goal-new"
-          className="px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs font-bold"
+          className={friendly
+            ? 'px-4 py-2 rounded-full bg-amber-500 text-white text-sm font-black'
+            : 'px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs font-bold'}
           onClick={() => setCreating(true)}
         >
           New goal
         </button>
       )}
       {error && <p className="text-xs text-red-600">{error}</p>}
-      {goals.length === 0 && !error && <p className="text-xs text-slate-400">No goals.</p>}
+      {goals.length === 0 && !error && (
+        <p className={friendly ? 'text-base font-bold text-slate-500' : 'text-xs text-slate-400'}>
+          {friendly ? 'No goals yet. Ask Grandpa for one!' : 'No goals.'}
+        </p>
+      )}
       {goals.map((goal) => {
         const expanded = openId === goal.id;
         const linkedTaskIds = new Set(goal.taskIds);
@@ -103,7 +117,10 @@ export function GoalsTab({
             data-testid="goal-card"
             data-title={goal.title}
             data-status={goal.status}
-            className="border border-slate-100 rounded-xl p-3"
+            data-variant={friendly ? 'friendly' : undefined}
+            className={friendly
+              ? 'rounded-3xl border-2 border-amber-200 bg-gradient-to-br from-amber-50 via-white to-sky-50 p-5 shadow-sm'
+              : 'border border-slate-100 rounded-xl p-3'}
           >
             <div className="flex items-start gap-2">
               <button
@@ -112,17 +129,29 @@ export function GoalsTab({
                 className="flex-1 min-w-0 text-left"
                 onClick={() => setOpenId(expanded ? null : goal.id)}
               >
-                <div className="flex items-center gap-2">
-                  <span data-testid="goal-icon" className="text-lg leading-none">{goal.icon || '🎯'}</span>
-                  <span className="text-sm font-bold text-slate-800 truncate">{goal.title}</span>
-                  {goal.status === 'achieved' && (
-                    <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded-full">Achieved</span>
-                  )}
+                {friendly ? (
+                  <div>
+                    <div className="flex items-start justify-between gap-2">
+                      <span data-testid="goal-icon" className="text-5xl leading-none">{goal.icon || '🎯'}</span>
+                      {goal.status === 'achieved' && (
+                        <span className="text-xs font-black text-emerald-700 bg-emerald-100 px-2 py-1 rounded-full">Achieved</span>
+                      )}
+                    </div>
+                    <div className="mt-3 text-xl font-black text-slate-900 break-words">{goal.title}</div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span data-testid="goal-icon" className="text-lg leading-none">{goal.icon || '🎯'}</span>
+                    <span className="text-sm font-bold text-slate-800 truncate">{goal.title}</span>
+                    {goal.status === 'achieved' && (
+                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded-full">Achieved</span>
+                    )}
+                  </div>
+                )}
+                <div className={friendly ? 'mt-4' : 'mt-2'}>
+                  <ProgressMeter percent={goal.progress} testId="goal-progress" size={friendly ? 'lg' : 'sm'} />
                 </div>
-                <div className="mt-2">
-                  <ProgressMeter percent={goal.progress} testId="goal-progress" />
-                </div>
-                <div className="mt-1 flex justify-between gap-2 text-[10px] text-slate-500">
+                <div className={`flex justify-between gap-2 ${friendly ? 'mt-2 text-sm font-bold text-slate-600' : 'mt-1 text-[10px] text-slate-500'}`}>
                   <span data-testid="goal-due">{goal.dueDate || 'No date'}</span>
                   <span data-testid="goal-counts">
                     {countLabel(goal.projectIds.length, 'project', 'projects')}
@@ -135,7 +164,7 @@ export function GoalsTab({
                 <button
                   type="button"
                   data-testid="goal-edit"
-                  className="text-[11px] font-bold text-slate-500"
+                  className={friendly ? 'text-sm font-black text-slate-500' : 'text-[11px] font-bold text-slate-500'}
                   onClick={() => setEditing(goal)}
                 >
                   Edit

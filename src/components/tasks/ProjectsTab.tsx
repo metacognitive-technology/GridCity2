@@ -28,13 +28,13 @@ export function ProjectsTab({
       const projectData = await projectRes.json().catch(() => null);
       const taskData = await taskRes.json().catch(() => null);
       if (cancelled) return;
-      if (!projectRes.ok || !taskRes.ok) {
+      if (!projectRes.ok || (!taskRes.ok && taskRes.status !== 403)) {
         setError('Could not load projects');
         return;
       }
       setError(null);
       setProjects(Array.isArray(projectData?.projects) ? projectData.projects : []);
-      setTasks(Array.isArray(taskData?.tasks) ? taskData.tasks : []);
+      setTasks(taskRes.ok && Array.isArray(taskData?.tasks) ? taskData.tasks : []);
     };
     void load();
     return () => {

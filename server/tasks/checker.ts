@@ -213,13 +213,16 @@ export type UrgentTask = {
 const BUCKET_RANK = { overdue: 0, today: 1, soon: 2, later: 3, none: 4 };
 const PRIORITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-/** Five most urgent open tasks for an admin prompt. Titles only — never emails. */
-export function urgentOpenTasks(db: Database, limit = 5): UrgentTask[] {
+/** Five most urgent open tasks. Pass assigneeId to keep a player inside My Tasks. */
+export function urgentOpenTasks(db: Database, limit = 5, assigneeId?: string): UrgentTask[] {
+  const scoped = assigneeId
+    ? ` AND assignee_id = ?`
+    : '';
   const rows = db.prepare(
     `SELECT id, title, status, kind, priority, due_date
      FROM tasks
-     WHERE archived_at IS NULL AND status IN ('todo','in_progress','blocked')`,
-  ).all() as {
+     WHERE archived_at IS NULL AND status IN ('todo','in_progress','blocked')${scoped}`,
+  ).all(...(assigneeId ? [assigneeId] : [])) as {
     id: string;
     title: string;
     status: string;
