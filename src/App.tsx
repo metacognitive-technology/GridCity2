@@ -246,6 +246,7 @@ import { AdminUsersPanel } from './components/auth/AdminUsersPanel';
 import { LobbyAuthLink } from './components/auth/LobbyAuthLink';
 import { QuickTaskButton, QuickTaskProvider } from './components/tasks/QuickTask';
 import { executeTaskBotActions } from './components/tasks/botTaskActions';
+import { Celebration } from './components/tasks/Celebration';
 import { TasksPanel } from './components/tasks/TasksPanel';
 import { OverdueBadge } from './components/tasks/OverdueBadge';
 
@@ -16973,6 +16974,7 @@ export default function App() {
           }}
           pickResultRef={botPickResultRef}
         />
+        <Celebration roomCode={roomCode} />
         {showTasksPanel && (
           <TasksPanel open onClose={() => setShowTasksPanel(false)} onShowMe={showTaskOnMap} />
         )}

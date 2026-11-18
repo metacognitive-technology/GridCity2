@@ -6,14 +6,26 @@ export type TaskCounts = { overdue: number; dueToday: number; open: number };
 const OPEN = `archived_at IS NULL AND status IN ('todo','in_progress','blocked')`;
 
 export function taskCounts(db: Database): TaskCounts {
+  return countTasks(db, null);
+}
+
+/** Open-task counts for one assignee. Players never see the global badge. */
+export function taskCountsForAssignee(db: Database, assigneeId: string): TaskCounts {
+  return countTasks(db, assigneeId);
+}
+
+function countTasks(db: Database, assigneeId: string | null): TaskCounts {
   const today = todayISO();
+  const where = assigneeId ? 'WHERE assignee_id = ?' : '';
+  const args = assigneeId ? [today, today, assigneeId] : [today, today];
   const row = db.prepare(
     `SELECT
        SUM(CASE WHEN ${OPEN} AND due_date IS NOT NULL AND due_date < ? THEN 1 ELSE 0 END) AS overdue,
        SUM(CASE WHEN ${OPEN} AND due_date = ? THEN 1 ELSE 0 END) AS dueToday,
        SUM(CASE WHEN ${OPEN} THEN 1 ELSE 0 END) AS open
-     FROM tasks`,
-  ).get(today, today) as { overdue: number | null; dueToday: number | null; open: number | null };
+     FROM tasks
+     ${where}`,
+  ).get(...args) as { overdue: number | null; dueToday: number | null; open: number | null };
   return {
     overdue: row?.overdue || 0,
     dueToday: row?.dueToday || 0,

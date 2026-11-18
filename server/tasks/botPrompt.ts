@@ -26,6 +26,11 @@ export function taskPromptSection(user: SessionUser, db: Database): string {
       kind: task.kind,
       dueDate: task.dueDate,
     })))}`);
+  } else if (can(user, 'tasks.view')) {
+    lines.push('This user can see only tasks assigned to them. Do not mention tasks assigned to anyone else.');
+  }
+  if (user.role !== 'admin' && can(user, 'tasks.edit')) {
+    lines.push('suggest_goal is allowed for this player. Propose one in-game goal and wait for them to choose Create it. Do not emit create_task until then.');
   }
   const actions: string[] = [];
   if (can(user, 'tasks.create') && can(user, 'tasks.edit')) {
@@ -80,6 +85,7 @@ export function scriptedBotReply(user: SessionUser, db: Database, message: strin
     };
   }
   if (/suggest a goal|give me a goal|suggest_goal/i.test(lower)) {
+    if (!can(user, 'tasks.edit')) return { reply: PLAYFUL_BUILD_IDEA };
     return {
       reply: 'Connect the two neighborhoods?',
       actions: [{
@@ -116,7 +122,7 @@ export function scriptedBotReply(user: SessionUser, db: Database, message: strin
   }
   if (/what'?s next/i.test(lower)) {
     if (can(user, 'tasks.view')) {
-      const tasks = urgentOpenTasks(db, 5);
+      const tasks = urgentOpenTasks(db, 5, user.role === 'admin' ? undefined : user.id);
       const lines = tasks.length
         ? tasks.map((task) => `- ${task.title}`).join('\n')
         : 'Nothing is open.';
@@ -130,10 +136,15 @@ export function scriptedBotReply(user: SessionUser, db: Database, message: strin
   return { reply: 'OK' };
 }
 
+function isChoiceAsk(ask: unknown): boolean {
+  return !!ask && typeof ask === 'object' && (ask as { type?: unknown }).type === 'choice';
+}
+
 /** Drop task actions the caller cannot perform. Players keep title and notes only. */
 export function presentBotPayload(user: SessionUser, payload: BotPayload): BotPayload {
   const actions = Array.isArray(payload.actions) ? payload.actions : [];
   const next: unknown[] = [];
+  let strippedSuggest = false;
   for (const action of actions) {
     if (!action || typeof action !== 'object') continue;
     const body = action as Record<string, unknown>;
@@ -169,16 +180,23 @@ export function presentBotPayload(user: SessionUser, payload: BotPayload): BotPa
       continue;
     }
     if (body.op === 'suggest_goal') {
-      if (!can(user, 'tasks.edit')) continue;
+      if (!can(user, 'tasks.edit')) {
+        strippedSuggest = true;
+        continue;
+      }
       next.push(action);
       continue;
     }
     next.push(action);
   }
+  const keptSuggest = next.some((action) => (
+    !!action && typeof action === 'object' && (action as { op?: unknown }).op === 'suggest_goal'
+  ));
+  const ask = strippedSuggest && !keptSuggest && isChoiceAsk(payload.ask) ? undefined : payload.ask;
   return {
     reply: typeof payload.reply === 'string' ? payload.reply : '',
     ...(next.length ? { actions: next } : {}),
-    ...(payload.ask ? { ask: payload.ask } : {}),
+    ...(ask ? { ask } : {}),
     ...(payload.escalate ? { escalate: payload.escalate } : {}),
   };
 }
