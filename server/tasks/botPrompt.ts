@@ -38,7 +38,7 @@ export function taskPromptSection(user: SessionUser, db: Database): string {
       '{"op":"create_task","title":"...","notes":"...","kind":"in_game","criteria":{...},"region":{"minX":0,"minY":0,"maxX":10,"maxY":10},"dueDate":"YYYY-MM-DD","goalId":"..."}',
     );
   } else if (can(user, 'tasks.create')) {
-    actions.push('{"op":"create_task","title":"...","notes":"..."} — quick task only. Keep title and notes. Do not add kind, criteria, region, dueDate, or goalId.');
+    actions.push('{"op":"create_task","title":"...","notes":"..."} — quick Request only. Keep title and notes. Do not add kind, criteria, region, dueDate, or goalId.');
     lines.push('This user cannot view tasks. If they ask what is next, give a playful build idea and do not list, quote, or invent existing tasks.');
   }
   if (can(user, 'tasks.view')) {

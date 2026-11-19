@@ -104,6 +104,8 @@ test('P4-01 player My Tasks complete and undo', async ({ page, request }) => {
   await expect(page.getByTestId('login-dialog')).toBeHidden();
   await enterRoom(page);
   await expect(page.getByTestId('quick-task-button')).toBeVisible();
+  await expect(page.getByTestId('quick-task-button')).toContainText('New Request for Grampa');
+  await expect(page.getByTestId('new-idea-button')).toBeVisible();
   await expect(page.getByTestId('tasks-panel-toggle')).toBeVisible();
   await page.getByTestId('tasks-panel-toggle').click();
   await expect(page.getByTestId('tasks-panel')).toBeVisible();
@@ -214,7 +216,7 @@ test('P4-02 in-game auto-complete celebrates in the room', async ({ page, reques
   }
 });
 
-test('P4-03 default player still sees only Quick task', async ({ page, request }) => {
+test('P4-03 default player still sees only Request and Idea buttons', async ({ page, request }) => {
   test.setTimeout(60_000);
   await ensureAdmin(request);
   const stamp = Date.now();
@@ -233,6 +235,9 @@ test('P4-03 default player still sees only Quick task', async ({ page, request }
   await expect(page.getByTestId('login-dialog')).toBeHidden();
   await enterRoom(page);
   await expect(page.getByTestId('quick-task-button')).toBeVisible();
+  await expect(page.getByTestId('quick-task-button')).toContainText('New Request for Grampa');
+  await expect(page.getByTestId('new-idea-button')).toBeVisible();
+  await expect(page.getByTestId('new-idea-button')).toContainText('New Idea');
   await expect(page.getByTestId('tasks-panel-toggle')).toHaveCount(0);
   await expect(page.getByTestId('tasks-panel')).toHaveCount(0);
   await expect(page.getByTestId('celebrate-banner')).toHaveCount(0);

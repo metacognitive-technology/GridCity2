@@ -41,7 +41,7 @@ async function createTask(action: Extract<BotAction, { op: 'create_task' }>, ctx
   if (!ctx.can.edit) {
     const res = await api('/api/tasks/quick', {
       method: 'POST',
-      body: JSON.stringify({ title, notes: action.notes || '' }),
+      body: JSON.stringify({ title, notes: action.notes || '', source: 'request' }),
     });
     if (!res.ok) return 'I could not save that task.';
     return 'Task created.';
@@ -71,7 +71,7 @@ async function createTask(action: Extract<BotAction, { op: 'create_task' }>, ctx
   if (res.status === 403) {
     const quick = await api('/api/tasks/quick', {
       method: 'POST',
-      body: JSON.stringify({ title, notes: action.notes || '' }),
+      body: JSON.stringify({ title, notes: action.notes || '', source: 'request' }),
     });
     return quick.ok ? 'Task created.' : 'I could not save that task.';
   }

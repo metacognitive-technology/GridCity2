@@ -219,11 +219,15 @@ test('P1-05 Isaiah view', async ({ page, request }) => {
   await expect(page.getByTestId('choose-password-title')).toHaveCount(0);
   await enterRoom(page);
   await expect(page.getByTestId('quick-task-button')).toBeVisible();
+  await expect(page.getByTestId('quick-task-button')).toContainText('New Request for Grampa');
+  await expect(page.getByTestId('new-idea-button')).toBeVisible();
+  await expect(page.getByTestId('new-idea-button')).toContainText('New Idea');
   await expect(page.getByTestId('tasks-panel-toggle')).toHaveCount(0);
   await expect(page.getByTestId('tasks-overdue-badge')).toHaveCount(0);
 
   await page.keyboard.press('Shift+T');
   await expect(page.getByTestId('quick-task-dialog')).toBeVisible();
+  await expect(page.getByTestId('quick-task-dialog-title')).toHaveText('New Request for Grampa');
   await expect(page.getByTestId('quick-task-assignee')).toHaveCount(0);
   await page.getByTestId('quick-task-dialog').getByRole('button', { name: 'Cancel' }).click();
   await expect(page.getByTestId('quick-task-dialog')).toHaveCount(0);
@@ -262,6 +266,11 @@ test('P1-05 Isaiah view', async ({ page, request }) => {
 
   await page.getByTitle('Hide panel').click();
   await expect(page.getByTestId('quick-task-button-compact')).toBeVisible();
+  await expect(page.getByTestId('quick-task-button-compact')).toHaveAttribute('title', 'New Request for Grampa');
+  await expect(page.getByTestId('quick-task-button-compact')).toHaveAttribute('aria-label', 'New Request for Grampa');
+  await expect(page.getByTestId('new-idea-button-compact')).toBeVisible();
+  await expect(page.getByTestId('new-idea-button-compact')).toHaveAttribute('title', 'New Idea');
+  await expect(page.getByTestId('new-idea-button-compact')).toHaveAttribute('aria-label', 'New Idea');
 });
 
 test('P1-06 admin view', async ({ page, request, baseURL }) => {
@@ -360,6 +369,12 @@ test('P1-08 anonymous play', async ({ page, request, baseURL }) => {
   test.setTimeout(60_000);
   await ensureAdmin(request);
   const roomCode = await createFreshRoom(page);
+  await expect(page.getByTestId('quick-task-button')).toHaveCount(0);
+  await expect(page.getByTestId('new-idea-button')).toHaveCount(0);
+  await page.getByTitle('Hide panel').click();
+  await expect(page.getByTestId('quick-task-button-compact')).toHaveCount(0);
+  await expect(page.getByTestId('new-idea-button-compact')).toHaveCount(0);
+  await page.getByTitle('Show tile palette').click();
   await page.getByRole('button', { name: 'Roads', exact: true }).click();
   const road = page.getByTitle('Straight Road', { exact: true });
   await road.scrollIntoViewIfNeeded();

@@ -37,7 +37,15 @@ export type TaskItem = {
   comments: TaskComment[];
   goalIds: string[];
   projectIds: string[];
+  tags: string[];
 };
+
+export const TASK_TAGS = ['Request', 'Idea'] as const;
+export type TaskTag = (typeof TASK_TAGS)[number];
+
+export function isTaskTag(value: unknown): value is TaskTag {
+  return value === 'Request' || value === 'Idea';
+}
 
 export type GoalItem = {
   id: string;

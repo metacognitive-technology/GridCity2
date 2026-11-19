@@ -18,6 +18,8 @@ const STATUSES = ['todo', 'in_progress', 'blocked', 'done', 'cancelled'] as cons
 const PRIORITIES = ['low', 'medium', 'high'] as const;
 const KINDS = ['real_world', 'in_game'] as const;
 const RECURRENCE = ['none', 'daily', 'weekly', 'monthly'] as const;
+const QUICK_SOURCES = ['request', 'idea'] as const;
+const TASK_TAGS = ['Request', 'Idea'] as const;
 const OPEN = `t.archived_at IS NULL AND t.status IN ('todo','in_progress','blocked')`;
 const HOUR_MS = 60 * 60 * 1000;
 const QUICK_LIMIT = 20;
@@ -88,6 +90,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     }
     const goal = typeof req.query.goal === 'string' ? req.query.goal : '';
     const project = typeof req.query.project === 'string' ? req.query.project : '';
+    const tag = typeof req.query.tag === 'string' ? req.query.tag : '';
     if (goal) {
       where.push('EXISTS (SELECT 1 FROM task_goals tg WHERE tg.task_id = t.id AND tg.goal_id = ?)');
       args.push(goal);
@@ -95,6 +98,10 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     if (project) {
       where.push('EXISTS (SELECT 1 FROM task_projects tp WHERE tp.task_id = t.id AND tp.project_id = ?)');
       args.push(project);
+    }
+    if ((TASK_TAGS as readonly string[]).includes(tag)) {
+      where.push('EXISTS (SELECT 1 FROM json_each(t.tags) WHERE json_each.value = ?)');
+      args.push(tag);
     }
 
     const sql = `
@@ -129,6 +136,8 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
     const notes = cleanNotes(req.body?.notes ?? req.body?.description);
     if (notes == null) return res.status(400).json({ error: 'Notes are too long' });
     const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+    const tagSource = parseQuickSource(body.source);
+    if (tagSource === 'invalid') return res.status(400).json({ error: 'invalid source' });
     const assignee = pickAssignee(db, user, body);
     if (assignee === 'invalid') return res.status(400).json({ error: 'invalid assignee' });
     let kind: Kind = 'real_world';
@@ -156,6 +165,7 @@ export function registerTaskRoutes(app: Express, ctx: { db: Database; io: Server
       worldId,
       aimX,
       aimY,
+      tags: tagsForQuickSource(tagSource),
     });
     audit(db, {
       actorId: user.id,
@@ -472,6 +482,7 @@ type TaskWrite = {
   aimX: number | null;
   aimY: number | null;
   criteria?: string | null;
+  tags?: string;
   status?: Status;
   goalIds?: string[];
   projectIds?: string[];
@@ -485,9 +496,9 @@ function insertTask(db: Database, task: TaskWrite): string {
   db.prepare(
     `INSERT INTO tasks (
        id, title, description, kind, status, priority, due_date, assignee_id, created_by_id,
-       source, recurrence, world_id, aim_x, aim_y, criteria, completed_at, completed_by,
+       source, recurrence, world_id, aim_x, aim_y, criteria, tags, completed_at, completed_by,
        created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     task.title,
@@ -504,6 +515,7 @@ function insertTask(db: Database, task: TaskWrite): string {
     task.aimX,
     task.aimY,
     task.criteria ?? null,
+    task.tags ?? '[]',
     done ? now : null,
     done ? task.createdById : null,
     now,
@@ -699,6 +711,7 @@ type TaskRow = {
   aim_x: number | null;
   aim_y: number | null;
   criteria: string | null;
+  tags: string;
   check_state: string | null;
   completed_at: number | null;
   completed_by: string | null;
@@ -794,6 +807,7 @@ function mapTask(row: TaskRow, comments: CommentJson[], today: string, links?: {
     comments,
     goalIds: links?.goalIds || [],
     projectIds: links?.projectIds || [],
+    tags: parseTags(row.tags),
   };
 }
 
@@ -817,4 +831,34 @@ function parseJson(raw: string | null): unknown {
   } catch {
     return null;
   }
+}
+
+function parseQuickSource(raw: unknown): 'request' | 'idea' | 'invalid' {
+  if (raw == null || raw === '') return 'request';
+  if ((QUICK_SOURCES as readonly unknown[]).includes(raw)) return raw as 'request' | 'idea';
+  return 'invalid';
+}
+
+function tagsForQuickSource(source: 'request' | 'idea'): string {
+  return JSON.stringify(source === 'idea' ? ['Idea'] : ['Request']);
+}
+
+function parseTags(raw: unknown): string[] {
+  let value: unknown = raw;
+  if (typeof raw === 'string') {
+    if (!raw.trim()) return [];
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item === 'string' && (TASK_TAGS as readonly string[]).includes(item) && !out.includes(item)) {
+      out.push(item);
+    }
+  }
+  return out;
 }

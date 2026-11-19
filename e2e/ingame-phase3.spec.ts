@@ -14,6 +14,7 @@ type TaskJson = {
   completedBy: string | null;
   assigneeId: string | null;
   worldId: string | null;
+  tags: string[];
 };
 
 async function roomCodeOf(page: Page): Promise<string> {
@@ -373,6 +374,7 @@ test('P3-05 admin lists tasks and a player files a quick task', async ({ page, r
     expect(train?.criteria).toBeNull();
     expect(train?.assigneeId).toBe(adminId);
     expect(train?.title).toBe('Get me a train set');
+    expect(train?.tags).toEqual(['Request']);
   } finally {
     await ctx.close();
   }

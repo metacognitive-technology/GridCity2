@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Lightbulb, Plus } from 'lucide-react';
 import { api } from '../../api';
 import { useAuth } from '../auth/AuthProvider';
 import { blockGridPointerEvents } from '../dockEvents';
@@ -8,7 +8,9 @@ type AimContext = {
   aim?: { x: number; y: number };
 };
 
-type QuickTaskApi = { open: () => void };
+export type QuickMode = 'request' | 'idea';
+
+type QuickTaskApi = { open: (mode?: QuickMode) => void };
 
 const QuickTaskContext = createContext<QuickTaskApi | null>(null);
 
@@ -24,6 +26,10 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
 }
 
+function canCreate(auth: ReturnType<typeof useAuth>): boolean {
+  return auth.can('tasks.create') && !auth.user?.mustChangePassword;
+}
+
 export function QuickTaskProvider({
   children,
   roomCode,
@@ -35,27 +41,33 @@ export function QuickTaskProvider({
 }) {
   const auth = useAuth();
   const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<QuickMode>('request');
+
+  const openWith = (next: QuickMode = 'request') => {
+    if (!auth.can('tasks.create')) return;
+    setMode(next);
+    setOpen(true);
+  };
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.repeat) return;
       if (!(event.shiftKey && (event.key === 'T' || event.key === 't'))) return;
       if (isTypingTarget(event.target)) return;
-      if (!auth.can('tasks.create') || auth.user?.mustChangePassword) return;
+      if (!canCreate(auth)) return;
       event.preventDefault();
-      setOpen(true);
+      openWith('request');
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [auth]);
 
   return (
-    <QuickTaskContext.Provider value={{ open: () => {
-      if (auth.can('tasks.create')) setOpen(true);
-    } }}>
+    <QuickTaskContext.Provider value={{ open: openWith }}>
       {children}
       <QuickTaskDialog
         open={open}
+        mode={mode}
         roomCode={roomCode}
         getContext={getContext}
         onClose={() => setOpen(false)}
@@ -67,19 +79,20 @@ export function QuickTaskProvider({
 export function QuickTaskButton({ variant }: { variant: 'pill' | 'compact' }) {
   const auth = useAuth();
   const quick = useContext(QuickTaskContext);
-  if (!auth.can('tasks.create') || auth.user?.mustChangePassword) return null;
+  if (!canCreate(auth)) return null;
   if (variant === 'compact') {
     return (
       <button
         type="button"
         data-testid="quick-task-button-compact"
         data-grid-control
-        title="Quick task"
+        title="New Request for Grampa"
+        aria-label="New Request for Grampa"
         className="absolute top-[4.75rem] left-4 z-[60] p-3 bg-white rounded-xl shadow-lg border border-slate-200 text-slate-700 hover:bg-slate-50"
         {...blockGridPointerEvents}
         onClick={(event) => {
           event.stopPropagation();
-          quick?.open();
+          quick?.open('request');
         }}
       >
         <Plus className="w-5 h-5" />
@@ -90,21 +103,58 @@ export function QuickTaskButton({ variant }: { variant: 'pill' | 'compact' }) {
     <button
       type="button"
       data-testid="quick-task-button"
-      className="mb-4 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs font-bold hover:bg-blue-700"
-      onClick={() => quick?.open()}
+      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs font-bold hover:bg-blue-700"
+      onClick={() => quick?.open('request')}
     >
-      <Plus className="w-3.5 h-3.5" /> Quick task
+      <Plus className="w-3.5 h-3.5 shrink-0" /> New Request for Grampa
+    </button>
+  );
+}
+
+export function NewIdeaButton({ variant }: { variant: 'pill' | 'compact' }) {
+  const auth = useAuth();
+  const quick = useContext(QuickTaskContext);
+  if (!canCreate(auth)) return null;
+  if (variant === 'compact') {
+    return (
+      <button
+        type="button"
+        data-testid="new-idea-button-compact"
+        data-grid-control
+        title="New Idea"
+        aria-label="New Idea"
+        className="absolute top-[8.5rem] left-4 z-[60] p-3 bg-white rounded-xl shadow-lg border border-slate-200 text-amber-700 hover:bg-amber-50"
+        {...blockGridPointerEvents}
+        onClick={(event) => {
+          event.stopPropagation();
+          quick?.open('idea');
+        }}
+      >
+        <Lightbulb className="w-5 h-5" />
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      data-testid="new-idea-button"
+      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-500 text-white text-xs font-bold hover:bg-amber-600"
+      onClick={() => quick?.open('idea')}
+    >
+      <Lightbulb className="w-3.5 h-3.5 shrink-0" /> New Idea
     </button>
   );
 }
 
 function QuickTaskDialog({
   open,
+  mode,
   onClose,
   roomCode,
   getContext,
 }: {
   open: boolean;
+  mode: QuickMode;
   onClose: () => void;
   roomCode: string | null;
   getContext: () => AimContext;
@@ -147,7 +197,11 @@ function QuickTaskDialog({
     setBusy(true);
     setError(null);
     try {
-      const body: Record<string, unknown> = { title: title.trim(), notes: notes.trim() };
+      const body: Record<string, unknown> = {
+        title: title.trim(),
+        notes: notes.trim(),
+        source: mode,
+      };
       if (canEdit) {
         body.assigneeId = assigneeId || null;
         body.kind = kind;
@@ -173,11 +227,14 @@ function QuickTaskDialog({
     }
   };
 
+  const heading = mode === 'idea' ? 'New Idea' : 'New Request for Grampa';
+
   return (
     <div
       className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-900/40 p-4"
       data-grid-control
       data-testid="quick-task-dialog"
+      data-mode={mode}
       {...blockGridPointerEvents}
     >
       <form
@@ -190,7 +247,7 @@ function QuickTaskDialog({
           }
         }}
       >
-        <h2 className="text-lg font-black mb-4">Quick task</h2>
+        <h2 className="text-lg font-black mb-4" data-testid="quick-task-dialog-title">{heading}</h2>
         <input
           data-testid="quick-task-title"
           autoFocus

@@ -7,6 +7,7 @@ import { GoalsTab } from './GoalsTab';
 import { ProjectsTab } from './ProjectsTab';
 import { useQuickTask } from './QuickTask';
 import { TaskDialog } from './TaskDialog';
+import { TaskTags } from './TaskTags';
 import { sortMyTasks, type PersonOption, type TaskItem } from './types';
 
 const fieldClass = 'px-2 py-1 rounded-lg border border-slate-200 text-xs bg-white';
@@ -41,6 +42,7 @@ export function TasksPanel({
   const [assignee, setAssignee] = useState('');
   const [kind, setKind] = useState('');
   const [due, setDue] = useState('');
+  const [tag, setTag] = useState('');
   const [editing, setEditing] = useState<TaskItem | null>(null);
   const [creating, setCreating] = useState(false);
   const [undo, setUndo] = useState<{ id: string; title: string; previous: TaskItem['status'] } | null>(null);
@@ -55,6 +57,7 @@ export function TasksPanel({
       if (assignee) params.set('assignee', assignee);
       if (kind) params.set('kind', kind);
       if (due) params.set('due', due);
+      if (tag) params.set('tag', tag);
     }
     const res = await api(`/api/tasks?${params.toString()}`);
     const data = await res.json().catch(() => null);
@@ -72,7 +75,7 @@ export function TasksPanel({
     if (!open || tab === 'goals' || tab === 'projects') return;
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, tab, status, assignee, kind, due, auth.tasksEpoch]);
+  }, [open, tab, status, assignee, kind, due, tag, auth.tasksEpoch]);
 
   useEffect(() => {
     if (!undo) return;
@@ -185,13 +188,18 @@ export function TasksPanel({
               <option value="soon">Soon</option>
               <option value="none">No date</option>
             </select>
+            <select data-testid="tasks-filter-tag" className={fieldClass} value={tag} onChange={(e) => setTag(e.target.value)}>
+              <option value="">Any tag</option>
+              <option value="Request">Request</option>
+              <option value="Idea">Idea</option>
+            </select>
           </div>
           <div className="flex gap-2">
             {auth.can('tasks.edit') && (
               <button type="button" data-testid="tasks-new" className="px-3 py-1.5 rounded-full bg-blue-600 text-white text-xs font-bold" onClick={() => setCreating(true)}>New task</button>
             )}
             {auth.can('tasks.create') && (
-              <button type="button" data-testid="tasks-all-quick" className="px-3 py-1.5 rounded-full bg-slate-100 text-xs font-bold" onClick={() => quick.open()}>Quick task</button>
+              <button type="button" data-testid="tasks-all-quick" className="px-3 py-1.5 rounded-full bg-slate-100 text-xs font-bold" onClick={() => quick.open('request')}>New Request</button>
             )}
           </div>
         </div>
@@ -225,6 +233,7 @@ export function TasksPanel({
               <div className="min-w-0 flex-1">
                 <div className={`font-bold text-slate-800 truncate ${kid ? 'text-base' : 'text-sm'}`}>{task.title}</div>
                 <div className="flex flex-wrap gap-1 mt-1">
+                  <TaskTags tags={task.tags} />
                   <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${chip.className}`}>{chip.label}</span>
                   <span className="text-[10px] text-slate-400">{task.kind === 'in_game' ? '🌍' : '✅'} {task.priority}</span>
                   {task.checkState?.detail && (

@@ -3,6 +3,7 @@ import { api } from '../../api';
 import { useAuth } from '../auth/AuthProvider';
 import { ProgressMeter } from './ProgressMeter';
 import { ProjectDialog } from './ProjectDialog';
+import { TaskTags } from './TaskTags';
 import type { ProjectItem, TaskItem } from './types';
 
 export function ProjectsTab({
@@ -110,6 +111,7 @@ export function ProjectsTab({
                   return (
                     <div key={task.id} data-testid="project-task" data-title={task.title} data-status={task.status} className="flex items-center gap-2 text-xs">
                       <span className="flex-1 truncate">{task.title}</span>
+                      <TaskTags tags={task.tags} />
                       <span className="text-[10px] uppercase text-slate-400">{task.status === 'in_progress' ? 'In progress' : task.status}</span>
                       {canFinish && (
                         <button type="button" data-testid="task-complete" className="font-bold text-blue-600" onClick={() => void complete(task)}>

@@ -244,7 +244,7 @@ import { useAuth } from './components/auth/AuthProvider';
 import { AccountChip } from './components/auth/AccountChip';
 import { AdminUsersPanel } from './components/auth/AdminUsersPanel';
 import { LobbyAuthLink } from './components/auth/LobbyAuthLink';
-import { QuickTaskButton, QuickTaskProvider } from './components/tasks/QuickTask';
+import { NewIdeaButton, QuickTaskButton, QuickTaskProvider } from './components/tasks/QuickTask';
 import { executeTaskBotActions } from './components/tasks/botTaskActions';
 import { Celebration } from './components/tasks/Celebration';
 import { TasksPanel } from './components/tasks/TasksPanel';
@@ -15821,7 +15821,10 @@ export default function App() {
             </button>
           </div>
 
-          <QuickTaskButton variant="pill" />
+          <div className="flex flex-wrap items-center gap-2 mb-4">
+            <QuickTaskButton variant="pill" />
+            <NewIdeaButton variant="pill" />
+          </div>
 
           {roomCode && (
             <div
@@ -16147,6 +16150,7 @@ export default function App() {
               <PanelLeftOpen className="w-5 h-5" />
             </button>
             <QuickTaskButton variant="compact" />
+            <NewIdeaButton variant="compact" />
           </>
         )}
 

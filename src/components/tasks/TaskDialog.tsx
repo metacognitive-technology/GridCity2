@@ -3,6 +3,7 @@ import { api } from '../../api';
 import { parseCriteria } from '../../shared/taskCriteria';
 import { blockGridPointerEvents } from '../dockEvents';
 import { CriteriaFields } from './CriteriaFields';
+import { TaskTags } from './TaskTags';
 import type { GoalItem, PersonOption, ProjectItem, TaskItem } from './types';
 
 type Draft = {
@@ -216,6 +217,11 @@ export function TaskDialog({
     >
       <form className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6" onSubmit={save}>
         <h2 className="text-lg font-black mb-4">{task ? 'Edit task' : 'New task'}</h2>
+        {!!task?.tags?.length && (
+          <div className="flex flex-wrap gap-1 mb-3">
+            <TaskTags tags={task.tags} />
+          </div>
+        )}
         <input
           data-testid="task-title"
           value={draft.title}

@@ -139,6 +139,12 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    version: 3,
+    sql: `
+      ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+    `,
+  },
 ];
 
 export function migrate(db: Database) {

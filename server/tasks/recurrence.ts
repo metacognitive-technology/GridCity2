@@ -17,6 +17,7 @@ type SourceTask = {
   aim_x: number | null;
   aim_y: number | null;
   criteria: string | null;
+  tags: string | null;
   archived_at: number | null;
 };
 
@@ -35,9 +36,9 @@ export function spawnNextOccurrence(db: Database, taskId: string, now: number): 
   db.prepare(
     `INSERT INTO tasks (
        id, title, description, kind, status, priority, due_date, assignee_id, created_by_id,
-       source, recurrence, world_id, aim_x, aim_y, criteria, completed_at, completed_by,
+       source, recurrence, world_id, aim_x, aim_y, criteria, tags, completed_at, completed_by,
        archived_at, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)`,
   ).run(
     id,
     row.title,
@@ -53,6 +54,7 @@ export function spawnNextOccurrence(db: Database, taskId: string, now: number): 
     row.aim_x,
     row.aim_y,
     row.criteria,
+    row.tags || '[]',
     now,
     now,
   );
